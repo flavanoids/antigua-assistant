@@ -1,0 +1,32 @@
+{
+  "config": {
+    "default": true,
+
+    // Project docs include lots of long code lines, URLs, and tables.
+    "MD013": false,
+    "MD060": false,
+
+    // Many docs are operational notes; relax style rules that create noise.
+    "MD022": false,
+    "MD025": false,
+    "MD031": false,
+    "MD032": false,
+    "MD034": false,
+    "MD047": false,
+    "MD036": false,
+    "MD058": false,
+
+    // Keep correctness-oriented rules enabled.
+    "MD040": true
+  },
+  "globs": ["**/*.md"],
+  "ignores": [
+    "**/node_modules/**",
+    "**/venv/**",
+    "**/venv-*/**",
+    "**/.venv/**",
+    "**/site-packages/**",
+    "**/whisper.cpp/**"
+  ]
+}
+

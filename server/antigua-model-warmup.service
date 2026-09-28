@@ -1,0 +1,15 @@
+[Unit]
+Description=Antigua Ollama Model Warmup (preload before first request)
+After=ollama.service
+Requires=ollama.service
+PartOf=ollama.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/curl -s -m 120 --retry 30 --retry-delay 2 --retry-connrefused \
+  http://localhost:11434/api/generate \
+  -d '{"model":"@OLLAMA_MODEL@","prompt":"","keep_alive":-1,"options":{"num_ctx":8192}}'
+
+[Install]
+WantedBy=multi-user.target

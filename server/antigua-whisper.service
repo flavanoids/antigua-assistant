@@ -1,0 +1,21 @@
+# whisper.cpp built with Vulkan (GGML_VULKAN=ON) in @WHISPER_DIR@,
+# outside this repo. Rebuild: cmake -B build -DGGML_VULKAN=ON && cmake --build build -j
+# Model: bash models/download-ggml-model.sh large-v3-turbo-q8_0 (~0.9GB VRAM).
+# -l is only the default: Antigua sets the language per request, English
+# first plus language probabilities, then Spanish if picked (_transcribe_gpu).
+[Unit]
+Description=Antigua STT (whisper.cpp large-v3-turbo on the GPU)
+After=network.target
+Before=antigua-server.service
+
+[Service]
+Type=simple
+WorkingDirectory=@WHISPER_DIR@
+ExecStart=@WHISPER_DIR@/build/bin/whisper-server -m models/ggml-large-v3-turbo-q8_0.bin --host 127.0.0.1 --port 8178 -l en -nt
+Restart=always
+RestartSec=5
+StandardOutput=append:@ANTIGUA_DIR@/logs/whisper_server.log
+StandardError=append:@ANTIGUA_DIR@/logs/whisper_server.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,28 @@
+# Satellite on the Pi (render with server/scripts/render_unit.py, run as the
+# desktop user so paplay reaches that user's PulseAudio, shared with
+# shairport-sync). network/wg-mesh.sh adds a wg0 ordering drop-in.
+[Unit]
+Description=Antigua Voice Assistant Satellite
+After=network-online.target mosquitto.service sound.target
+Wants=network-online.target mosquitto.service
+
+[Service]
+Type=simple
+User=@USER@
+Group=audio
+WorkingDirectory=@ANTIGUA_DIR@
+Environment=PYTHONUNBUFFERED=1
+Environment=XDG_RUNTIME_DIR=/run/user/@UID@
+Environment=PULSE_SERVER=unix:/run/user/@UID@/pulse/native
+ExecStart=@ANTIGUA_DIR@/venv/bin/python @ANTIGUA_DIR@/antigua_satellite.py
+Restart=always
+RestartSec=5
+# Audio outranks anything else on the Pi (e.g. a display kiosk).
+Nice=-10
+CPUWeight=400
+IOWeight=400
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+# Copy to hosts.conf (git-ignored) for wg-mesh.sh. One host per line:
+# name       ssh-target       lan-ip        wg-ip      guarded-tcp-ports  services-using-the-tunnel
+# ssh-target: "local" for the box you run it on, "root@host" for root ssh,
+# anything else is ssh'd to and run with sudo.
+primary      local            192.168.1.10  10.77.0.1  9393  antigua-server,kitchen-bridge
+satellite    satellite        192.168.1.11  10.77.0.2  1883  antigua-satellite
+backup       root@backup-box  192.168.1.12  10.77.0.3  9394  antigua-fallback,kitchen-bridge-standby

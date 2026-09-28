@@ -1,0 +1,277 @@
+mqtt:
+  broker: 10.77.0.2   # the satellite's Mosquitto, over WireGuard (network/README.md)
+  port: 1883
+whisper:
+  language: en
+  device: 0
+  # faster-whisper model actually used. small.en over base (2026-09-25): on
+  # 16 kitchen clips it got every "pause" and "play Bad Bunny" base garbled
+  # ("Come on, let's go", "It's like bad money"), for ~0.66s vs ~0.4s.
+  fw_model: small.en            # CPU fallback + hotword re-hearing
+  # Primary STT: whisper.cpp large-v3-turbo on the RX 6650 XT (Vulkan),
+  # antigua-whisper.service. ~0.30s vs small.en's ~0.68s, and it gets
+  # "Pause"/"Play Bad Bunny" over music that small.en garbles.
+  gpu_url: http://127.0.0.1:8178/inference
+  # Spanish (docs/spanish_support_plan.md): the GPU server auto-detects, and
+  # Antigua answers in Spanish only on clear evidence. Tested: "Pause" over
+  # music scored en 0.72; spoken Spanish sentences scored es 0.90-1.00.
+  spanish_min_prob: 0.85
+  spanish_min_words: 3
+  beam_size: 1                 # greedy: same transcripts as beam 5 here, faster
+  # Second opinion (~2.2s) only for a short transcript that matches no skill
+  # while music plays: small.en heard "Pause" as "Follow us"; medium.en got
+  # all 4 such clips. "" disables.
+  fw_model_careful: medium.en
+  prompt: ""  # no name bias — it turned mic echo/noise into a name and
+             # the LLM read that as being addressed, causing a self-reply loop
+ollama:
+  host: http://localhost:11434
+  model: qwen3.5:4b            # any small instruct model Ollama serves
+  system_prompt_file: server/config/system_prompt.txt
+  max_tokens: 65
+  temperature: 0.4
+  num_ctx: 8192               # the ollama.service default is 131072, which
+                               # spills 22% of the model to CPU (35 vs 65 tok/s)
+  keep_alive: -1
+  interaction_keep_alive: -1  # never unload — speed matters more than the
+                               # idle VRAM cost; a warmup unit also loads it
+                               # at boot / ollama restart before any request
+tts:
+  output_dir: audio_out       # relative to the repo root
+  remote_url: http://127.0.0.1:5500/tts       # antigua-tts.service on this box
+  fallback_url: http://10.77.0.3:5500/tts     # backup TTS box, same voice blend ("" = none)
+  speed: 0.9            # Kokoro delivery rate (voice blend lives in kokoro_tts_server_flask.py)
+server:
+  host: 0.0.0.0
+  port: 9393
+  audio_ttl_seconds: 300
+display:
+  enabled: false   # PinedaDisplay MQTT integration — off by default
+env:
+  VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/radeon_icd.json
+assistant:
+  wake_words:
+    - alexa
+  display_commands:
+    - keywords: [times square, city cam]
+      url: https://www.youtube.com/live/EXAMPLE
+      label: Times Square
+      duration: 30
+household:                             # who memories are kept for
+  - name: Alex
+  - name: Katherine
+    nicknames: [kat]                   # also accepted as this person
+  # - name: Sean
+  #   misheard_as: [Shawn]             # STT outputs rewritten to the name (case-sensitive)
+  #   say_as: Shaun                    # respelling for TTS if Kokoro mispronounces it
+memory:
+  ttl_days: 14                         # entries older than this are auto-deleted
+  storage_path: data/memories.json     # relative to the repo root
+weather:
+  location: "10001"          # legacy wttr.in key (LLM-prompt fallback only)
+  ttl_seconds: 900           # forecast cache: 15 min
+  nws_lat: 40.713            # home lat — used for NWS alerts endpoint
+  nws_lon: -74.006           # home lon
+  alerts_ttl_seconds: 600    # NWS alert cache: 10 min
+  # Open-Meteo home point for the deterministic weather skill (defaults to the
+  # nws_lat/nws_lon above if unset).
+  home_lat: 40.713
+  home_lon: -74.006
+  home_tz: "America/New_York"
+  timeout_seconds: 4         # fail fast rather than stall TTS
+  severe_alerts: true        # speak new Severe/Extreme NWS alerts unprompted
+  prewarm_cities: []         # e.g. ["Denver", "Portland, Maine"] — kept warm on boot
+  phrasing:
+    rain_likely_pct: 50      # >= this reads as "yes / likely"
+    rain_slight_pct: 20      # >= this reads as "maybe / slight chance"
+    jacket_below_f: 58       # feels-like below this suggests a jacket
+    notable_wind_mph: 20     # only mention wind unprompted above this
+# MCP servers, run as persistent stdio subprocesses by antigua_core.mcp_client.
+# The primary and the backup box run their own copies from server/mcp/venv (built
+# by server/mcp/setup.sh; deploy_fallback.sh does the backup box). Relative paths are
+# from the repo root. Secrets (GOVEE_API_KEY) go in env_file, which is
+# gitignored and machine-local — deploy_fallback.sh copies it to the backup box.
+mcp:
+  env_file: server/config/mcp.env
+  servers:
+    roku:
+      command: [server/mcp/venv/bin/mcp-remote-control]
+      env:
+        HOST_IP: "192.168.1.50"     # your Roku TV — find it with nmap -p 8060
+      timeout: 8                    # a TV in standby holds keypresses ~5s
+    appletv:
+      # Own venv: mcp-pyatv needs Python <=3.13 (asyncio breakage on 3.14).
+      command: [server/mcp/venv-atv/bin/mcp-pyatv]
+      env:
+        # Pairing credentials (gitignored, chmod 600). Pair once, with the
+        # TV on, per protocol:
+        #   server/mcp/venv-atv/bin/atvremote --id <APPLE_TV_ID> \
+        #     --protocol companion --storage-filename server/config/pyatv.conf pair
+        # then again with --protocol airplay.
+        MCP_PYATV_STORAGE_PATH: server/config/pyatv.conf
+      timeout: 10                   # pyatv retries an unreachable/unpaired device for ~18s; don't wait that long
+    govee:
+      command: [server/mcp/venv/bin/govee-mcp]
+      env:
+        GOVEE_PREFER_LAN: "true"    # LAN (UDP, ~0.3s) where the device allows it, else cloud
+        GOVEE_CACHE_PATH: data/govee-mcp/devices.json
+        GOVEE_GROUPS_PATH: data/govee-mcp/groups.json
+      timeout: 20                   # cloud calls + the one-time discovery on first use
+
+# One TV, two MCP servers. The Apple TV ("Living Room") drives the TV over HDMI-CEC; the Roku server is only for
+# inputs, which the Apple TV can't switch. Each function lists providers in
+# order: add "roku" after "appletv" to fall back when the Apple TV is
+# unpaired/unreachable.
+living_room_tv:
+  appletv_device: "Living Room"
+  failure_cooldown_seconds: 120   # after a failure, go straight to the next provider for this long
+  providers:
+    power: [appletv]
+    volume: [appletv]
+    mute: [appletv]
+    apps: [appletv]
+    navigation: [appletv]
+    playback: [appletv]
+    inputs: [roku]
+  # Spoken input names → Roku ECP input key. HDMI N, "live tv" and "AV" work
+  # without an entry. First label per key is what Antigua says back.
+  inputs:
+    playstation 5: InputHDMI1
+    playstation: InputHDMI1
+    ps5: InputHDMI1
+    jbl bar 500: InputHDMI4
+    jbl: InputHDMI4
+
+# Music: Apple Music via Music Assistant (server/music/docker-compose.yml on
+# the primary). MUSIC_ASSISTANT_TOKEN (a long-lived MA token) goes in the mcp
+# env_file. url uses the LAN IP so the fallback box reaches it too.
+music:
+  enabled: true
+  url: http://192.168.1.10:8095
+  timeout_seconds: 10
+  # Search the MA library too: items already in your Apple Music library come
+  # back as library items and are missing from the apple_music results.
+  providers: [library, apple_music]
+  default_player: Kitchen Speaker       # the kitchen AirPlay speaker
+  default_volume: 65              # % a speaker starts at when music begins from idle
+  track_radio: true               # after a single song, keep going with similar ones
+  lyrics_search: true             # "play the song that goes …" via SearXNG
+  # Ducking: from the wake word until the conversation ends (reply played and
+  # follow-up window closed). 25% left commands unintelligible to Whisper.
+  duck_ratio: 0.1
+  # The satellite ducks its AirPlay stream itself on antigua/listening
+  # (PulseAudio, ~50ms); via Music Assistant it took ~1.5s. List players here
+  # only for speakers that can't duck locally.
+  duck_players: []
+  duck_timeout_seconds: 60        # safety net if the bridge's "idle" message is lost
+  # Spoken speaker name → Music Assistant player name ("play X on the soundbar")
+  speakers:
+    kitchen: Kitchen Speaker
+    kitchen speaker: Kitchen Speaker
+    living room: Living Room
+    living room tv: Living Room
+    apple tv: Living Room
+    tv: Living Room
+    soundbar: Soundbar
+    sound bar: Soundbar
+    jbl: Soundbar
+    bedroom: Bedroom (2)
+    homepod: Bedroom (2)
+  # How Antigua names each player in replies ("Playing Halo on the soundbar")
+  labels:
+    Living Room: the living room TV
+    Soundbar: the soundbar
+    Bedroom (2): the bedroom HomePod
+
+govee:
+  mcp_server: govee
+  concurrency: 6             # parallel device commands for group phrases
+  # Alias (from parse_govee_request) → Govee device ID. The server addresses
+  # by ID, so the app's duplicate/misspelled chandelier names don't matter.
+  devices:
+    tv-bar: "AA:BB:CC:DD:EE:FF:00:01"         # model, e.g. H6054 — IDs from the Govee app / list_devices
+    hallway-1: "AA:BB:CC:DD:EE:FF:00:02"
+    hallway-2: "AA:BB:CC:DD:EE:FF:00:03"
+  # Run a scene on these lights while a timer/alarm/reminder rings on the
+  # satellite (spoken announcement + ~5s bell), then restore each light's
+  # power, color/white and brightness. Scenes animate on the device, so it's
+  # ~4 cloud calls per fire — pulsing brightness from the server got the
+  # cloud-only TV bar rate-limited (429). Scene names: list_scenes per device.
+  alarm_flash:
+    enabled: true
+    devices: [tv-bar]
+    seconds: 8
+    scenes:                  # per kind; timer is the default
+      alarm: Sweet           # soft pink/white; Siren read as police lights
+      timer: Sweet
+      reminder: Sweet
+
+calc:
+  # Arithmetic / unit / temperature conversion is always on and offline.
+  # Only currency conversion touches the network (ECB rates via Frankfurter).
+  currency:
+    enabled: true
+    ttl_seconds: 21600       # ECB publishes rates once per business day
+    base: USD                # table kept warm on boot; other bases fetched on demand
+    timeout_seconds: 4
+
+sports:
+  enabled: true
+  live_ttl_seconds: 60       # scoreboard cache (today's/live games) — moves fast
+  team_ttl_seconds: 300      # team record/schedule cache
+  f1_ttl_seconds: 300        # F1 scoreboard cache
+  timeout_seconds: 4
+
+news:
+  ttl_seconds: 1200          # refresh cache every 20 minutes in background
+  max_headlines: 5           # headlines to fetch per source before topic filtering
+  max_tokens_news: 150       # LLM token override for news responses (normal is 80)
+  sources:
+    - name: aljazeera
+      url: https://www.aljazeera.com/xml/rss/all.xml
+    # General world feed, not the middle_east-scoped one — that skewed every
+    # "what's in the news" toward one region regardless of what was asked.
+    - name: bbc
+      url: https://feeds.bbci.co.uk/news/world/rss.xml
+    # Reuters and AP both retired their public RSS feeds outright (not a dead
+    # link to fix — the endpoints are gone). Proxied through a Google News
+    # site-scoped search instead, using the same RSS mechanism topic search
+    # already relies on below.
+    - name: reuters
+      google_query: "site:reuters.com"
+    - name: ap
+      google_query: "site:apnews.com"
+    - name: npr
+      url: https://feeds.npr.org/1001/rss.xml
+    # Category feeds — used when "tech news", "business news", etc. is requested
+    - name: bbc_tech
+      url: https://feeds.bbci.co.uk/news/technology/rss.xml
+      category: tech
+    - name: bbc_science
+      url: https://feeds.bbci.co.uk/news/science_and_environment/rss.xml
+      category: science
+    - name: bbc_business
+      url: https://feeds.bbci.co.uk/news/business/rss.xml
+      category: business
+    - name: reuters_business
+      google_query: "site:reuters.com business"
+      category: business
+
+search:
+  enabled: true
+  url: "http://localhost:8080"
+  result_count: 3            # top N snippets injected as LLM context
+  live_result_count: 6       # wider window for fixtures/results/local news
+  home_city: "New York"       # disambiguates local teams ("Dynamo" -> Dynamo Kyiv otherwise)
+  max_tokens_search: 120     # LLM token budget (default is 65)
+  max_tokens_search_long: 220  # how-to / install answers need room for steps
+  router_enabled: true       # ask the LLM when no pattern matches (~0.5s)
+  router_timeout_seconds: 3
+  timeout_seconds: 4         # fail fast rather than stall TTS
+  # google (web) returns 0 results on this instance — blocked upstream — so it
+  # is left out; google news still works and stays. Verify with:
+  #   curl -sG localhost:8080/search --data-urlencode q=test \
+  #        --data-urlencode engines=google --data-urlencode format=json
+  engines: "bing,duckduckgo"  # ranked snippets; wikipedia runs separately for answer box
+  news_engines: "google news,bing news,bing"  # used for temporal/topic news queries
+  cache_ttl_seconds: 900     # identical queries skip the network for 15 min

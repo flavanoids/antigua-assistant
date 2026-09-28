@@ -1,0 +1,5 @@
+# Apple TV MCP server — separate venv (server/mcp/venv-atv) because it needs
+# Python <=3.13; setup.sh builds it with uv. Pinned: very young project.
+mcp-pyatv==0.2.0     # github.com/crlian/mcp-pyatv
+pyatv==0.18.0        # github.com/postlund/pyatv
+mcp==2.2.0           # mcp-pyatv targets the 2.x SDK (unlike venv/'s servers)

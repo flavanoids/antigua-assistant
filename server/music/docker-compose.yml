@@ -1,0 +1,18 @@
+# Music Assistant — the music server Antigua's music skill drives.
+# Apple Music is the source; players are the AirPlay devices on the LAN
+# (the satellite's shairport-sync = default, Apple TV "Living Room", JBL soundbar,
+# HomePod mini "Bedroom (2)"). Host networking: AirPlay/mDNS discovery and
+# the stream server (8097) need it. UI + API on :8095.
+#   docker compose -f server/music/docker-compose.yml up -d
+# MA_DATA_DIR (where MA keeps config and logins) goes in server/music/.env,
+# which is git-ignored: echo MA_DATA_DIR=/srv/music-assistant > server/music/.env
+services:
+  music-assistant:
+    image: ghcr.io/music-assistant/server:2.10.4   # pinned; bump deliberately
+    container_name: antigua-music-assistant
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ${MA_DATA_DIR:?set MA_DATA_DIR in server/music/.env}:/data   # config, logins, library cache — not in the repo
+    environment:
+      - LOG_LEVEL=info

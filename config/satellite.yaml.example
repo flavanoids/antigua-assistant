@@ -1,0 +1,24 @@
+# Copy to config/satellite.yaml (git-ignored) and set your hosts.
+mqtt:
+  broker: "localhost"           # Mosquitto runs on the satellite itself
+  port: 1883
+
+server:
+  host: "10.77.0.1"             # primary server (WireGuard address, network/README.md)
+  port: 9393
+  fallback_host: "10.77.0.3"    # backup server; takes over when the primary is down
+  fallback_port: 9394
+  health_check_interval: 20     # seconds between primary probes
+
+satellite:
+  antigua_volume_pct: 70        # Antigua speaking level 0-100; independent of the AirPlay sink volume
+  # alarm_ring_seconds: 5.0     # how long a timer/alarm rings before auto-stopping
+  # output_device: "alsa_output.platform-soc_sound.stereo-fallback"
+  #                             # PulseAudio sink (default: HiFiBerry DAC+); see `pactl list short sinks`
+
+display:
+  enabled: false                # PinedaDisplay MQTT integration — off by default
+
+# The satellite is audio output only: TTS/alarm playback + AirPlay via
+# shairport-sync. Wake word + STT capture run in the kitchen-mic bridge
+# (kitchen-mic/bridge/kitchen_bridge.py).

@@ -1,0 +1,394 @@
+# Routing fixtures — utterance -> the route run_pipeline should take.
+#
+# Asserted by tests/test_routing.py against server.antigua_server.classify().
+# Route names must appear in ROUTE_ORDER.
+#
+# This file exists because every skill is regex-routed and the routes compete:
+# is_search_request() already carries six negative guards to stop it stealing
+# utterances from news, weather, time, date, timers and memory. Each new skill
+# adds more. These fixtures turn "did I break an old skill" from something you
+# find out in the kitchen into something you find out before deploying.
+#
+# When adding a skill, add its trigger phrases here AND the phrases from
+# neighbouring skills it is most likely to steal.
+#
+# Two sections:
+#   routes      — must route as stated. A mismatch fails the suite.
+#   known_gaps  — currently route wrong. Recorded, not fixed. The suite fails
+#                 if one starts passing, so fixing a bug forces promoting it
+#                 into `routes` rather than leaving a stale entry behind.
+
+routes:
+
+  volume:
+    - turn it up
+    - turn it down
+    - too quiet
+    - speak up
+    - too loud
+    - turn the volume down
+    # One-word trigger — exempted from the garbage filter (2026-07-27)
+    - louder
+
+  music:
+    # Transport controls (was the `media` route)
+    - next song
+    - next track
+    - skip this song
+    - skip
+    - previous song
+    - go back a track
+    - pause the music
+    - pause
+    - resume the music
+    - stop the music
+    # Bare Alexa-style controls — used to be dropped as one-word noise (2026-09-25)
+    - play
+    - Play!
+    - stop
+    - stop it
+    - continue
+    # Habit from the Echo; STT keeps the name when it's said mid-sentence
+    - Alexa, can you pause?
+    # Whisper's usual mishearing of "play" over music
+    - Played Chapel Room.
+    - restart the song
+    - play it again
+    - replay the album
+    - start the album over
+    - repeat this song
+    - repeat the album
+    - turn off repeat
+    - shuffle
+    - turn off shuffle
+    - what song is this
+    - who sings this
+    - turn the music up
+    - set the music volume to 30
+    - move the music to the soundbar
+    # Playing
+    - play Beyonce
+    - play Beyonce's newest album
+    - play the album Lemonade
+    - play Halo by Beyonce
+    - play the song Halo
+    - play some jazz
+    - play Bad Bunny songs from 2021
+    - play the song that goes I'm in love with the shape of you
+    - play Adele in the bedroom
+    - play Taylor Swift on the living room tv
+    - play the second one
+    - put on some Bad Bunny
+    - I want to hear Rosalia
+    # Discography questions
+    - what are the names of the older albums by Toro y Moi
+    - what's Beyonce's latest album
+    - what albums does Toro y Moi have
+
+  govee:
+    - turn on the hallway lights
+    - turn off all the lights
+    - set the rope light to purple
+    - set the chandelier to 5700 kelvin
+    - make the chandelier daylight
+    - set the hallway lights to warm white
+    - set the tv lights to 50 percent
+    - dim the hallway lights
+    - turn on the pink lights
+    # Collision: "tv bar" / "tv lights" must reach Govee, not the Roku regex.
+    - turn on the tv bar
+    - set the tv bar to blue
+    - hallway lights off
+    - put the pink lights on
+
+  tv:
+    # Promoted from known_gaps (2026-07-27): the TV is tested before volume
+    - volume up on the tv
+    - tv volume down
+    - turn on the tv
+    - turn the tv off
+    - mute the tv
+    - unmute the tv
+    - tv home
+    - go home on the tv
+    - roku back
+    - switch to hdmi 1
+    - switch to live tv
+    - switch to the playstation
+    # App launching (Roku MCP launch_app)
+    - open netflix
+    - put on youtube on the tv
+    - launch disney plus
+    - switch to hulu
+    - pull up espn
+    - open plex
+    # "apple tv" is the same screen
+    - turn on the apple tv
+    - apple tv volume down
+    # Playback needs the TV named; bare "pause" stays with media
+    - pause the tv
+    - resume the apple tv
+
+  time_date:
+    - what time is it
+    - what's the time
+    - what's today's date
+    - what day is it
+    - what's the date today
+
+  weather:
+    - what's the weather
+    - what is the weather
+    - how hot is it outside
+    - will it rain tomorrow
+    - is it going to rain tomorrow
+    - what's the forecast
+    - what's the weather in Dallas
+    - do I need an umbrella today
+    - do I need a jacket
+    - is it cold outside
+    - any rain this weekend
+    - when's sunset
+    - is it warmer than yesterday
+    - what's the weather this Thursday
+
+  display:
+    - show me the city cam
+    - show me times square
+
+  memory_save:
+    - remember that I took my medicine
+    - remember that Alex took his allergy pill
+    - remember I parked in section c
+    - remember that Katherine has a dentist appointment friday
+
+  memory_forget_content:
+    - forget that I took medicine
+    - forget everything about the dentist
+
+  memory_forget_last:
+    - forget the last thing I told you
+    - forget that
+
+  medicine_query:
+    - did I take my medicine
+    - have I taken my meds today
+    - did Alex take his pills
+
+  memory_query:
+    - what did I say I took
+    - what did Alex take today
+    - what did I tell you earlier
+    - what have I told you
+
+  list_add:
+    - add milk to the shopping list
+    - add milk, eggs and bread to the list
+    - put bread on my todo list
+    - add call the vet to my to-do list
+
+  list_query:
+    - what's on my shopping list
+    - what's on the list
+    - read my list
+    - read the todo list
+
+  list_remove:
+    - remove milk from the shopping list
+    - take eggs off the list
+    - delete bread from my todo list
+    - clear the shopping list
+    - empty my list
+
+  timer_cancel:
+    - cancel my timer
+    - cancel the pasta timer
+    - cancel all timers
+    - cancel my 7 am alarm
+    - stop all timers and alarms
+    - cancel the dentist reminder
+    - cancel both timers
+    - cancel the 5 minute timer
+    - cancel the first one
+
+  timer_add:
+    - add 5 minutes to the timer
+    - add two minutes to the pasta timer
+    - add 2 minutes to the 5 minute timer
+    - give it 2 more minutes
+
+  timer_reset:
+    - reset the timer
+    - restart my timer
+
+  timer_status:
+    - how much time is left
+    - how much time is left on my timer
+    # Promoted from known_gaps (2026-07-27): _TIMER_STATUS_RE widened
+    - what timers are running
+    - do I have any timers
+    - when's my alarm
+    - how long is left on the pasta timer
+    - what are my reminders
+    - when's my next reminder
+    - how long until my gym alarm
+    - when is my gym alarm
+    - how much time until my 8 am alarm
+    - what timers do I have
+    - when does the pasta timer go off
+    - how much time is left on the 5 minute timer
+    - how long on the second one
+
+  snooze:
+    - snooze for 5 minutes
+    # One-word trigger — exempted from the garbage filter (2026-07-27)
+    - snooze
+
+  timer_set:
+    - set a timer for 5 minutes
+    - set a pasta timer for 10 minutes
+    - timer for 2 minutes
+    # Promoted from known_gaps: compound durations now parse
+    - set a timer for an hour and a half
+    - set a timer for two and a half minutes
+    - set a 20 minute timer for banana bread
+
+  reminder_set:
+    - remind me in 30 seconds
+    - remind me to move the laundry in 40 minutes
+    - remind me to call the dentist at 3 tomorrow
+    - remind me to take out the trash tonight at 8
+    - set a reminder to call mom at 6pm
+    - remind me in 2 hours to check the roast
+    - remind me to water the plants every morning at 9
+    - don't let me forget to take the trash out tonight
+    - remind me to water the garden tomorrow morning
+    # Under-specified (a day, no time) — routes here; the handler asks the time.
+    - remind me to call the dentist tomorrow
+    - remind me to email the landlord on friday
+    # Steal-guards:
+    #   "remind me to bring an umbrella" -> llm  (no day and no time)
+    #   "wake me up at 7 am"             -> alarm_set
+
+  alarm_set:
+    - wake me up at 7 am
+    - set an alarm for 6 30 am
+    # Promoted from known_gaps: am/pm no longer required
+    - wake me at seven tomorrow
+    - set an alarm for every weekday at 7
+    - every morning at 6:45
+    - wake me up at 5 every monday and wednesday
+
+  news:
+    - what's in the news
+    # Promoted from known_gaps (2026-07-27): is_local_news_query narrowed to places
+    - news about ukraine
+    - reuters headlines on the middle east
+    - give me the headlines
+    - al jazeera headlines
+    - reuters headlines
+    - what's the tech news
+    - business news
+
+  calc:
+    - what's 12 times 13
+    - what is 100 divided by 4
+    - what's 15% of 80
+    - what's 25 percent off 40 dollars
+    - what's a 20% tip on a 47 dollar check
+    - half of 250
+    - how many ml in 2 cups
+    - how many cups are in a gallon
+    - 5 miles in km
+    - convert 350 fahrenheit to celsius
+    - 50 dollars in euros
+    - how much is 20 dollars in pesos
+    - convert 100 euros to dollars
+    # Steal-guards: neighbouring skills must keep these.
+    #   "set a timer for 5 minutes"   -> timer_set   (timer block runs first)
+    #   "add 5 minutes to the timer"  -> timer_add
+    #   "is it warmer than yesterday" -> weather      (weather gate runs first)
+
+  sports:
+    # NFL/MLB/NBA/MLS/F1 — answered deterministically by sports.answer()
+    # instead of falling to search (moved out of the search: section below).
+    - who won the astros game last night
+    - when is the next dynamo game
+    - what's the score of the rockets game
+    - did the texans win
+    - what's the astros record
+    - who won the packers game
+    - when do the 49ers play next
+    - who won the last f1 race
+    - when's the next grand prix
+    # Giants/Cardinals are shared by NFL and MLB — a qualifier picks the
+    # league; sports.resolve_team() still claims the ambiguous form (falls
+    # back to a documented default rather than guessing wrong or asking).
+    - who won the football giants game
+    - who won the baseball giants game
+    - who won the giants game
+    # Steal-guards: neighbouring skills must keep these.
+    #   "I met a Texans fan yesterday" -> llm     (no sports verb nearby)
+
+  substitution:
+    - what can I use instead of buttermilk
+    - what's a substitute for eggs
+    - I don't have baking powder what can I use
+
+  search:
+    - who is the ceo of starbucks
+    - search for the best cast iron skillet
+    # Local news routes to search rather than the RSS cache, by design.
+    - what's happening in chicago
+    - any news in chicago today
+    # Claimed by _SEARCH_FACTUAL_RE. Arguably training data would do, but
+    # searching a settled fact is harmless — pinning it so a regex change
+    # that flips it is at least visible.
+    - who was the first president of mexico
+
+  llm:
+    - tell me a joke
+    # "play" that isn't music
+    - play a game with me
+    - how do you play chess
+    - who played Batman in the first movie
+    # Naming an app without a launch verb isn't a TV command.
+    - I watched netflix last night
+    - is youtube down
+    - how do you make risotto
+    - why is the sky blue
+    - what's the difference between baking soda and baking powder
+    - tell me a story about a lighthouse
+    # Status questions about lights go to the LLM, not the Govee side-effect.
+    - are the hallway lights on
+    # Mentioning the lights isn't a command — this was Antigua's own reply
+    # heard back by the kitchen mic (2026-09-23), and it switched them all on.
+    - You're not going to the lights. What if I got the door open and the lights on?
+    - I left the hallway lights on all day
+    # A reminder with no trigger time isn't one we can set — falls through.
+    - remind me to bring an umbrella
+    # Sports steal-guard: a team name alone, with no sports verb, isn't sports.
+    - I met a Texans fan yesterday
+    # classify() never consults the LLM search router, so anything only the
+    # router would claim is expected to land here. In the live pipeline these
+    # do reach search, ~0.5s later.
+    - how much does a switch 2 cost
+
+  garbage:
+    - ""
+    - uh
+    - mm
+
+# ── Known gaps ───────────────────────────────────────────────────────────────
+# Real divergences between documented behaviour and actual routing, found when
+# this harness was first run (2026-07-27). Not fixed here — Phase 0 builds the
+# net, it does not swing at what falls into it.
+
+known_gaps:
+
+  - utterance: what do you remember about katherine
+    expected: memory_query
+    actual: llm
+    note: >
+      "what do you remember about X" is not matched by is_memory_query(),
+      so the memory store is never consulted and the LLM answers from nothing.

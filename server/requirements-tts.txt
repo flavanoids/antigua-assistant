@@ -1,0 +1,9 @@
+# Kokoro TTS server (kokoro_tts_server_flask.py, antigua-tts.service) on
+# the primary and the backup. Also needs espeak-ng from the OS package manager and
+# the kokoro-v1.0 .onnx + voices .bin files in models/.
+Flask~=3.1.3
+kokoro-onnx~=0.4.7
+numpy>=2.5,<3
+onnxruntime~=1.28.0
+phonemizer-fork~=3.3.1
+soundfile~=0.14.0

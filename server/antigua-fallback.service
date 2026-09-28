@@ -1,0 +1,21 @@
+# Installed on the backup by server/scripts/deploy_fallback.sh
+[Unit]
+Description=Antigua Fallback Server (TTS-only until the primary is down)
+After=network-online.target ollama.service antigua-tts.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@ANTIGUA_DIR@
+Environment=PYTHONUNBUFFERED=1
+# Whisper tiny is pre-fetched by deploy_fallback.sh; the takeover must not
+# depend on reaching huggingface.co.
+Environment=HF_HUB_OFFLINE=1
+ExecStart=@ANTIGUA_DIR@/venv/bin/python3 @ANTIGUA_DIR@/server/antigua_fallback_server.py
+Restart=always
+RestartSec=5
+StandardOutput=append:@ANTIGUA_DIR@/logs/fallback.log
+StandardError=append:@ANTIGUA_DIR@/logs/fallback.log
+
+[Install]
+WantedBy=multi-user.target

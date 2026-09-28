@@ -1,0 +1,6 @@
+# Third-party MCP servers Antigua runs (stdio). Installed into server/mcp/venv
+# on the primary and the backup — see server/mcp/setup.sh. Pinned: both are young
+# projects and the pipeline depends on their tool names and argument shapes.
+mcp-remote-control==0.1.0   # Roku ECP  — github.com/AaronGoldsmith/mcp-remote-control
+govee-mcp==0.2.1            # Govee LAN+cloud — github.com/evefromwayback/govee-mcp
+mcp>=1.23.3,<2              # both servers import mcp.server.fastmcp, removed in SDK 2.x

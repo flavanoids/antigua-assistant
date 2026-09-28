@@ -1,0 +1,41 @@
+# Copy to config.yaml (gitignored) once the device is flashed and on the LAN.
+device:
+  host: "kitchen-mic.local"   # or a static IP once known
+  port: 6053                  # ESPHome native API default
+  noise_psk: "PASTE_api_encryption_key_FROM_secrets.yaml"
+
+# Placeholder for the "where does this run" decision from the README —
+# not consumed by receiver.py yet, just documenting the choice to make.
+run_on: "primary"   # informational: which box runs this copy
+
+# See README's "Two open decisions": if true, receiver.py calls the
+# device's start_va custom action right after each pipeline stop instead
+# of relying on on-device micro_wake_word.
+continuous_external_trigger: false
+
+# mosquitto broker — kitchen_bridge.py subscribes to antigua/done here to
+# know when the Pi has finished playing a response, so it can open the
+# follow-up listening window at the right time.
+mqtt:
+  broker: "10.77.0.2"   # the satellite, where mosquitto runs — over wg0 (network/README.md)
+  port: 1883
+
+# Short "I'm listening" cue published to antigua/cue when the wake word fires.
+# Served by antigua_server.py from server/static_audio/. Omit to disable.
+wake_cue_url: "http://10.77.0.1:9393/audio/wake_cue.wav"
+
+# Where kitchen replies play. "pi" (default): antigua/play -> the satellite's
+# speakers; the mic is muted while Antigua talks. "device": the reSpeaker's
+# own 3.5mm/speaker output, so its XMOS echo canceller has a reference —
+# no playback mute, and the wake word interrupts a reply. Needs a speaker
+# plugged into the reSpeaker.
+reply_output: "pi"
+
+# Failover (see kitchen_bridge.py docstring). Where turns go, and where they
+# go instead when server_url refuses the connection (antigua-server down).
+server_url: "http://localhost:9393/pipeline"
+fallback_server_url: "http://10.77.0.3:9394/pipeline"   # backup server over wg0
+
+# Set only on the standby copy (the backup box, written by deploy_fallback.sh):
+# stay off the reSpeaker while this host answers, take over when it doesn't.
+# standby_for_host: "192.168.1.10"   # the primary's LAN IP

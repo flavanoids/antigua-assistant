@@ -1,0 +1,7 @@
+aioesphomeapi>=29.0.0
+PyYAML
+paho-mqtt>=2.0.0
+numpy
+requests
+openwakeword>=0.4.0
+onnxruntime

@@ -1,0 +1,15 @@
+# Antigua's ports answer only over the wg0 tunnel and localhost — never the LAN.
+# Installed to /etc/antigua/guard.nft by network/wg-mesh.sh, which fills in
+# @PORTS@ (this host's Antigua ports) and @VERDICT@ (drop, or accept while
+# observing). Its own table, so reloading it never touches Docker's rules.
+table inet antigua_guard
+delete table inet antigua_guard
+
+table inet antigua_guard {
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iifname { "lo", "wg0" } accept
+		tcp dport { @PORTS@ } limit rate 10/minute log prefix "antigua-guard: " level info
+		tcp dport { @PORTS@ } counter @VERDICT@
+	}
+}

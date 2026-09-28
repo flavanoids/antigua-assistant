@@ -1,0 +1,207 @@
+# Entry point only — the actual XMOS/I2C bring-up and micro_wake_word setup
+# live in the community-maintained base config. Do not hand-roll that part;
+# it's non-trivial hardware init. Everything below the credentials is an
+# override: Antigua's kitchen bridge owns the LED and the user button.
+packages:
+  respeaker-satellite: github://formatBCE/Respeaker-Lite-ESPHome-integration/config/common/respeaker-satellite-base.yaml@main
+
+esphome:
+  name: kitchen-mic
+  friendly_name: Kitchen Mic
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+  # Called by kitchen_bridge.py. led_state: 0 idle, 1 listening (voice-level
+  # glow), 2 thinking, 3 speaking, 4 follow-up window, 5 error flash,
+  # 6 do-not-disturb. led_level: 0..1 voice loudness, ~12 Hz while listening.
+  actions:
+    - action: led_state
+      variables:
+        state: int
+      then:
+        - lambda: id(bridge_led) = state;
+        - script.execute: control_leds
+        - if:
+            condition:
+              lambda: return state == 5;
+            then:
+              - script.execute: led_error_timeout
+    - action: led_level
+      variables:
+        level: float
+      then:
+        - lambda: id(voice_level) = level;
+
+# Antigua's bridge does wake detection. The on-device micro_wake_word models
+# (okay nabu, hey jarvis, ...) only cost ESP32 CPU — and a detection while
+# the voice assistant runs stops the stream the bridge is listening to.
+voice_assistant:
+  on_client_connected:
+    - micro_wake_word.stop:
+
+sensor:
+  # XMOS neural voice-to-noise estimate, 0-100. The bridge logs it at each
+  # wake so false triggers can be told apart from real speech.
+  - platform: template
+    id: vnr
+    name: "Voice-to-noise ratio"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 250ms
+    lambda: return id(respeaker)->read_vnr();
+    filters:
+      - delta: 3
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# Bring-up used VERY_VERBOSE; formatting that much log output competes with
+# the audio stream on the ESP32. DEBUG stays compiled in (selectable at
+# runtime via the "Logger Level" entity); it just starts at INFO.
+logger:
+  initial_level: INFO
+
+globals:
+  - id: bridge_led
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: voice_level
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+light:
+  - id: !extend led_internal
+    effects:
+      # Brightness follows the speaker's voice: fast attack, slow release, and
+      # the target decays on its own if the bridge stops sending levels.
+      - addressable_lambda:
+          name: "Voice Level"
+          update_interval: 16ms
+          lambda: |-
+            static float cur = 0.0f;
+            float target = id(voice_level);
+            cur += (target - cur) * (target > cur ? 0.5f : 0.12f);
+            id(voice_level) *= 0.97f;
+            float f = 0.15f + 0.85f * cur;
+            auto v = id(led_internal)->current_values;
+            it[0].set_rgb(v.get_red() * 255 * f, v.get_green() * 255 * f, v.get_blue() * 255 * f);
+      - addressable_lambda:
+          name: "Breathe"
+          update_interval: 20ms
+          lambda: |-
+            float ph = (millis() % 3000) / 3000.0f;
+            float f = 0.2f + 0.8f * (0.5f - 0.5f * cosf(ph * 2.0f * M_PI));
+            auto v = id(led_internal)->current_values;
+            it[0].set_rgb(v.get_red() * 255 * f, v.get_green() * 255 * f, v.get_blue() * 255 * f);
+
+# The hardware mute is handled by the XMOS; just repaint when it changes.
+respeaker_lite:
+  mute_state:
+    on_state:
+      - script.execute: control_leds
+
+script:
+  # Replaces the base config's control_leds, which is driven by HA voice
+  # assistant phases (meaningless in continuous external-trigger mode) and
+  # checks the user button first — stuck "pressed" without the D2 jumper.
+  - id: !remove control_leds
+  - id: control_leds
+    mode: restart
+    then:
+      - lambda: |-
+          id(check_if_timers_active).execute();
+          if (id(is_timer_active)) id(fetch_first_active_timer).execute();
+          if (id(improv_ble_in_progress)) { id(control_leds_improv_ble_state).execute(); return; }
+          if (id(init_in_progress)) { id(control_leds_init_state).execute(); return; }
+          if (!id(wifi_id).is_connected() || !id(api_id).is_connected()) {
+            id(control_leds_no_ha_connection_state).execute(); return;
+          }
+          if (id(timer_ringing).state) { id(control_leds_timer_ringing).execute(); return; }
+
+          auto show = [](float r, float g, float b, float bright, const char *effect) {
+            id(led_internal).turn_on().set_rgb(r, g, b).set_brightness(bright)
+                .set_effect(effect).set_transition_length(0).perform();
+          };
+          if (id(mute_state).state) { show(1.0, 0.0, 0.0, 0.6, "None"); return; }
+          switch (id(bridge_led)) {
+            case 1: show(0.0, 0.8, 1.0, 1.0, "Voice Level"); return;
+            case 2: show(0.1, 0.3, 1.0, 0.8, "Slow Pulse"); return;
+            case 3: show(0.0, 0.8, 1.0, 0.7, "Breathe"); return;
+            case 4: show(0.0, 0.8, 1.0, 0.25, "None"); return;
+            case 5: show(1.0, 0.45, 0.0, 0.8, "Fast Pulse"); return;
+            case 6: show(0.5, 0.0, 1.0, 0.12, "None"); return;
+          }
+          if (id(is_timer_active)) { id(control_leds_timer_ticking).execute(); return; }
+          if (id(alarm_on).state) { id(control_leds_alarm_active).execute(); return; }
+          id(control_leds_voice_assistant_idle_phase).execute();
+  - id: led_error_timeout
+    mode: restart
+    then:
+      - delay: 1500ms
+      - lambda: if (id(bridge_led) == 5) id(bridge_led) = 0;
+      - script.execute: control_leds
+
+binary_sensor:
+  # Replaces the base config's button, which drove HA pipelines and a
+  # 22s-hold factory reset. Every gesture is now just an event for the bridge.
+  # Needs the USR->D2 jumper; until then GPIO3 reads stuck-pressed and the
+  # bridge ignores events (it waits to see the button released once).
+  - id: !remove user_button
+  - platform: gpio
+    id: user_button
+    name: "User button"
+    # Pull-up (2026-09-24): without it the pin floated and read as a held
+    # button — 38 phantom long presses overnight 09-23, toggling
+    # do-not-disturb until it stuck on and the morning's wake words were ignored.
+    pin:
+      number: GPIO3  # D2
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_multi_click:
+      - timing:
+          - ON for at most 1s
+          - OFF for at least 0.25s
+        then:
+          - event.trigger:
+              id: button_press_event
+              event_type: single_press
+      - timing:
+          - ON for at most 1s
+          - OFF for at most 0.25s
+          - ON for at most 1s
+          - OFF for at least 0.25s
+        then:
+          - event.trigger:
+              id: button_press_event
+              event_type: double_press
+      # 2.5s so a brief glitch or an accidental lean can't toggle do-not-disturb.
+      - timing:
+          - ON for at least 2.5s
+        then:
+          - event.trigger:
+              id: button_press_event
+              event_type: long_press
+
+event:
+  - id: !extend button_press_event
+    event_types:
+      - single_press
+
+# Antigua's TTS is WAV; the base config only compiles in FLAC, so the
+# reSpeaker's media player can't play replies (reply_output: device) without it.
+audio:
+  codecs:
+    wav:

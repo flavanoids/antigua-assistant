@@ -1,0 +1,22 @@
+# Tool config only — Antigua isn't an installable package. Dependencies live in
+# server/requirements.txt, server/requirements-tts.txt, requirements-satellite.txt
+# and kitchen-mic/bridge/requirements.txt.
+
+[tool.ruff]
+target-version = "py311"   # oldest interpreter in use (the satellite Pi)
+extend-exclude = ["venv", "venv-*"]
+
+[tool.ruff.lint]
+# Bug-catching rules only. ruff's newer defaults add ~300 style findings.
+select = ["E4", "E7", "E9", "F", "B"]
+ignore = ["B905"]          # zip(strict=) — noise for this codebase
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E731"]       # lambda stubs are fine in tests
+
+[tool.pytest.ini_options]
+# Each tests/test_*.py is a standalone script (python3 tests/test_x.py);
+# tests/conftest.py runs each one in its own subprocess, so pytest must not
+# also import them as modules.
+testpaths = ["tests"]
+python_files = ["__suites_run_via_conftest__"]

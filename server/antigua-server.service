@@ -1,0 +1,16 @@
+[Unit]
+Description=Antigua Voice Assistant Server
+After=network.target ollama.service
+
+[Service]
+Type=simple
+WorkingDirectory=@ANTIGUA_DIR@
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@ANTIGUA_DIR@/venv/bin/python3 @ANTIGUA_DIR@/server/antigua_server.py
+Restart=always
+RestartSec=5
+StandardOutput=append:@ANTIGUA_DIR@/logs/server.log
+StandardError=append:@ANTIGUA_DIR@/logs/server.log
+
+[Install]
+WantedBy=multi-user.target

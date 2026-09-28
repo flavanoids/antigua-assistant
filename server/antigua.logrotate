@@ -1,0 +1,13 @@
+# Installed as /etc/logrotate.d/antigua. These logs hold transcripts of what
+# the kitchen mic heard, so keep 7 days, same as kitchen-mic captures.
+# deploy_fallback.sh installs a copy with the path rewritten for the backup.
+@ANTIGUA_DIR@/logs/*.log {
+    daily
+    rotate 6
+    maxage 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

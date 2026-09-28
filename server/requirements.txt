@@ -1,0 +1,13 @@
+# Antigua server (antigua_server.py on the primary, antigua_fallback_server.py on
+# the backup) and the shared antigua_core package. Python 3.11+.
+# Versions are the ones running on both boxes as of 2026-09-28.
+#   python3 -m venv venv && venv/bin/pip install -r server/requirements.txt
+faster-whisper~=1.2.1   # CPU fallback STT + re-hearing; primary is whisper.cpp
+feedparser~=6.0.14      # news headlines
+num2words~=0.5.14       # numbers -> words for TTS
+paho-mqtt~=2.1.0
+PyYAML~=6.0.3
+requests~=2.34.2
+
+# Optional: speaker ID (server/scripts/enroll_speaker.py). Not installed yet.
+#   speechbrain torch torchaudio

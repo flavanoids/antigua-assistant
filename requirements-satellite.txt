@@ -1,0 +1,5 @@
+# Satellite (antigua_satellite.py) on the Pi. Python 3.11+.
+# Also needs PulseAudio (parec/paplay) from the OS package manager.
+paho-mqtt~=2.1.0
+PyYAML~=6.0.3
+requests~=2.34.2

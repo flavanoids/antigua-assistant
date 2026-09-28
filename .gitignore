@@ -1,0 +1,88 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.venv/
+venv/
+venv-py312/
+
+# AI coding assistant files
+CLAUDE.md
+AGENTS.md
+SOUL.md
+*.claude
+plan/
+PLAN*.md
+IMPLEMENTATION_PLAN.md
+SESSION_NOTES.md
+LATENCY.md
+
+# Runtime data (memories, etc.)
+data/
+
+# Logs
+logs/
+*.log
+
+# Generated audio
+audio_out/
+audio_in/
+
+# Models and binaries (large files — install separately)
+models/
+whisper.cpp/
+rocm_compat/
+
+# MIOpen GPU kernel cache
+.miopen_cache/
+
+# Tool caches
+.ruff_cache/
+
+# Secrets / local overrides. Real config is per machine; the tracked
+# *.example.* files are the templates (a fresh clone falls back to them).
+server/config/server.yaml
+server/config/system_prompt.txt
+config/satellite.yaml
+.env
+*.secret
+server/config/mcp.env
+server/config/pyatv.conf
+server/mcp/venv-atv/
+
+# Editor / manual backups
+*.bak
+*.bak.*
+
+# OS
+.DS_Store
+Thumbs.db
+server/mcp/venv*/
+
+# Never commit recordings or chat/transcript logs (2026-09-28). Mic audio
+# includes overheard household speech. Only generated cues are tracked;
+# .githooks/pre-commit enforces this even for `git add -f`.
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.opus
+*.m4a
+*.aac
+*.webm
+*.pcm
+*.raw
+!/audio/*.wav
+!/server/static_audio/*.wav
+captures/
+kitchen-mic/bridge/tools/fixtures/
+transcripts/
+conversations/
+chat_logs/
+*.jsonl
+.claude/
+server/scripts/deploy.env
+network/hosts.conf
+.githooks/private-patterns
+searxng/searxng/settings.yml

@@ -1,0 +1,16 @@
+[Unit]
+Description=Antigua Kitchen Mic Bridge (reSpeaker Lite)
+After=network.target antigua-server.service
+
+[Service]
+Type=simple
+WorkingDirectory=@ANTIGUA_DIR@/kitchen-mic/bridge
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@ANTIGUA_DIR@/kitchen-mic/bridge/venv/bin/python3 @ANTIGUA_DIR@/kitchen-mic/bridge/kitchen_bridge.py
+Restart=always
+RestartSec=5
+StandardOutput=append:@ANTIGUA_DIR@/logs/kitchen-bridge.log
+StandardError=append:@ANTIGUA_DIR@/logs/kitchen-bridge.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,30 @@
+# Copy to settings.yml (git-ignored) and set server.secret_key.
+use_default_settings: true
+
+server:
+  secret_key: "CHANGE_ME"   # openssl rand -hex 32
+  bind_address: "0.0.0.0"
+  port: 8080
+  limiter: false
+  image_proxy: false
+
+search:
+  safe_search: 0
+  default_lang: en-US
+  formats:
+    - json
+
+engines:
+  - name: google images
+    disabled: true
+  - name: google videos
+    disabled: true
+  - name: bing images
+    disabled: true
+  - name: bing videos
+    disabled: true
+
+ui:
+  static_use_hash: true
+  infinite_scroll: false
+  default_theme: simple

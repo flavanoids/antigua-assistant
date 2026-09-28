@@ -1,0 +1,8 @@
+[Unit]
+Description=Antigua: delete kitchen-mic captures older than 7 days
+
+[Service]
+Type=oneshot
+# -print logs each deletion to the journal (journalctl -u captures-prune).
+# deploy_fallback.sh rewrites the path for the backup.
+ExecStart=/usr/bin/find @ANTIGUA_DIR@/kitchen-mic/bridge/captures -type f -name '*.wav' -mmin +10080 -print -delete

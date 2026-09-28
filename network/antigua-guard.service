@@ -1,0 +1,17 @@
+[Unit]
+Description=Antigua guard: Antigua ports reachable only over wg0 and localhost
+Documentation=file://@ANTIGUA_DIR@/network/README.md
+DefaultDependencies=no
+Wants=network-pre.target
+Before=network-pre.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/antigua/guard.nft
+ExecReload=/usr/sbin/nft -f /etc/antigua/guard.nft
+ExecStop=/usr/sbin/nft delete table inet antigua_guard
+
+[Install]
+WantedBy=sysinit.target

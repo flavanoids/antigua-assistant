@@ -1,0 +1,25 @@
+# Lint + the network-free test suites on every push and pull request.
+# 3.11 is the oldest interpreter in use (the satellite Pi).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: server/requirements.txt
+      - run: pip install -r server/requirements.txt pytest ruff
+      - run: ruff check .
+      - run: pytest -v

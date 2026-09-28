@@ -1,0 +1,7 @@
+esphome/secrets.yaml
+esphome/.esphome/
+bridge/config.yaml
+bridge/captures/
+bridge/venv/
+bridge/__pycache__/
+bridge/wake_samples/

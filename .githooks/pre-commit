@@ -1,0 +1,37 @@
+#!/bin/sh
+# Block recordings and chat/transcript logs from ever being committed.
+# Only generated cues in audio/ and server/static_audio/ are allowed.
+# Enable per clone: git config core.hooksPath .githooks
+bad=$(git diff --cached --name-only --diff-filter=ACR | grep -iE \
+  '\.(wav|mp3|flac|ogg|opus|m4a|aac|webm|pcm|raw|log|jsonl)$|(^|/)(captures|transcripts|conversations|chat_logs|logs|fixtures)/' \
+  | grep -vE '^(audio/[^/]+\.wav|server/static_audio/[^/]+\.wav)$' \
+  | grep -vE '^tests/fixtures/[^/]+\.(ya?ml|json)$')
+if [ -n "$bad" ]; then
+  echo "pre-commit: refusing to commit recordings or chat/transcript logs:" >&2
+  echo "$bad" | sed 's/^/  /' >&2
+  exit 1
+fi
+
+# Block personal details (home IPs, paths, names, location) in added lines.
+# Patterns are extended regexes, one per line, in .githooks/private-patterns —
+# git-ignored, because listing them in a tracked file would publish them.
+# Real values belong in the git-ignored configs (*.example.* are the templates).
+top=$(git rev-parse --show-toplevel)
+patterns=$(mktemp)
+trap 'rm -f "$patterns"' EXIT
+printf '%s\n' 'ssh -i ' 'BEGIN [A-Z ]*PRIVATE KEY' >"$patterns"
+if [ -f "$top/.githooks/private-patterns" ]; then
+  grep -Ev '^[[:space:]]*(#|$)' "$top/.githooks/private-patterns" >>"$patterns"
+fi
+# LICENSE is exempt: the copyright holder's name is meant to be public.
+leaks=$(git diff --cached --name-only --diff-filter=ACMR -- . ':!.githooks/pre-commit' ':!LICENSE' \
+  | while IFS= read -r f; do
+  git diff --cached -U0 -- "$f" | grep '^+' | grep -v '^+++' \
+    | grep -Ef "$patterns" | sed "s|^+|$f: |"
+done)
+if [ -n "$leaks" ]; then
+  echo "pre-commit: personal details in added lines (see .githooks/private-patterns):" >&2
+  printf '%s\n' "$leaks" | cut -c1-160 | sed 's/^/  /' >&2
+  echo "Move them to a git-ignored config, or git commit --no-verify if intended." >&2
+  exit 1
+fi
