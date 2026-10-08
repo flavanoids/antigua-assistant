@@ -1,0 +1,32 @@
+# Places for drive times ("how long to get to Mom's house?").
+#
+# Copy to server/config/places.yaml and chmod 600 it. places.yaml is
+# git-ignored and never published; this example is only a template and is
+# never read by Antigua.
+#
+# Privacy:
+#   - Addresses here are never spoken, logged, or given to the LLM. Replies
+#     name a favorite only ("It's about 20 minutes to Mom's house").
+#   - An address is looked up once on Photon (OpenStreetMap) and cached as
+#     coordinates in data/commute_places.json (chmod 600). To skip that lookup
+#     entirely, give lat/lon instead of an address.
+#   - Routes are requested with home and favorites rounded to ~100 m.
+#   - Antigua's ports only answer over the WireGuard mesh (network/README.md),
+#     so other devices on the LAN can't ask it about these.
+
+home:
+  address: "350 5th Ave, New York, NY 10118"
+  # lat: 40.748
+  # lon: -73.986
+
+favorites:
+  - name: Mom's house          # what Antigua says back
+    aliases: [mom, my mom's, mom and dad's]   # other ways you'll say it
+    address: "1 Example St, Springfield, IL"
+  - name: work
+    aliases: [the office, my office]
+    lat: 40.7128
+    lon: -74.0060
+  # - name: Sean's apartment
+  #   say_as: Shaun's apartment  # respelling for TTS
+  #   address: "..."

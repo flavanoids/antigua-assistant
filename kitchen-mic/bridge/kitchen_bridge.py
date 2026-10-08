@@ -62,7 +62,8 @@ from openwakeword import VAD
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    # Milliseconds, so wake -> cue -> reply timing can be read off the log.
+    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("kitchen-bridge")
@@ -82,11 +83,19 @@ WAKE_WORD = "alexa"
 # >= 0.75, while 8 of 37 false wakes (TV, talk nearby) scored 0.62-0.70.
 WAKE_WORD_THRESHOLD = 0.75
 WAKE_WORD_CONFIRM_FRAMES = 3
-ENERGY_GATE_RMS = 150
+# No energy gate (removed 2026-10-01): it skipped frames under RMS 150, so in
+# a quiet room openWakeWord saw "Alexa" with holes in it and every quiet frame
+# reset the confirm count — a replayed "Alexa" + pause at moderate volume
+# never fired. It was a Pi CPU saver; on noegpu01 a frame costs ~1.5ms.
+# Near-misses (2026-10-01): a score burst that peaks at NEAR_MISS_SCORE or
+# more without waking is logged and its audio saved, so misses can be tuned
+# from data — before this a missed "Alexa" left no trace at all.
+NEAR_MISS_SCORE = 0.4
+NEAR_MISS_AUDIO_S = 2.5
 DEBOUNCE_S = 3.0
 OWW_CHUNK_BYTES = 1280 * SAMPLE_WIDTH  # 80ms, matches openWakeWord's expected frame size
 # openWakeWord keeps a rolling window of audio features, and the bridge stops
-# feeding it while recording/muted (and skips frames under the energy gate).
+# feeding it while recording/muted.
 # Left alone, the window still holds the last "Alexa", so the next loud sound
 # of any kind scored 1.0 and re-woke Antigua — the "Oh"/"Yep" turns answered
 # with "didn't catch that" (2026-09-23). Flushing silence through it clears it.
@@ -112,11 +121,16 @@ NO_SPEECH_TIMEOUT_S = 3.0  # give up if no speech at all follows the wake word/p
 # got no reply at all. If the window had real energy, send it to STT anyway;
 # an empty transcript gets the server's "didn't catch that" reply instead of
 # silence. Follow-up turns still drop silently (TV-loop guard).
-FALLBACK_LOUD_RMS = ENERGY_GATE_RMS * 2
+FALLBACK_LOUD_RMS = 300
 FALLBACK_MIN_LOUD_S = 0.6  # after the preroll; the ~0.6s wake cue decays well under this at the mic
 
 WATCHDOG_CHECK_S = 5     # how often to check for a stalled stream
 WATCHDOG_STALL_S = 30    # no audio at all for this long -> force reconnect
+# Mic stream gaps (2026-10-01): wakes sometimes feel 1-2s late though the
+# detector fires ~50ms after the word. A gap this long between audio packets
+# means the reSpeaker's stream stalled or bunched up on Wi-Fi.
+AUDIO_GAP_WARN_S = 0.3
+AUDIO_GAP_LOG_EVERY_S = 10
 
 SERVER_URL = "http://localhost:9393/pipeline"
 
@@ -140,18 +154,53 @@ FOLLOWUP_VAD_TRIGGER_THRESHOLD = 0.5  # speech-prob bar to open a follow-up turn
 # answered. The window still accepts the wake word to continue the conversation.
 FOLLOW_UP_SPEECH_TRIGGER = False
 SLEEP_WORDS = frozenset(["thank you", "thanks", "stop", "stop listening", "goodbye", "that's all"])
-MAX_PLAYING_MUTE_S = 20  # safety ceiling in case antigua/done is ever lost
+# Safety ceiling on the playback mute in case antigua/done is ever lost.
+# A flat 20s (until 2026-10-01) ran out mid-reply on long answers (knowledge,
+# recipes) and unmuted the mic while Antigua was still talking — 12 times in
+# a week. Now: AWAITING_REPLY_MUTE_S until the server answers (matches the
+# POST timeout), then sized to the reply text.
+AWAITING_REPLY_MUTE_S = 60
+REPLY_MUTE_BASE_S = 10
+REPLY_CHARS_PER_S = 12   # Kokoro speaks ~15; slower here so the ceiling errs long
+REPLY_MUTE_MAX_S = 180
 # TV-voice-hijack guard (2026-09-21): a false wake near the soundbar used to
 # loop indefinitely — every response re-armed an 8s follow-up window that the
 # TV's dialogue kept filling. Capping consecutive follow-up turns ends any
 # such loop after at most MAX_FOLLOWUP_TURNS responses; conversation resumes
 # normally with an explicit wake word.
 MAX_FOLLOWUP_TURNS = 2
+# Answers without the wake word (2026-10-01): when the server flags a reply
+# expects_reply — a fixed skill question with a pending handler ("Which one?",
+# "Do you have everything?", "Want me to play Friday's?"), never LLM text —
+# the follow-up window takes plain speech. The 09-23 loops came from speech
+# windows after every reply; this one only follows a question, opens after
+# antigua/done (so not on Antigua's own voice), and an answer that doesn't
+# get another question back closes it. MAX_ANSWER_TURNS caps a run of them.
+MAX_ANSWER_TURNS = 6
+# Cooking (2026-10-06): while a recipe is open the server flags every recipe
+# reply expects_reply + recipe_mode, so "next"/"repeat that" right after a step
+# needs no wake word. A checklist or a whole recipe runs well past 6 answers;
+# this is only a backstop for a loop. A non-recipe reply closes the run anyway.
+MAX_RECIPE_TURNS = 40
+ANSWER_SPEECH_CHUNKS = 3  # 90ms of speech in a row opens the turn, not a blip
+# Conversation mode (2026-10-04): "let's chat" — the server flags its replies
+# chat_mode, and while it's on every follow-up window takes plain speech, with
+# no turn cap. The server's addressee check is the guard against the TV and
+# side conversations (it ends the chat silently); here the window just stays
+# open longer, and the wake word may cut a reply short.
+CHAT_TIMEOUT_S = 20
+# Barge-in: "Alexa" while a chat reply plays on the Pi stops it. The mic hears
+# that reply (no AEC for the Pi's speakers), so the bar is well above
+# WAKE_WORD_THRESHOLD — her own voice must never trip it.
+BARGE_IN_THRESHOLD = 0.9
 
 # LED + user button (2026-09-23). led_state values must match the led_state
 # action in esphome/kitchen-mic.yaml; the device runs the animations, the
 # bridge only says which state and, while recording, how loud the voice is.
-LED_IDLE, LED_LISTENING, LED_THINKING, LED_SPEAKING, LED_FOLLOWUP, LED_ERROR, LED_DND = range(7)
+# LED_ANSWER (2026-10-06): the follow-up window takes plain speech (a skill
+# question or a recipe step) — green, so it reads differently from
+# LED_FOLLOWUP's dim cyan, where the wake word is still needed.
+LED_IDLE, LED_LISTENING, LED_THINKING, LED_SPEAKING, LED_FOLLOWUP, LED_ERROR, LED_DND, LED_CHAT, LED_ANSWER = range(9)
 # Long press toggles do-not-disturb. Off until the reSpeaker is reflashed with
 # the GPIO3 pull-up (esphome/kitchen-mic.yaml, 2026-09-24): the floating pin
 # fired 38 phantom long presses overnight 09-23 and left DND stuck on 06:05-09:27,
@@ -176,6 +225,9 @@ STATE_FOLLOWUP = "followup"
 class KitchenBridge:
     def __init__(self, cfg: dict):
         self.cfg = cfg
+        # The event loop only weakly references tasks; hold fire-and-forget
+        # ones here so they aren't garbage-collected mid-flight.
+        self._bg_tasks: set[asyncio.Task] = set()
         self.client = APIClient(
             address=cfg["device"]["host"],
             port=cfg["device"].get("port", 6053),
@@ -189,6 +241,12 @@ class KitchenBridge:
         self._oww_buf = bytearray()
         self._oww_preroll = deque(maxlen=3)  # last few raw chunks, prepended on trigger
         self._confirm_count = 0
+        self._recent = deque(maxlen=int(NEAR_MISS_AUDIO_S * SAMPLE_RATE / 1280))  # near-miss audio
+        self._burst_peak = 0.0   # highest score in the current burst
+        self._burst_run = 0      # longest run of frames >= threshold in it
+        self._gap_count = 0
+        self._gap_max = 0.0
+        self._gap_logged_t = 0.0
         self._last_activation = 0.0
 
         self._vad_buf = bytearray()
@@ -206,6 +264,10 @@ class KitchenBridge:
         # Wake cue: played on the Pi's speakers the moment the wake word fires,
         # since in external-trigger mode the device itself never knows it woke.
         self.wake_cue_url = cfg.get("wake_cue_url", "")
+        # Played when conversation mode ends without a goodbye (silence, or
+        # speech that wasn't for her), so it doesn't just quietly stop.
+        self.chat_end_cue_url = cfg.get("chat_end_cue_url") or (
+            self.wake_cue_url.replace("wake_cue.wav", "chat_end.wav") if self.wake_cue_url else "")
         self.server_url = cfg.get("server_url", SERVER_URL)
         self.fallback_server_url = cfg.get("fallback_server_url", "")
         self.standby_for_host = cfg.get("standby_for_host", "")
@@ -216,6 +278,13 @@ class KitchenBridge:
         self._followup_armed_at = 0.0
         self._followup_deadline = 0.0
         self._followup_turns = 0  # consecutive VAD-opened follow-ups, capped (see MAX_FOLLOWUP_TURNS)
+        self._expect_reply = False   # last reply was a question waiting on an answer
+        self._recipe = False         # ...and a recipe is open (no 6-answer cap)
+        self._speech_window = False  # this follow-up window takes plain speech
+        self._speech_run_followup = 0
+        self._chat = False           # conversation mode is on (server's chat_mode)
+        self._turn = 0               # bumped per recording; a reply to an older turn
+                                     # (one the wake word interrupted) is ignored
 
         # Mute wake-word/VAD processing while Antigua's own response is
         # playing on the Pi — mirrors antigua_satellite.py's old `_is_playing`
@@ -224,7 +293,7 @@ class KitchenBridge:
         # separate speakers, so without this the mic hears its own answer and
         # re-triggers the wake word mid-playback.
         self._playing = False
-        self._playing_since = 0.0
+        self._playing_until = 0.0  # safety deadline for the mute (see REPLY_MUTE_*)
         # The mute starts when a turn is sent, not when its reply comes back:
         # streamed LLM replies start playing on the Pi while the request is
         # still open, and an unmuted mic heard them, woke on them and answered
@@ -293,10 +362,17 @@ class KitchenBridge:
         if not self.conversation_id:
             self._led_idle()
             return  # nothing to follow up on (e.g. woken but no response sent yet)
-        if self._followup_turns >= MAX_FOLLOWUP_TURNS:
-            log.info(f"=== FOLLOW-UP CAP ({MAX_FOLLOWUP_TURNS}) REACHED — WAKE WORD REQUIRED TO CONTINUE ===")
-            self._end_conversation()
-            return
+        if self._chat:
+            self._speech_window, cap = True, None
+        elif self._expect_reply:
+            cap = MAX_RECIPE_TURNS if self._recipe else MAX_ANSWER_TURNS
+            self._speech_window = self._followup_turns < cap
+        else:
+            self._speech_window = FOLLOW_UP_SPEECH_TRIGGER and self._followup_turns < MAX_FOLLOWUP_TURNS
+            cap = MAX_FOLLOWUP_TURNS
+        if (self._expect_reply or FOLLOW_UP_SPEECH_TRIGGER) and not self._speech_window:
+            log.info(f"=== FOLLOW-UP CAP ({cap}) REACHED — WAKE WORD REQUIRED TO CONTINUE ===")
+        self._speech_run_followup = 0
         now = time.time()
         self.state = STATE_FOLLOWUP
         self._followup_vad_buf.clear()
@@ -304,9 +380,12 @@ class KitchenBridge:
         self._oww_preroll.clear()
         self._confirm_count = 0
         self._followup_armed_at = now + FOLLOW_UP_ARM_DELAY_MS / 1000
-        self._followup_deadline = now + FOLLOW_UP_ARM_DELAY_MS / 1000 + FOLLOW_UP_TIMEOUT_S
-        log.info(f"=== FOLLOW-UP WINDOW OPEN ({FOLLOW_UP_TIMEOUT_S}s, speech or wake word) ===")
-        self._led(LED_FOLLOWUP)
+        timeout = CHAT_TIMEOUT_S if self._chat else FOLLOW_UP_TIMEOUT_S
+        self._followup_deadline = now + FOLLOW_UP_ARM_DELAY_MS / 1000 + timeout
+        how = ("chatting, no wake word needed" if self._chat
+               else "answer, no wake word needed" if self._speech_window else "wake word")
+        log.info(f"=== FOLLOW-UP WINDOW OPEN ({timeout}s, {how}) ===")
+        self._led(LED_CHAT if self._chat else LED_ANSWER if self._speech_window else LED_FOLLOWUP)
 
     def _end_conversation(self):
         # Deliberately does NOT touch self._playing — a sleep word or a
@@ -316,7 +395,12 @@ class KitchenBridge:
         # (or the safety timeout) clears the mute.
         self.state = STATE_LISTENING
         self.conversation_id = ""
+        if self._chat:
+            self._chat = False
+            log.info("=== CONVERSATION MODE ENDED ===")
+            self._cue(self.chat_end_cue_url)
         self._followup_turns = 0
+        self._expect_reply = self._recipe = self._speech_window = False
         self._oww_buf.clear()
         self._oww_preroll.clear()
         self._confirm_count = 0
@@ -328,9 +412,14 @@ class KitchenBridge:
 
     # ── LED / button ────────────────────────────────────────────────────────
 
+    def _spawn(self, coro):
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
     def _led(self, state: int):
         if svc := self._services.get("led_state"):
-            asyncio.create_task(self._call_action(svc, {"state": state}))
+            self._spawn(self._call_action(svc, {"state": state}))
 
     def _led_idle(self):
         self._led(LED_DND if self._dnd else LED_IDLE)
@@ -348,7 +437,7 @@ class KitchenBridge:
         samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
         db = 20 * np.log10(np.sqrt(np.mean(samples ** 2)) / 32768 + 1e-9)
         level = float(np.clip((db - LED_LEVEL_FLOOR_DB) / LED_LEVEL_SPAN_DB, 0.0, 1.0))
-        asyncio.create_task(self._call_action(svc, {"level": level}))
+        self._spawn(self._call_action(svc, {"level": level}))
 
     async def _call_action(self, svc, data: dict):
         try:
@@ -428,16 +517,21 @@ class KitchenBridge:
         return 0
 
     async def handle_audio(self, data: bytes, data2=None):
-        self._last_audio_t = time.time()
+        now = time.time()
+        if self._last_audio_t:
+            self._note_gap(now, now - self._last_audio_t)
+        self._last_audio_t = now
         # With replies on the reSpeaker its AEC cancels them, so keep listening
         # (the wake word interrupts); on the Pi's speakers the mic must be muted.
         if self._playing and not self._reply_on_device and self.state != STATE_RECORDING:
-            if time.time() - self._playing_since > MAX_PLAYING_MUTE_S:
+            if now > self._playing_until:
                 log.warning("Playing-mute safety timeout — no antigua/done seen, unmuting")
                 self._playing = False
                 if self.state == STATE_LISTENING:
                     self._led_idle()
             else:
+                if self._chat:
+                    self._feed_wake_word(data, barge_in=True)
                 return  # muted: avoid the mic re-triggering on Antigua's own voice
         if self.state == STATE_LISTENING:
             self._feed_wake_word(data)  # still runs in DND, so ignored wakes get logged
@@ -454,19 +548,41 @@ class KitchenBridge:
         log.warning(f"Device-side pipeline stop (abort={abort}) — re-arming start_va")
         await self._start_va()
 
-    def _feed_wake_word(self, data: bytes):
+    def _note_gap(self, now: float, gap: float):
+        if gap < AUDIO_GAP_WARN_S:
+            return
+        self._gap_count += 1
+        self._gap_max = max(self._gap_max, gap)
+        if now - self._gap_logged_t >= AUDIO_GAP_LOG_EVERY_S:
+            log.warning(f"Mic audio gap: {self._gap_count} gap(s) >= {AUDIO_GAP_WARN_S * 1000:.0f}ms, "
+                        f"longest {self._gap_max * 1000:.0f}ms")
+            self._gap_count, self._gap_max, self._gap_logged_t = 0, 0.0, now
+
+    def _mute_for(self, seconds: float):
+        self._playing = True
+        self._playing_until = time.time() + seconds
+
+    def _end_burst(self):
+        """Score fell back under NEAR_MISS_SCORE without a wake: log the burst
+        and keep its audio so missed "Alexa"s can be found and tuned for."""
+        if self._burst_peak >= NEAR_MISS_SCORE:
+            path = CAPTURES_DIR / f"nearmiss_{int(time.time() * 1000)}.wav"
+            self._write_wav(path, b"".join(self._recent))
+            vnr = f", vnr={self._vnr:.0f}" if self._vnr is not None else ""
+            log.info(f"Wake near-miss: peak={self._burst_peak:.2f}, "
+                     f"{self._burst_run} frame(s) >= {WAKE_WORD_THRESHOLD}{vnr} -> {path.name}")
+        self._burst_peak, self._burst_run = 0.0, 0
+
+    def _feed_wake_word(self, data: bytes, barge_in: bool = False):
+        threshold = BARGE_IN_THRESHOLD if barge_in else WAKE_WORD_THRESHOLD
         self._oww_buf.extend(data)
         while len(self._oww_buf) >= OWW_CHUNK_BYTES:
             chunk = bytes(self._oww_buf[:OWW_CHUNK_BYTES])
             del self._oww_buf[:OWW_CHUNK_BYTES]
             self._oww_preroll.append(chunk)
+            self._recent.append(chunk)
 
             samples = np.frombuffer(chunk, dtype=np.int16)
-            rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
-            if rms < ENERGY_GATE_RMS:
-                self._confirm_count = 0
-                continue
-
             try:
                 prediction = self.oww.predict(samples)
             except Exception as e:
@@ -475,10 +591,17 @@ class KitchenBridge:
 
             score = prediction.get(WAKE_WORD, 0.0)
 
-            if score >= WAKE_WORD_THRESHOLD:
+            if score >= threshold:
                 self._confirm_count += 1
             else:
                 self._confirm_count = 0
+            if barge_in:
+                pass  # her own voice: near-misses here say nothing about missed wakes
+            elif score >= NEAR_MISS_SCORE:
+                self._burst_peak = max(self._burst_peak, score)
+                self._burst_run = max(self._burst_run, self._confirm_count)
+            elif self._burst_peak:
+                self._end_burst()
 
             if self._confirm_count >= WAKE_WORD_CONFIRM_FRAMES:
                 now = time.time()
@@ -494,6 +617,8 @@ class KitchenBridge:
                 vnr = f", vnr={self._vnr:.0f}" if self._vnr is not None else ""
                 log.info(f"Wake word '{WAKE_WORD}' detected (score={score:.2f}{vnr})"
                          + (" [continuation]" if was_followup else ""))
+                if barge_in:
+                    self._interrupt_reply()
                 self._start_recording(follow_up_turn=False)
                 return  # remaining bytes in _oww_buf get reprocessed next call
 
@@ -508,7 +633,7 @@ class KitchenBridge:
 
         # Wake word still works as an explicit continuation trigger.
         self._feed_wake_word(data)
-        if self.state != STATE_FOLLOWUP or not FOLLOW_UP_SPEECH_TRIGGER:
+        if self.state != STATE_FOLLOWUP or not self._speech_window:
             return  # wake word fired _start_recording already, or speech can't open a turn
 
         self._followup_vad_buf.extend(data)
@@ -517,15 +642,35 @@ class KitchenBridge:
             del self._followup_vad_buf[:VAD_CHUNK_BYTES]
             samples = np.frombuffer(chunk, dtype=np.int16)
             speech_prob = float(self.vad.predict(samples, frame_size=VAD_CHUNK_SAMPLES))
-            if speech_prob > FOLLOWUP_VAD_TRIGGER_THRESHOLD:
+            self._speech_run_followup = (self._speech_run_followup + 1
+                                         if speech_prob > FOLLOWUP_VAD_TRIGGER_THRESHOLD else 0)
+            if self._speech_run_followup >= ANSWER_SPEECH_CHUNKS:
                 log.info(f"=== FOLLOW-UP SPEECH DETECTED (p={speech_prob:.2f}) ===")
                 self._start_recording(follow_up_turn=True)
                 return
+
+    def _interrupt_reply(self):
+        """The wake word over a chat reply: stop it on the Pi and stop the
+        server publishing the rest. The turn in flight, if any, is abandoned
+        (_turn moves on when the new recording starts)."""
+        log.info("=== WAKE WORD OVER REPLY — INTERRUPTING ===")
+        self.mqtt.publish("antigua/stop", json.dumps({"source": "kitchen-bridge"}), qos=1)
+        self._playing = self._awaiting_reply = False
+
+    def _cue(self, url: str):
+        if not url:
+            return
+        if self._reply_on_device:
+            self.client.media_player_command(self._media_player_key, media_url=url, announcement=True)
+        else:
+            self.mqtt.publish("antigua/cue", json.dumps({"audio_url": url}), qos=1)
 
     def _reset_wake_word(self):
         self.oww.predict(OWW_FLUSH)
         self.oww.reset()
         self._confirm_count = 0
+        self._burst_peak, self._burst_run = 0.0, 0
+        self._recent.clear()
 
     def _publish_listening(self, active: bool):
         # antigua-server ducks any playing music while this is true, so the
@@ -535,6 +680,7 @@ class KitchenBridge:
 
     def _start_recording(self, follow_up_turn: bool):
         self.state = STATE_RECORDING
+        self._turn += 1
         self._publish_listening(True)
         self._reset_wake_word()
         self._follow_up_turn = follow_up_turn
@@ -551,7 +697,9 @@ class KitchenBridge:
         self._vad_buf = bytearray()
         self._silent_chunks = 0
         self._speech_run = 0
-        self._has_speech = False
+        # An answer turn opens on ANSWER_SPEECH_CHUNKS of speech already, so a
+        # short "yes" mostly spent opening it isn't dropped as no-speech.
+        self._has_speech = follow_up_turn
         self._max_speech_prob = 0.0
         self._recording_start = time.time()
         self.vad.reset_states()
@@ -559,12 +707,8 @@ class KitchenBridge:
         if self._reply_on_device and self._playing:
             log.info("Interrupting reply on the reSpeaker")
             self._stop_device_playback()
-        if not follow_up_turn and self.wake_cue_url:
-            if self._reply_on_device:
-                self.client.media_player_command(
-                    self._media_player_key, media_url=self.wake_cue_url, announcement=True)
-            else:
-                self.mqtt.publish("antigua/cue", json.dumps({"audio_url": self.wake_cue_url}), qos=1)
+        if not follow_up_turn:
+            self._cue(self.wake_cue_url)
 
     def _feed_recording(self, data: bytes):
         self._utterance_frames.extend(data)
@@ -671,12 +815,13 @@ class KitchenBridge:
         self._led(LED_THINKING)
         if not self._reply_on_device:
             self._awaiting_reply = True
-            self._playing = True
-            self._playing_since = time.time()
+            self._mute_for(AWAITING_REPLY_MUTE_S)
 
-        asyncio.create_task(self._send_to_server(out_path, follow_up_turn))
+        self._spawn(self._send_to_server(out_path, follow_up_turn))
 
     async def _send_to_server(self, wav_path: Path, follow_up_turn: bool = False):
+        turn = self._turn
+        self._expect_reply = self._recipe = False
         if not self.conversation_id:
             self.conversation_id = uuid.uuid4().hex
         conv_id = self.conversation_id
@@ -708,14 +853,22 @@ class KitchenBridge:
             response_text = result.get("response", "")
             log.info(f"Transcript: {transcript!r}")
             log.info(f"Response:   {response_text!r}")
+            if turn != self._turn:
+                log.info("Reply belongs to an interrupted turn — ignoring it")
+                return
             audio_url = result.get("audio_url", "")
+            self._expect_reply = bool(result.get("expects_reply"))
+            self._recipe = bool(result.get("recipe_mode"))
+            was_chat, self._chat = self._chat, bool(result.get("chat_mode"))
+            if self._chat and not was_chat:
+                log.info("=== CONVERSATION MODE ON ===")
 
             self._awaiting_reply = False
             if response_text and (audio_url or result.get("streaming")):
                 # Mute wake-word/VAD until antigua/done confirms the Pi has
                 # finished playing this — see _is_playing note in __init__.
-                self._playing = True
-                self._playing_since = time.time()
+                self._mute_for(min(REPLY_MUTE_MAX_S,
+                                   REPLY_MUTE_BASE_S + len(response_text) / REPLY_CHARS_PER_S))
             elif not self._reply_on_device:
                 self._playing = False  # nothing will play, so no antigua/done is coming
 
@@ -741,11 +894,14 @@ class KitchenBridge:
                 # VAD-opened follow-up window caught background noise — server
                 # says end silently, same as antigua_satellite.py's old behavior.
                 log.info("=== FOLLOW-UP FALSE TRIGGER — ENDING SILENTLY ===")
+                self._chat = was_chat  # so _end_conversation sounds the chat-end cue
                 self._end_conversation()
                 return
 
+            # In a chat "thanks, that's sweet" is conversation, not goodbye —
+            # the server decides when a chat is over.
             clean = transcript.lower().strip().rstrip(".,!?")
-            if clean in SLEEP_WORDS or any(clean.endswith(w) for w in SLEEP_WORDS):
+            if not was_chat and (clean in SLEEP_WORDS or any(clean.endswith(w) for w in SLEEP_WORDS)):
                 log.info(f"Sleep word detected in {transcript!r} — ending conversation")
                 self._end_conversation()
                 return
@@ -756,6 +912,8 @@ class KitchenBridge:
             # listening for a follow-up while Antigua is still talking.
         except Exception as e:
             log.error(f"Pipeline request failed: {e}")
+            if turn != self._turn:
+                return
             self._awaiting_reply = False
             if not self._reply_on_device:
                 self._playing = False

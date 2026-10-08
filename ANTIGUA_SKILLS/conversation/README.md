@@ -11,6 +11,50 @@ Maintains conversation history across multiple turns so the user can ask follow-
 
 ---
 
+## Conversation mode ("let's chat", 2026-10-04)
+
+Plain-speech follow-ups are off for ordinary replies (they looped on
+Antigua's own voice and the TV; see `FOLLOW_UP_SPEECH_TRIGGER` in
+`kitchen-mic/bridge/kitchen_bridge.py`). Conversation mode is the opt-in
+way to talk back and forth without repeating the wake word:
+
+```text
+"Alexa, let's chat"            → "Sure, what's on your mind?"   (LED: soft green breathe)
+"I'm thinking of repainting the kitchen"
+→ "Ooh, bold. What color are you leaning toward?"
+"Maybe a dark green"           ← no wake word, no beep
+"Alexa—" (mid-reply)           ← cuts her off; say the new thing
+"Okay, that's all"             → "Okay, talk later."
+```
+
+- **Start:** a whole-utterance phrase: "let's chat/talk", "can we chat for a
+  bit", "keep me company", "conversation mode" (`chat._START_RE`; "talk to
+  me about volcanoes" is a question, not a mode).
+- **While on:** every reply carries `chat_mode: true`; the bridge reopens a
+  20s plain-speech window after each reply (`CHAT_TIMEOUT_S`, no turn cap).
+  Free-form turns get a chatty stage direction (1–2 sentences, sometimes a
+  question back; `chat.HINT`) unless a persona direction, search or an
+  article already shapes the answer. Skills (timers, weather…) work as usual
+  and don't end the chat. History holds `CHAT_MAX_HISTORY` (20) messages
+  instead of 6.
+- **Guard:** each plain-speech turn passes an addressee check first
+  (`chat.is_addressed`): her own last line coming back → no; her name → yes;
+  otherwise one YES/NO call to the 4B model (~0.2s, fails closed after
+  `CHAT_ADDRESSEE_TIMEOUT`). Not for her → the chat ends silently with the
+  soft `chat_end.wav` cue. Wake-word turns and answers to a pending skill
+  question skip the check.
+- **Interrupt:** while a chat reply plays on the Pi, the bridge keeps
+  scoring the wake word at `BARGE_IN_THRESHOLD` (0.9). A hit publishes
+  `antigua/stop` (the Pi drops its queue and kills paplay; the server stops
+  publishing the rest of the reply) and starts a new recording.
+- **End:** "that's all", "bye", "talk later"… (spoken goodbye), 20s of
+  silence, or speech that wasn't for her (both with the end cue). In a chat
+  the bridge's sleep words don't apply ("thanks, that's sweet" is chat).
+- Primary only: the fallback has no addressee check and says chatting needs
+  the main server.
+
+---
+
 ## How Users Trigger It
 
 No explicit trigger — it's always active when inside a conversation window.

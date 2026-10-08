@@ -39,6 +39,10 @@ rsync -az "$REPO/server/config/server.yaml" "$REPO/server/config/system_prompt.t
 rsync -az "$REPO/server/mcp/requirements.txt" "$REPO/server/mcp/requirements-atv.txt" \
     "$REPO/server/mcp/setup.sh" "$HOST:$DEST/server/mcp/"
 ssh "$HOST" "$DEST/server/mcp/setup.sh"
+# Home + favorite addresses for drive times — private, so 600 like mcp.env.
+if [ -f "$REPO/server/config/places.yaml" ]; then
+    rsync -az --chmod=F600 "$REPO/server/config/places.yaml" "$HOST:$DEST/server/config/"
+fi
 if [ -f "$REPO/server/config/mcp.env" ]; then
     rsync -az --chmod=F600 "$REPO/server/config/mcp.env" "$HOST:$DEST/server/config/"
 else
@@ -54,6 +58,9 @@ fi
 rsync -az "$REPO/kitchen-mic/bridge/kitchen_bridge.py" "$REPO/kitchen-mic/bridge/requirements.txt" \
     "$HOST:$DEST/kitchen-mic/bridge/"
 rsync -az --ignore-existing "$REPO/data/memories.json" "$REPO/data/lists.json" "$HOST:$DEST/data/" 2>/dev/null || true
+# The offline cookbook (recipe.Cookbook): popular recipes stored on the
+# primary, so recipes still work here during an outage, web or no web.
+rsync -az "$REPO/data/cookbook/" "$HOST:$DEST/data/cookbook/" 2>/dev/null || true
 
 # Standby bridge config: the primary's (device PSK, MQTT, reply output),
 # pointed at this box and told to stand by for the primary.
@@ -83,6 +90,14 @@ ssh "$HOST" "[ -x $DEST/kitchen-mic/bridge/venv/bin/python3 ] || { python3 -m ve
 OWW=$("$REPO/kitchen-mic/bridge/venv/bin/python3" -c 'import openwakeword, os; print(os.path.dirname(openwakeword.__file__))')
 RDIR=$(ssh "$HOST" "$DEST/kitchen-mic/bridge/venv/bin/python3 -c 'import openwakeword, os; print(os.path.dirname(openwakeword.__file__))'")
 rsync -az "$OWW/resources/models/" "$HOST:$RDIR/resources/models/"
+
+# Its own SearXNG on localhost:8080: the primary's goes down with it, and
+# search + recipes are needed most in an outage. Same settings (secret_key
+# included) as the primary's.
+ssh "$HOST" "mkdir -p $DEST/searxng/searxng"
+rsync -az "$REPO/searxng/docker-compose.yml" "$HOST:$DEST/searxng/"
+rsync -az --chmod=F600 "$REPO/searxng/searxng/settings.yml" "$HOST:$DEST/searxng/searxng/"
+ssh "$HOST" "cd $DEST/searxng && docker compose up -d"
 
 # Backup Kokoro TTS (antigua-tts.service, :5500) runs the primary's server script.
 rsync -az "$REPO/server/kokoro_tts_server_flask.py" "$HOST:$TTS_DIR/tts_server.py"

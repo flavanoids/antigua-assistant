@@ -116,6 +116,10 @@ if srv.music is not None:
         return None
 
     srv.music.ma.cmd = _cmd
+    # Corrections are remembered in data/music_prefs.json; a dry run's must
+    # not steer the live server's next "play X".
+    srv.music._prefs_path = _SCRATCH / "music_prefs.json"
+    srv.music._played_path = _SCRATCH / "music_played.json"
 
 # ── Timers: private, silent ──────────────────────────────────────────────────
 

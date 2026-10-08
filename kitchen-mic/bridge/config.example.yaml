@@ -23,6 +23,9 @@ mqtt:
 # Short "I'm listening" cue published to antigua/cue when the wake word fires.
 # Served by antigua_server.py from server/static_audio/. Omit to disable.
 wake_cue_url: "http://10.77.0.1:9393/audio/wake_cue.wav"
+# Soft cue when conversation mode ("let's chat") ends without a goodbye.
+# Defaults to chat_end.wav next to wake_cue_url.
+# chat_end_cue_url: "http://10.77.0.1:9393/audio/chat_end.wav"
 
 # Where kitchen replies play. "pi" (default): antigua/play -> the satellite's
 # speakers; the mic is muted while Antigua talks. "device": the reSpeaker's

@@ -45,8 +45,44 @@ server:
   host: 0.0.0.0
   port: 9393
   audio_ttl_seconds: 300
+persona:
+  sass: 2          # 0 warm, 1 dry, 2 sassy, 3 sharp — edge in casual chat and jokes
 display:
   enabled: false   # PinedaDisplay MQTT integration — off by default
+security:              # Eufy cameras + front door lock via Home Assistant (antigua_core/security.py)
+  ha_url: http://homeassistant.local:8123
+  token_file: /etc/antigua/ha.env      # HA_TOKEN=..., root-only
+  go2rtc: http://127.0.0.1:1984        # where HA pushes the livestreams (/opt/go2rtc)
+  live_seconds: 60                     # "show me the front door" stays up this long
+  snapshots_dir: /var/lib/antigua-cams # photos for the display's traffic-cam card
+  low_battery: 20
+  cameras:
+    front_door:
+      entity: camera.doorbell
+      title: Front door
+      stream: <doorbell serial>
+      battery: sensor.doorbell_battery_percentage
+      motion: binary_sensor.doorbell_motion_detected
+      person: binary_sensor.doorbell_person_detected
+      ring: binary_sensor.doorbell_ringing
+      snapshot_minutes: 30             # battery camera: wake it rarely
+    garage:
+      entity: camera.garage
+      title: Garage
+      stream: <garage cam serial>
+      battery: sensor.garage_battery_percentage
+      motion: binary_sensor.garage_motion_detected
+      person: binary_sensor.garage_person_detected
+      snapshot_minutes: 10             # solar-charged
+  lock:
+    entity: lock.front_door
+    status: sensor.front_door_lock_status
+    battery: sensor.front_door_battery_percentage
+pineda:                # PinedaDisplay Web — the airplaypi kiosk screen (ANTIGUA_SKILLS/pineda_display)
+  # url: http://127.0.0.1:8090   # unset = no display skill
+  profile: default     # the kiosk's profile; its theme is the one on screen
+  # device: <id>       # the kiosk's device id for "this photo"; unset = latest screen to report
+  reboot_delay_seconds: 10   # airplaypi plays the "rebooting" reply before it goes down
 env:
   VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/radeon_icd.json
 assistant:
@@ -156,6 +192,10 @@ music:
   default_volume: 65              # % a speaker starts at when music begins from idle
   track_radio: true               # after a single song, keep going with similar ones
   lyrics_search: true             # "play the song that goes …" via SearXNG
+  store_country: US               # iTunes store whose popularity order ranks songs
+  llm_fallback: true              # the LLM restates requests no pattern knows (~0.6s, only when music-ish)
+  # Players "play X everywhere" groups (default: every player in speakers)
+  # everywhere: [Kitchen Speaker, Soundbar, Bedroom (2)]
   # Ducking: from the wake word until the conversation ends (reply played and
   # follow-up window closed). 25% left commands unintelligible to Whisper.
   duck_ratio: 0.1
@@ -182,6 +222,26 @@ music:
     Living Room: the living room TV
     Soundbar: the soundbar
     Bedroom (2): the bedroom HomePod
+
+# Podcasts: "play Apple News Today" / "play Up First" plays that day's episode
+# on the music speakers (antigua_core/podcast.py). A show is an RSS `feed`, or
+# an Apple-exclusive `apple_id` (no feed; read from its Apple Podcasts page).
+# `days` are its news days: before today's is out it plays the latest; on
+# other days it offers the latest ("Want me to play Friday's?").
+# `url_pattern` / `max_minutes` drop extras (interviews, trailers, long-form).
+podcasts:
+  apple_news_today:
+    title: Apple News Today
+    names: [apple news today, apple news]
+    apple_id: "1473872585"
+    url_pattern: '/ANT-\d{8}(?:v\d+)?\.mp3$'
+    days: [mon, tue, wed, thu, fri]
+  up_first:
+    title: Up First
+    names: [up first, npr up first, "npr's up first", up first from npr]
+    feed: https://feeds.npr.org/510318/podcast.xml
+    max_minutes: 20                 # skips the Sunday Story and bonus interviews
+    days: [mon, tue, wed, thu, fri, sat]
 
 govee:
   mcp_server: govee
@@ -221,6 +281,47 @@ sports:
   team_ttl_seconds: 300      # team record/schedule cache
   f1_ttl_seconds: 300        # F1 scoreboard cache
   timeout_seconds: 4
+
+commute:
+  # Drive times from home: "how long to get to Lowe's on Ella", "how far is
+  # Mom's house", "how's traffic to work". Home and favorites live in
+  # places_file (git-ignored, chmod 600; template: places.example.yaml).
+  # Routes come from TomTom when TOMTOM_API_KEY is in the mcp env_file (free
+  # developer key, live traffic), else OSRM (no traffic of its own). Houston
+  # TranStar adds live speeds vs normal + incidents (Houston area only).
+  enabled: true
+  places_file: server/config/places.yaml
+  transtar: true
+  search_radius_km: 35       # stores farther than this aren't "near you"
+  unusual_min_minutes: 5     # "slower than usual" needs at least this much...
+  unusual_pct: 20            # ...and this share of the usual time
+  timeout_seconds: 5
+  # photon_url: https://photon.komoot.io          # place search (OpenStreetMap)
+  # osrm_url: https://router.project-osrm.org     # or your own OSRM
+  # road_aliases:            # spoken road -> OpenStreetMap name, for "the one by the beltway"
+  #   the beltway: sam houston
+
+knowledge:
+  # People, history and events ("who was Frida Kahlo", "tell me about the
+  # Cuban Missile Crisis"): an overview grounded in the Wikipedia article, plus
+  # Wikidata facts for follow-ups ("Antigua, was she married?").
+  enabled: true
+  topic_ttl_seconds: 900     # follow-ups about the subject within 15 minutes
+  max_tokens: 220            # overview (3-4 sentences)
+  max_tokens_followup: 130
+  overview_sentences: "3 to 4"
+  timeout_seconds: 4
+
+recipes:
+  # "How do I make cheesecake": a real recipe from a recipe site (never one the
+  # LLM writes), read step by step. Needs search (SearXNG) enabled.
+  enabled: true
+  candidates: 10             # result pages fetched per dish, in parallel
+  fetch_timeout_seconds: 5   # give up on slow sites after this
+  cache_days: 14             # parsed recipes kept per dish
+  session_ttl_seconds: 14400 # a cooking session lasts 4 hours after its last turn
+  answer_ttl_seconds: 600    # a bare "yes"/"no" answers a question up to 10 minutes old
+  qa_max_tokens: 110          # grounded answer to a free-form cooking question
 
 news:
   ttl_seconds: 1200          # refresh cache every 20 minutes in background
@@ -272,6 +373,9 @@ search:
   # is left out; google news still works and stays. Verify with:
   #   curl -sG localhost:8080/search --data-urlencode q=test \
   #        --data-urlencode engines=google --data-urlencode format=json
-  engines: "bing,duckduckgo"  # ranked snippets; wikipedia runs separately for answer box
-  news_engines: "google news,bing news,bing"  # used for temporal/topic news queries
+  engines: "google,duckduckgo,brave"  # ranked snippets; wikipedia runs separately for answer box. Not bing: junk via SearXNG
+  news_engines: "google news,bing news,duckduckgo news,google"  # used for temporal/topic news queries
+  # parallel_api_key: ""      # keyed fallback when SearXNG returns nothing (or PARALLEL_API_KEY env)
+  # parallel_keyless: true    # without a key, Parallel's free public MCP endpoint instead
+  # parallel_mode: "fast"     # turbo | fast | basic | advanced
   cache_ttl_seconds: 900     # identical queries skip the network for 15 min

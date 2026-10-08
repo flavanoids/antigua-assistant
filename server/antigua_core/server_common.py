@@ -76,15 +76,33 @@ def timer_fire_text(label: str, kind: str, message: str | None = None) -> str:
     return f"Your {label} is done."
 
 
-def prune_audio(audio_dir: Path, ttl: float, cache_ttl: float = 0) -> int:
+def prune_audio(audio_dir: Path, ttl: float, cache_ttl: float = 0,
+                cache_max_bytes: int = 0) -> int:
     """Delete reply WAVs older than ttl seconds. Content-cached cache_*.wav
     files live cache_ttl longer: synthesize() never reuses one older than
-    that, and skipping them once grew audio_out to 11 GB. Returns the count."""
+    that, and skipping them once grew audio_out to 11 GB. A cache hit touches
+    its file, so mtime is last use; past cache_max_bytes (0 = no cap) the
+    least recently used cache files go first. Returns the count."""
     now = time.time()
     removed = 0
+    cached = []
     for f in audio_dir.glob("*.wav"):
-        limit = ttl + cache_ttl if f.name.startswith("cache_") else ttl
-        if now - f.stat().st_mtime > limit:
+        try:
+            st = f.stat()
+        except FileNotFoundError:
+            continue
+        is_cache = f.name.startswith("cache_")
+        if now - st.st_mtime > (ttl + cache_ttl if is_cache else ttl):
             f.unlink(missing_ok=True)
+            removed += 1
+        elif is_cache:
+            cached.append((st.st_mtime, st.st_size, f))
+    if cache_max_bytes:
+        total = sum(size for _, size, _ in cached)
+        for _, size, f in sorted(cached, key=lambda c: c[0]):
+            if total <= cache_max_bytes:
+                break
+            f.unlink(missing_ok=True)
+            total -= size
             removed += 1
     return removed

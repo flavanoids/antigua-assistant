@@ -12,7 +12,9 @@ server:
 
 satellite:
   antigua_volume_pct: 70        # Antigua speaking level 0-100; independent of the AirPlay sink volume
-  # alarm_ring_seconds: 5.0     # how long a timer/alarm rings before auto-stopping
+  # alarm_ring_seconds: 5.0     # bell length per ring (short: the mic hears the wake word between rings)
+  # alarm_repeat_seconds: 30.0  # a timer/alarm/reminder rings again this often until "stop" / the wake word
+  # alarm_max_seconds: 300.0    # ...for at most this long
   # output_device: "alsa_output.platform-soc_sound.stereo-fallback"
   #                             # PulseAudio sink (default: HiFiBerry DAC+); see `pactl list short sinks`
 

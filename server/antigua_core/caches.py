@@ -544,6 +544,28 @@ class NewsCache:
 # ── SearXNG Web Search ────────────────────────────────────────────────────────
 
 
+def parallel_mcp(tool: str, arguments: dict, timeout: float = 20) -> dict | None:
+    """Call a tool (web_search, web_fetch) on Parallel's free public MCP
+    endpoint: no key, no SLA. Its result JSON, or None on any failure."""
+    try:
+        r = requests.post(
+            settings.PARALLEL_MCP_URL,
+            headers={"Accept": "application/json, text/event-stream"},
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                  "params": {"name": tool, "arguments": arguments}},
+            timeout=timeout,
+        )
+        r.raise_for_status()
+        reply = r.json()
+        if "error" in reply or reply.get("result", {}).get("isError"):
+            raise ValueError(f"MCP error: {str(reply)[:200]}")
+        text = next(c["text"] for c in reply["result"]["content"] if c.get("type") == "text")
+        return json.loads(text)
+    except (requests.RequestException, ValueError, KeyError, StopIteration) as e:
+        log.warning("Parallel %s failed: %s", tool, e)
+        return None
+
+
 class SearXNGSkill:
     """Queries a local SearXNG instance and formats top snippets as LLM context."""
 
@@ -653,15 +675,21 @@ class SearXNGSkill:
             return r.json()
 
         wiki_data = {}
-        if wiki:
-            wiki_query = self._wiki_entity(query)
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                f_wiki = pool.submit(_fetch, wiki_query, "wikipedia")
-                f_snippets = pool.submit(_fetch, query, eff_engines, categories)
-                wiki_data = f_wiki.result()
-                snippet_data = f_snippets.result()
-        else:
-            snippet_data = _fetch(query, eff_engines, categories)
+        try:
+            if wiki:
+                wiki_query = self._wiki_entity(query)
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    f_wiki = pool.submit(_fetch, wiki_query, "wikipedia")
+                    f_snippets = pool.submit(_fetch, query, eff_engines, categories)
+                    wiki_data = f_wiki.result()
+                    snippet_data = f_snippets.result()
+            else:
+                snippet_data = _fetch(query, eff_engines, categories)
+        except requests.RequestException as e:
+            if not self._parallel_on():
+                raise
+            log.warning("SearXNG failed (%s); trying Parallel", e)
+            snippet_data = {}
 
         for ib in wiki_data.get("infoboxes", []):
             text = ib.get("content", "").strip()
@@ -685,11 +713,55 @@ class SearXNGSkill:
                 results.append(
                     {"title": title, "content": content[:400], "published": published[:10]}
                 )
+        if not results and self._parallel_on():
+            results = self._parallel(query, limit)
         results = self._rank(results, query)[:limit]
         result = (None, results)
         with self._cache_lock:
             self._cache[cache_key] = (result, now)
         return result
+
+    @staticmethod
+    def _parallel_on() -> bool:
+        return bool(settings.PARALLEL_API_KEY or settings.PARALLEL_KEYLESS)
+
+    def _parallel(self, query: str, limit: int) -> list:
+        """SearXNG came back empty (its engines rate-limited or blocked):
+        the same {title, content, published} rows from Parallel's Search
+        API with a key, else its public MCP endpoint, whose web_search tool
+        returns the same JSON as text. [] on any failure, so a search never
+        dies here."""
+        search = {"objective": query, "search_queries": [query]}
+        try:
+            if settings.PARALLEL_API_KEY:
+                r = requests.post(
+                    settings.PARALLEL_URL,
+                    headers={"x-api-key": settings.PARALLEL_API_KEY},
+                    json={**search, "mode": settings.PARALLEL_MODE, "advanced_settings": {
+                        "max_results": max(limit * 3, 10),
+                        "excerpt_settings": {"max_chars_per_result": 800},
+                    }},
+                    timeout=settings.SEARCH_TIMEOUT + 4,
+                )
+                r.raise_for_status()
+                data = r.json()
+            else:
+                data = parallel_mcp("web_search", search, timeout=settings.SEARCH_TIMEOUT + 8)
+                if data is None:
+                    return []
+            rows = data.get("results") or []
+        except (requests.RequestException, ValueError) as e:
+            log.warning("Parallel search failed: %s", e)
+            return []
+        out = []
+        for row in rows:
+            title = (row.get("title") or "").strip()
+            content = " ".join(row.get("excerpts") or []).strip()
+            if title and content:
+                out.append({"title": title, "content": content[:400],
+                            "published": (row.get("publish_date") or "")[:10]})
+        log.info("Search: SearXNG empty for %r; Parallel gave %d results", query, len(out))
+        return out
 
     def _thin(self, answer, results: list) -> bool:
         """No answer worth showing the LLM: nothing back, or all boilerplate."""

@@ -12,13 +12,12 @@ from . import household
 # ── TTS text normalisation helpers ──────────────────────────────────────────
 
 # Filler openers the LLM produces that sound awkward spoken aloud
+# Each opener needs its own punctuation: a bare prefix match turned "Sorry"
+# into "rry" and "Right now" into "now", and "Great. Ready…" into ". Ready…".
 _FILLER_RE = re.compile(
-    r"^(Sure[,!]?\s*|Certainly[,!]?\s*|Of course[,!]?\s*|Absolutely[,!]?\s*"
-    r"|Great[,!]?\s*|Awesome[,!]?\s*|No problem[,!]?\s*"
-    r"|Happy to help[,!]?\s*|Good question[!.]?\s*|Good point[!.]?\s*"
-    r"|Glad you asked[!.]?\s*"
-    r"|Here's the thing[,!]?\s*|The thing is[,!]?\s*"
-    r"|Look[,!]?\s*|Right[,!]?\s*|So[,!]?\s*|Well[,!]?\s*)",
+    r"^(?:(?:Sure|Certainly|Of course|Absolutely|Great|Awesome|No problem"
+    r"|Happy to help|Here's the thing|The thing is|Look|Right|So|Well)[,!]"
+    r"|(?:Good question|Good point|Glad you asked)[!.,])\s*",
     re.IGNORECASE,
 )
 
@@ -268,7 +267,13 @@ def _strip_self_id(text):
     return text
 
 
+# Emoji (and the joiners/selectors that glue them) — Kokoro either drops them
+# or spells out "person running", and the small fallback model loves them.
+_EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\u200D\uFE0F]+")
+
+
 def _strip_markdown(text):
+    text = _EMOJI_RE.sub("", text)
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
     text = re.sub(r"\*(.+?)\*", r"\1", text)
     text = re.sub(r"`(.+?)`", r"\1", text)

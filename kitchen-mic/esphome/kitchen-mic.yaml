@@ -18,7 +18,9 @@ api:
     key: !secret api_encryption_key
   # Called by kitchen_bridge.py. led_state: 0 idle, 1 listening (voice-level
   # glow), 2 thinking, 3 speaking, 4 follow-up window, 5 error flash,
-  # 6 do-not-disturb. led_level: 0..1 voice loudness, ~12 Hz while listening.
+  # 6 do-not-disturb, 7 conversation mode (soft green breathe),
+  # 8 answer window, no wake word needed (steady soft green). led_level:
+  # 0..1 voice loudness, ~12 Hz while listening.
   actions:
     - action: led_state
       variables:
@@ -138,6 +140,8 @@ script:
             case 4: show(0.0, 0.8, 1.0, 0.25, "None"); return;
             case 5: show(1.0, 0.45, 0.0, 0.8, "Fast Pulse"); return;
             case 6: show(0.5, 0.0, 1.0, 0.12, "None"); return;
+            case 7: show(0.1, 1.0, 0.5, 0.35, "Breathe"); return;
+            case 8: show(0.1, 1.0, 0.5, 0.35, "None"); return;
           }
           if (id(is_timer_active)) { id(control_leds_timer_ticking).execute(); return; }
           if (id(alarm_on).state) { id(control_leds_alarm_active).execute(); return; }

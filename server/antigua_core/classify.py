@@ -8,17 +8,23 @@ Network-touching cousins live elsewhere: HomeControl.parse_tv() (configured
 input labels), route_search_with_llm() (Ollama), and the format_* builders.
 """
 
+import re
+
 from . import settings
 from . import sports as _sports
 from .music_intents import parse_music
+from .podcast import parse_podcast
 
 # Intent parsers live in intents/, one module per skill; re-exported here so
 # callers keep importing them from classify.
+from .intents.commute import parse_commute_request  # noqa: F401 — re-exported
 from .intents.calc import (  # noqa: F401 — re-exported
     _CALC_CCY,
     _CALC_ROUTE_RE,
     _CALC_UNITS,
+    is_calc_request,
 )
+from .intents.funny_sound import is_funny_sound_request  # noqa: F401 — re-exported
 from .intents.govee import (  # noqa: F401 — re-exported
     _GOVEE_ALL_DEVICES,
     _GOVEE_BARE_POWER_MAX_WORDS,
@@ -31,6 +37,14 @@ from .intents.govee import (  # noqa: F401 — re-exported
     _GOVEE_QUESTION_RE,
     _GOVEE_WHITE_TEMPS,
     parse_govee_request,
+)
+from .intents.knowledge import (  # noqa: F401 — re-exported
+    is_household_question,
+    is_knowledge_followup,
+    knowledge_language,
+    parse_knowledge_request,
+    split_possessive,
+    who_kind,
 )
 from .intents.lists import (  # noqa: F401 — re-exported
     _LIST_ADD_RE,
@@ -81,6 +95,12 @@ from .intents.news import (  # noqa: F401 — re-exported
     is_news_followup,
     is_news_request,
 )
+from .intents.recipe import (  # noqa: F401 — re-exported
+    looks_like_food,
+    parse_cook_command,
+    parse_recipe_request,
+    requested_servings,
+)
 from .intents.search import (  # noqa: F401 — re-exported
     _EVENT_FILLER,
     _EVENT_RESULT_RE,
@@ -104,6 +124,8 @@ from .intents.search import (  # noqa: F401 — re-exported
     rewrite_event_query,
     shape_general_query,
 )
+from .intents.recipe import parse_swap_question
+from .recipe_subs import table_swap
 from .intents.substitution import (  # noqa: F401 — re-exported
     _SUBST_CONTEXTUAL_RE,
     _SUBST_EXPLICIT_RE,
@@ -120,6 +142,14 @@ from .intents.time_date import (  # noqa: F401 — re-exported
 )
 from .intents.timers import (  # noqa: F401 — re-exported
     TimerRef,
+    alarm_missing_time,
+    is_dismiss_request,
+    normalize_clock,
+    parse_alarm_change,
+    parse_pause_request,
+    parse_skip_request,
+    resolve_new_time,
+    timer_missing_length,
     _ADD_TIME_RE,
     _ALARM_RE,
     _ALARM_TRIGGER_RE,
@@ -176,6 +206,7 @@ from .intents.timers import (  # noqa: F401 — re-exported
     resolve_day_offset,
     resolve_duration,
 )
+from .intents.pineda import parse_pineda_request  # noqa: F401 — re-exported
 from .intents.transcript import (  # noqa: F401 — re-exported
     _DIDNT_CATCH,
     _SHOW_ME_RE,
@@ -186,6 +217,7 @@ from .intents.transcript import (  # noqa: F401 — re-exported
     is_garbage_transcript,
     strip_wake_prefix,
 )
+from .intents.security import parse_security_request  # noqa: F401 — re-exported
 from .intents.tv import (  # noqa: F401 — re-exported
     _HDMI_NUM_RE,
     _TV,
@@ -218,13 +250,25 @@ from .intents.weather import (  # noqa: F401 — re-exported
 # function and not scattered through the pipeline.
 ROUTE_ORDER = [
     "garbage",
+    # Cameras and the front door lock: narrow regexes (a camera or door
+    # mention plus a show/lock verb), ahead of Govee so "show me the porch"
+    # isn't a light; "the porch light" itself stays Govee's.
+    "security",
     # Govee and the TV are tested before volume/media so "tv volume down"
     # reaches the TV and "tv bar lights" reach Govee; plain "turn it up" still
     # lands on volume because the TV regexes all require a TV mention.
     "govee",
+    # The airplaypi display before the TV, whose input regex would take
+    # "switch to the ocean theme"; its own regexes need a display, theme,
+    # Pi, quote, phrase or photo mention, and leave "play the ... theme" alone.
+    "pineda",
     "tv",
+    # Before podcast/music, which would search Apple Music for "a funny sound".
+    "funny_sound",
     # Music before volume so "turn the music up" drives the music player;
     # bare "turn it up" has no "music" and still lands on volume.
+    # Podcasts first: "play Apple News today" isn't an Apple Music search.
+    "podcast",
     "music",
     "volume",
     "time_date",
@@ -241,18 +285,31 @@ ROUTE_ORDER = [
     "list_add",
     "list_query",
     "list_remove",
-    "timer_cancel",
     "timer_add",
+    "alarm_skip",
+    "timer_cancel",
+    "alarm_change",
+    "timer_pause",
     "timer_reset",
     "timer_status",
     "snooze",
     "reminder_set",
     "alarm_set",
     "timer_set",
+    # "How long to get to Lowe's", "how far is Mom's house" — after the timer
+    # block, which owns "how long is left on the pasta timer".
+    "commute",
     "sports",
     "calc",
     "news",
+    # "How do I make cheesecake" — before search, which has "recipe for" and
+    # "how to make" but would answer with one squashed paragraph.
+    "recipe",
     "substitution",
+    # People, history and events — before search, which would otherwise take
+    # "who was X" with a one-sentence snippet answer. Role and time-sensitive
+    # questions ("who is the CEO of…", "latest…") are left to search.
+    "knowledge",
     "search",
     "llm",
 ]
@@ -276,9 +333,10 @@ def classify(transcript: str, *, search_enabled: bool | None = None) -> str:
 
     Two known divergences from run_pipeline, both pre-existing:
 
-      * The memory follow-up branch (`_FOLLOWUP_RE` + `_last_memory_topic`) is
-        conversation-scoped state, not a property of the transcript, so it is
-        not reachable here.
+      * The memory follow-up branch (`_FOLLOWUP_RE` + `_last_memory_topic`) and
+        the knowledge follow-up ("was she married?" after "who was Frida
+        Kahlo") are state, not properties of the transcript, so neither is
+        reachable here.
       * run_pipeline's context-injecting branches (memory_query, news, search)
         fall through rather than returning, so a transcript matching both
         memory_query and a timer would trigger both. classify() reports the
@@ -291,14 +349,22 @@ def classify(transcript: str, *, search_enabled: bool | None = None) -> str:
     if not transcript or is_garbage_transcript(transcript):
         return "garbage"
 
+    if parse_security_request(transcript):
+        return "security"
     # Govee before the TV so "tv bar" / "tv lights" aren't swallowed by the TV
     # regex; both before volume so "volume up on the tv" reaches the TV.
     if parse_govee_request(transcript):
         return "govee"
+    if parse_pineda_request(transcript):
+        return "pineda"
     if (_TV_APP_RE.search(transcript) or _TV_INPUT_RE.search(transcript)
             or _TV_RE.search(transcript)):
         return "tv"
 
+    if is_funny_sound_request(transcript):
+        return "funny_sound"
+    if parse_podcast(transcript):
+        return "podcast"
     if parse_music(transcript):
         return "music"
     if parse_volume_request(transcript):
@@ -314,6 +380,11 @@ def classify(transcript: str, *, search_enabled: bool | None = None) -> str:
 
     if detect_display_command(transcript):
         return "display"
+
+    # "What time did I set my alarm for" is ours, not a memory question.
+    if parse_timer_status_request(transcript) and re.search(
+            r"\b(?:alarm|timer|reminder)s?\b", transcript, re.IGNORECASE):
+        return "timer_status"
 
     if parse_remember_request(transcript):
         return "memory_save"
@@ -335,10 +406,19 @@ def classify(transcript: str, *, search_enabled: bool | None = None) -> str:
 
     # Timer block. run_pipeline computes timer/alarm up front but tests the
     # chain in this order, and only looks for an alarm when no timer matched.
-    if parse_timer_cancel_request(transcript):
-        return "timer_cancel"
+    # Add (and take-off) first: "remove 2 minutes from the timer" isn't a
+    # cancel. Skip before cancel: "turn off my alarm for tomorrow" sits out
+    # one day of a repeating alarm. Change before reset: "reset my alarm to 7".
     if parse_add_time_request(transcript):
         return "timer_add"
+    if parse_skip_request(transcript):
+        return "alarm_skip"
+    if parse_timer_cancel_request(transcript):
+        return "timer_cancel"
+    if parse_alarm_change(transcript):
+        return "alarm_change"
+    if parse_pause_request(transcript):
+        return "timer_pause"
     if parse_timer_reset_request(transcript) is not None:
         return "timer_reset"
     if parse_timer_status_request(transcript):
@@ -350,10 +430,14 @@ def classify(transcript: str, *, search_enabled: bool | None = None) -> str:
     # ("remind me ... tomorrow") also routes here — the handler asks the time.
     if parse_reminder_request(transcript) or reminder_missing_time(transcript):
         return "reminder_set"
-    if parse_alarm_request(transcript):
+    # No time / no length: the handler asks "for what time?" / "for how long?"
+    if parse_alarm_request(transcript) or alarm_missing_time(transcript):
         return "alarm_set"
-    if parse_timer_request(transcript):
+    if parse_timer_request(transcript) or timer_missing_length(transcript) is not None:
         return "timer_set"
+
+    if settings.COMMUTE_ENABLED and parse_commute_request(transcript):
+        return "commute"
 
     # Broader weather phrasings ("do I need an umbrella", "colder than
     # yesterday", "when's sunset") — after the imperative-shaped routes above so
@@ -374,7 +458,7 @@ def classify(transcript: str, *, search_enabled: bool | None = None) -> str:
     # answered by calc.answer(). After weather/timers/memory so "add 5 minutes"
     # and "colder than yesterday" are already claimed; a miss here falls to the
     # LLM exactly as before.
-    if _CALC_ROUTE_RE.search(transcript):
+    if is_calc_request(transcript):
         return "calc"
 
     # Topic-form requests ("news about ukraine") are news even when the intent
@@ -383,9 +467,19 @@ def classify(transcript: str, *, search_enabled: bool | None = None) -> str:
             and not is_local_news_query(transcript):
         return "news"
 
+    if search_enabled and settings.RECIPE_ENABLED and parse_recipe_request(transcript):
+        return "recipe"
     if search_enabled:
         if is_substitution_request(transcript):
             return "substitution"
+    # "Can I use olive oil instead of butter?" the curated table answers,
+    # search or not (recipe_subs.table_swap).
+    swap = parse_swap_question(transcript)
+    if swap and table_swap(*swap):
+        return "substitution"
+    if settings.KNOWLEDGE_ENABLED and parse_knowledge_request(transcript):
+        return "knowledge"
+    if search_enabled:
         if is_search_request(transcript):
             return "search"
 

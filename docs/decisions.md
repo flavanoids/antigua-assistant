@@ -159,6 +159,30 @@ no model and starts no MCP servers until `/activate`, which keeps a
 small-memory box responsive. Timers aren't synced to it, because both servers
 would fire them.
 
+**The backup keeps the 2B model** (2026-10-03, during a noegpu01 PSU
+outage). The backup's GPU, a 4 GB Radeon Vega M, holds `qwen3.5:2b` entirely.
+The test used the stock `qwen3.5:4b` with the same quant and size as the
+primary's uncensored 4B; it spilled 31% to CPU. The test used the fallback's
+own settings: no thinking, an 8k context, 120 tokens and the real system
+prompt.
+
+| | 2B | 4B |
+|---|---|---|
+| Speed | ~36 tok/s | ~10 tok/s |
+| First word (warm) | ~1.6 s | ~3.8 s |
+| Short reply | 2–3 s | 5–8 s |
+
+The 4B was clearly better: it answered a memory question from its context
+where the 2B said "I don't know", and its jokes were the household's own
+rather than stock. It was still too slow for a voice reply, so the backup
+stays on 2B and accepts rougher answers during an outage.
+
+The primary's actual model, HauhauCS Qwen3.5-4B Uncensored Q4_K_M, wasn't
+tested; it wasn't pulled on the backup. It may lack the stock model's vision
+weights and fit fully on the GPU, so benchmark it before writing off the 4B
+for good. Loading a second model on the backup evicts the pinned 2B: re-pin
+it afterwards with `keep_alive: -1`.
+
 **Recordings and logs are kept for 7 days** (2026-09-28). The mic streams
 continuously, and false wakes capture private conversation. Captures are
 pruned hourly and logs rotated daily. Nothing under `data/`, `logs/` or

@@ -1,0 +1,216 @@
+# Music resolution benchmark cases (tests/music_bench.py). Synthetic requests
+# written the way Whisper transcribes them; no real household transcripts
+# here (those go in the git-ignored data/music_bench_local.yaml).
+#
+# Tags: artist, the-band, song, by-artist, album, discography, genre, lyrics,
+# misheard, spanish, phrasing, same-title, followup, routing, correction.
+# An album named after its title track ("Un Verano Sin Ti") accepts either:
+# Antigua plays the song, like Alexa; "the album X" gets the album.
+
+# ── artists ──────────────────────────────────────────────────────────────
+- {say: play beyonce, want: {type: artist, artist: Beyoncé}, tags: [artist]}
+- {say: play bad bunny, want: {type: artist, artist: Bad Bunny}, tags: [artist, spanish]}
+- {say: play leon bridges, want: {type: artist, artist: Leon Bridges}, tags: [artist]}
+- {say: play taylor swift, want: {type: artist, artist: Taylor Swift}, tags: [artist]}
+- {say: play fleetwood mac, want: {type: artist, artist: Fleetwood Mac}, tags: [artist]}
+- {say: play stevie wonder, want: {type: artist, artist: Stevie Wonder}, tags: [artist]}
+- {say: play norah jones, want: {type: artist, artist: Norah Jones}, tags: [artist]}
+- {say: play frank ocean, want: {type: artist, artist: Frank Ocean}, tags: [artist]}
+- {say: play karol g, want: {type: artist, artist: Karol G}, tags: [artist, spanish]}
+- {say: play juan gabriel, want: {type: artist, artist: Juan Gabriel}, tags: [artist, spanish]}
+- {say: play selena, want: {type: artist, artist: Selena}, tags: [artist, spanish]}
+- {say: play sade, want: {type: artist, artist: Sade}, tags: [artist]}
+- {say: play nirvana, want: {type: artist, artist: Nirvana}, tags: [artist]}
+- {say: play queen, want: {type: artist, artist: Queen}, tags: [artist]}
+- {say: play journey, want: {type: artist, artist: Journey}, tags: [artist]}
+- {say: play hozier, want: {type: artist, artist: Hozier}, tags: [artist]}
+- {say: play some songs by amy winehouse, want: {type: artist, artist: Amy Winehouse}, tags: [artist, phrasing]}
+- {say: play music by daft punk, want: {type: artist, artist: Daft Punk}, tags: [artist, phrasing]}
+- {say: play the artist sza, want: {type: artist, artist: SZA}, tags: [artist, phrasing]}
+- {say: play the band radiohead, want: {type: artist, artist: Radiohead}, tags: [artist, phrasing]}
+- {say: "can you play some kendrick lamar", want: {type: artist, artist: Kendrick Lamar}, tags: [artist, phrasing]}
+- {say: put on some stevie nicks, want: {type: artist, artist: Stevie Nicks}, tags: [artist, phrasing]}
+- {say: i want to hear olivia rodrigo, want: {type: artist, artist: Olivia Rodrigo}, tags: [artist, phrasing]}
+
+# ── "The" bands, with and without the article ────────────────────────────
+- {say: play cheetah girls, want: {type: artist, artist: The Cheetah Girls}, tags: [artist, the-band]}
+- {say: play the cheetah girls, want: {type: artist, artist: The Cheetah Girls}, tags: [artist, the-band]}
+- {say: play beatles, want: {type: artist, artist: The Beatles}, tags: [artist, the-band]}
+- {say: play the weeknd, want: {type: artist, artist: The Weeknd}, tags: [artist, the-band]}
+- {say: play the killers, want: {type: artist, artist: The Killers}, tags: [artist, the-band]}
+- {say: play strokes, want: {type: artist, artist: The Strokes}, tags: [artist, the-band]}
+- {say: play the marias, want: {type: artist, artist: The Marías}, tags: [artist, the-band]}
+- {say: play the rolling stones, want: {type: artist, artist: The Rolling Stones}, tags: [artist, the-band]}
+
+# ── songs by bare title: the well-known version, not a cover ─────────────
+- {say: play so sick, want: {type: track, name: So Sick, artist: Ne-Yo}, tags: [song]}
+- {say: play halo, want: {type: track, name: Halo, artist: Beyoncé}, tags: [song]}
+- {say: play bohemian rhapsody, want: {type: track, name: Bohemian Rhapsody, artist: Queen}, tags: [song]}
+- {say: play hotel california, want: {type: track, name: Hotel California, artist: Eagles}, tags: [song]}
+- {say: play espresso, want: {type: track, name: Espresso, artist: Sabrina Carpenter}, tags: [song]}
+- {say: play blinding lights, want: {type: track, name: Blinding Lights, artist: The Weeknd}, tags: [song]}
+- {say: play dancing queen, want: {type: track, name: Dancing Queen, artist: ABBA}, tags: [song]}
+- {say: play hey ya, want: {type: track, name: Hey Ya!, artist: Outkast}, tags: [song]}
+- {say: play crazy in love, want: {type: track, name: Crazy in Love, artist: Beyoncé}, tags: [song]}
+- {say: play umbrella, want: {type: track, name: Umbrella, artist: Rihanna}, tags: [song]}
+- {say: play hips don't lie, want: {type: track, name: Hips Don't Lie, artist: Shakira}, tags: [song]}
+- {say: play rolling in the deep, want: {type: track, name: Rolling in the Deep, artist: Adele}, tags: [song]}
+- {say: play bad guy, want: {type: track, name: bad guy, artist: Billie Eilish}, tags: [song]}
+- {say: play as it was, want: {type: track, name: As It Was, artist: Harry Styles}, tags: [song]}
+- {say: play levitating, want: {type: track, name: Levitating, artist: Dua Lipa}, tags: [song]}
+- {say: play uptown funk, want: {type: track, name: Uptown Funk, artist: Mark Ronson}, tags: [song]}
+- {say: play jolene, want: {type: track, name: Jolene, artist: Dolly Parton}, tags: [song]}
+- {say: play stand by me, want: {type: track, name: Stand by Me, artist: Ben E. King}, tags: [song]}
+- {say: play hello, want: {type: track, name: Hello, artist: Adele}, tags: [song, same-title]}
+- {say: play yesterday, want: {type: track, name: Yesterday, artist: The Beatles}, tags: [song, same-title]}
+- {say: play africa, want: {type: track, name: Africa, artist: Toto}, tags: [song, same-title]}
+- {say: play thriller, want: {type: [track, album], name: Thriller, artist: Michael Jackson}, tags: [song, same-title]}
+- {say: play good 4 u, want: {type: track, name: good 4 u, artist: Olivia Rodrigo}, tags: [song]}
+- {say: play shallow, want: {type: track, name: Shallow, artist: Lady Gaga}, tags: [song, same-title]}
+- {say: play flowers, want: {type: track, name: Flowers, artist: Miley Cyrus}, tags: [song, same-title]}
+- {say: play september, want: {type: track, name: September, artist: "Earth, Wind & Fire"}, tags: [song, same-title]}
+
+# ── "the song X" and other phrasings ─────────────────────────────────────
+- {say: play the song so sick, want: {type: track, name: So Sick, artist: Ne-Yo}, tags: [song, phrasing]}
+- {say: "play the song, so sick", want: {type: track, name: So Sick, artist: Ne-Yo}, tags: [song, phrasing]}
+- {say: "play the song, hello", want: {type: track, name: Hello, artist: Adele}, tags: [song, phrasing]}
+- {say: play the track umbrella, want: {type: track, name: Umbrella, artist: Rihanna}, tags: [song, phrasing]}
+- {say: i want to hear dancing queen, want: {type: track, name: Dancing Queen, artist: ABBA}, tags: [song, phrasing]}
+- {say: "play Espresso.", want: {type: track, name: Espresso, artist: Sabrina Carpenter}, tags: [song, phrasing]}
+
+# ── title by artist ──────────────────────────────────────────────────────
+- {say: play so sick by ne-yo, want: {type: track, name: So Sick, artist: Ne-Yo}, tags: [song, by-artist]}
+- {say: play halo by beyonce, want: {type: track, name: Halo, artist: Beyoncé}, tags: [song, by-artist]}
+- {say: play landslide by fleetwood mac, want: {type: track, name: Landslide, artist: Fleetwood Mac}, tags: [song, by-artist]}
+- {say: play fast car by tracy chapman, want: {type: track, name: Fast Car, artist: Tracy Chapman}, tags: [song, by-artist]}
+- {say: play fast car by luke combs, want: {type: track, name: Fast Car, artist: Luke Combs}, tags: [song, by-artist, same-title]}
+- {say: play hurt by johnny cash, want: {type: track, name: Hurt, artist: Johnny Cash}, tags: [song, by-artist, same-title]}
+- {say: play valerie by amy winehouse, want: {type: track, name: Valerie, artist: Amy Winehouse}, tags: [song, by-artist]}
+- {say: play respect by aretha franklin, want: {type: track, name: Respect, artist: Aretha Franklin}, tags: [song, by-artist]}
+- {say: play hello by lionel richie, want: {type: track, name: Hello, artist: Lionel Richie}, tags: [song, by-artist, same-title]}
+- {say: play stand by me by ben e king, want: {type: track, name: Stand by Me, artist: Ben E. King}, tags: [song, by-artist]}
+
+# ── misheard names (text only; re-hearing needs audio) ───────────────────
+- {say: play so sick by nia, want: {type: track, name: So Sick, artist: Ne-Yo}, tags: [song, misheard]}
+- {say: play so sick by neo, want: {type: track, name: So Sick, artist: Ne-Yo}, tags: [song, misheard]}
+- {say: play halo by beyond say, want: {type: track, name: Halo, artist: Beyoncé}, tags: [song, misheard]}
+- {say: play chapel roan, want: {type: artist, artist: Chappell Roan}, tags: [artist, misheard]}
+- {say: play billy eyelash, want: {type: artist, artist: Billie Eilish}, tags: [artist, misheard]}
+- {say: play the weekend, want: {type: artist, artist: The Weeknd}, tags: [artist, misheard, the-band]}
+- {say: play dua leepa, want: {type: artist, artist: Dua Lipa}, tags: [artist, misheard]}
+- {say: play hosier, want: {type: artist, artist: Hozier}, tags: [artist, misheard]}
+- {say: play jay balvin, want: {type: artist, artist: J Balvin}, tags: [artist, misheard, spanish]}
+- {say: play sisa, want: {type: artist, artist: SZA}, tags: [artist, misheard]}
+- {say: play espresso by sabrina, want: {type: track, name: Espresso, artist: Sabrina Carpenter}, tags: [song, misheard, by-artist]}
+
+# ── albums ───────────────────────────────────────────────────────────────
+- {say: play the album lemonade, want: {type: album, name: Lemonade, artist: Beyoncé}, tags: [album]}
+- {say: play rumours by fleetwood mac, want: {type: album, name: Rumours, artist: Fleetwood Mac}, tags: [album, by-artist]}
+- {say: play the album abbey road, want: {type: album, name: Abbey Road, artist: The Beatles}, tags: [album]}
+- {say: play abbey road, want: {type: album, name: Abbey Road, artist: The Beatles}, tags: [album]}
+- {say: play un verano sin ti, want: {type: [album, track], name: Un Verano Sin Ti, artist: Bad Bunny}, tags: [album, spanish]}
+- {say: play the album 21 by adele, want: {type: album, name: "21", artist: Adele}, tags: [album]}
+- {say: play nevermind album, want: {type: album, name: Nevermind, artist: Nirvana}, tags: [album]}
+- {say: play the album blonde by frank ocean, want: {type: album, name: Blonde, artist: Frank Ocean}, tags: [album]}
+- {say: play currents by tame impala, want: {type: album, name: Currents, artist: Tame Impala}, tags: [album, by-artist]}
+- {say: play the album rumors, want: {type: album, name: Rumours, artist: Fleetwood Mac}, tags: [album, misheard]}
+- {say: play the miseducation of lauryn hill, want: {type: [album, track], name: The Miseducation of Lauryn Hill, artist: Lauryn Hill}, tags: [album]}
+
+# ── discography ──────────────────────────────────────────────────────────
+- {say: play taylor swift's first album, want: {type: album, name: Taylor Swift, artist: Taylor Swift}, tags: [album, discography]}
+- {say: play adele's first album, want: {type: album, name: "19", artist: Adele}, tags: [album, discography]}
+- {say: play beyonce's newest album, want: {type: album, artist: Beyoncé}, tags: [album, discography]}
+- {say: play fleetwood mac songs from the 70s, want: {type: album, artist: Fleetwood Mac}, tags: [album, discography]}
+- {say: [what are the older albums by toro y moi, play the second one], want: {type: album, name: Causers of This, artist: Toro y Moi}, tags: [album, discography, followup]}
+- {say: [what's adele's first album, play it], want: {type: album, name: "19", artist: Adele}, tags: [album, discography, followup]}
+
+# ── genres, moods, playlists ─────────────────────────────────────────────
+- {say: play some jazz, want: {type: playlist, name_has: [jazz]}, tags: [genre]}
+- {say: play chill music, want: {type: playlist, name_has: [chill]}, tags: [genre]}
+- {say: play some reggaeton, want: {type: playlist, name_has: [reggaeton]}, tags: [genre, spanish]}
+- {say: play classical music, want: {type: playlist, name_has: [classical]}, tags: [genre]}
+- {say: play 90s hip hop, want: {type: playlist, name_has: ["90s", "'90s", hip-hop, hip hop]}, tags: [genre]}
+- {say: play workout music, want: {type: playlist, name_has: [workout, fitness]}, tags: [genre]}
+- {say: play christmas music, want: {type: playlist, name_has: [christmas, holiday]}, tags: [genre]}
+- {say: play lo-fi beats, want: {type: playlist, name_has: [lo-fi, lofi]}, tags: [genre]}
+- {say: play some 80s music, want: {type: playlist, name_has: ["80s", "'80s"]}, tags: [genre]}
+- {say: play something relaxing, want: {type: playlist, name_has: [relax, chill, calm]}, tags: [genre, phrasing]}
+- {say: play dinner music, want: {type: playlist, name_has: [dinner]}, tags: [genre]}
+
+# ── lyrics ───────────────────────────────────────────────────────────────
+- {say: play the song that goes is this the real life, want: {type: track, name: Bohemian Rhapsody, artist: Queen}, tags: [lyrics]}
+- {say: play the song that goes hello from the other side, want: {type: track, name: Hello, artist: Adele}, tags: [lyrics]}
+- {say: play the song that goes we will we will rock you, want: {type: track, name: We Will Rock You, artist: Queen}, tags: [lyrics]}
+- {say: play the song that goes i'm in love with the shape of you, want: {type: track, name: Shape of You, artist: Ed Sheeran}, tags: [lyrics]}
+
+# ── spanish titles ───────────────────────────────────────────────────────
+- {say: play despacito, want: {type: track, name: Despacito, artist: Luis Fonsi}, tags: [song, spanish]}
+- {say: play titi me pregunto, want: {type: track, name: Tití Me Preguntó, artist: Bad Bunny}, tags: [song, spanish]}
+- {say: play bidi bidi bom bom, want: {type: track, name: Bidi Bidi Bom Bom, artist: Selena}, tags: [song, spanish]}
+- {say: play ella baila sola, want: {type: track, name: Ella Baila Sola, artist: Eslabon Armado}, tags: [song, spanish]}
+- {say: play la bachata by manuel turizo, want: {type: track, name: La Bachata, artist: Manuel Turizo}, tags: [song, spanish, by-artist]}
+- {say: play rebelde by rbd, want: {type: [track, album], name: Rebelde, artist: RBD}, tags: [song, spanish, by-artist]}
+
+# ── routing: not music ───────────────────────────────────────────────────
+- {say: play apple news today, want: {route: podcast}, tags: [routing]}
+- {say: play up first, want: {route: podcast}, tags: [routing]}
+- {say: "play Apple News today.", want: {route: podcast}, tags: [routing]}
+
+# ── corrections ("no, the Adele one") ────────────────────────────────────
+- {say: [play fast car, "no, the luke combs one"], want: {type: track, name: Fast Car, artist: Luke Combs}, tags: [correction]}
+- {say: [play hurt, "no, the johnny cash one"], want: {type: track, name: Hurt, artist: Johnny Cash}, tags: [correction]}
+- {say: [play hello, "no, the one by lionel richie"], want: {type: track, name: Hello, artist: Lionel Richie}, tags: [correction]}
+- {say: [play hello, the other one], want: {type: track, name: Hello}, tags: [correction]}
+- {say: [play hurt, "no, the original"], want: {type: track, name: Hurt, artist: Nine Inch Nails}, tags: [correction]}
+- {say: [play thriller, "no, i meant the album"], want: {type: album, name: Thriller, artist: Michael Jackson}, tags: [correction]}
+- {say: [play so sick, the one by brandy], want: {type: track, name: So Sick, artist: Brandy}, tags: [correction]}
+- {say: [play landslide, "no, the smashing pumpkins one"], want: {type: track, name: Landslide, artist: The Smashing Pumpkins}, tags: [correction]}
+- {say: [play queen, "no, i meant the song"], want: {type: track, name: Queen}, tags: [correction]}
+- {say: [play toxic, wrong song], want: {type: track, name: Toxic}, tags: [correction]}
+# A correction is remembered: the same request next time gets it
+- {say: [play hello, "no, the one by lionel richie", play hello], want: {type: track, name: Hello, artist: Lionel Richie}, tags: [correction]}
+# Not after a play: these mean nothing to music
+- {say: the other one, want: {route: llm}, tags: [correction, routing]}
+- {say: "no, the adele one", want: {route: llm}, tags: [correction, routing]}
+
+# ── held out: added after the resolver was tuned, to check it generalizes ─
+- {say: play mr brightside, want: {type: track, name: Mr. Brightside, artist: The Killers}, tags: [song, holdout]}
+- {say: play hey jude, want: {type: track, name: Hey Jude, artist: The Beatles}, tags: [song, holdout]}
+- {say: play purple rain, want: {type: [track, album], name: Purple Rain, artist: Prince}, tags: [song, holdout]}
+- {say: play wonderwall, want: {type: track, name: Wonderwall, artist: Oasis}, tags: [song, holdout]}
+- {say: play smells like teen spirit, want: {type: track, name: Smells Like Teen Spirit, artist: Nirvana}, tags: [song, holdout]}
+- {say: play billie jean, want: {type: track, name: Billie Jean, artist: Michael Jackson}, tags: [song, holdout]}
+- {say: play creep, want: {type: track, name: Creep, artist: Radiohead}, tags: [song, same-title, holdout]}
+- {say: play toxic, want: {type: track, name: Toxic, artist: Britney Spears}, tags: [song, same-title, holdout]}
+- {say: play believer, want: {type: track, name: Believer, artist: Imagine Dragons}, tags: [song, same-title, holdout]}
+- {say: play perfect, want: {type: track, name: Perfect, artist: Ed Sheeran}, tags: [song, same-title, holdout]}
+- {say: play anti-hero, want: {type: track, name: Anti-Hero, artist: Taylor Swift}, tags: [song, holdout]}
+- {say: play cruel summer, want: {type: track, name: Cruel Summer, artist: Taylor Swift}, tags: [song, same-title, holdout]}
+- {say: play gasolina, want: {type: track, name: Gasolina, artist: Daddy Yankee}, tags: [song, spanish, holdout]}
+- {say: play la bamba, want: {type: track, name: La Bamba, artist: Ritchie Valens}, tags: [song, spanish, holdout]}
+- {say: play amor prohibido, want: {type: [track, album], name: Amor Prohibido, artist: Selena}, tags: [song, spanish, holdout]}
+- {say: play sweet caroline, want: {type: track, name: Sweet Caroline, artist: Neil Diamond}, tags: [song, holdout]}
+- {say: play take on me, want: {type: track, name: Take On Me, artist: a-ha}, tags: [song, holdout]}
+- {say: play i will always love you, want: {type: track, name: I Will Always Love You, artist: Whitney Houston}, tags: [song, same-title, holdout]}
+- {say: play feeling good by nina simone, want: {type: track, name: Feeling Good, artist: Nina Simone}, tags: [song, by-artist, holdout]}
+- {say: play hallelujah by jeff buckley, want: {type: track, name: Hallelujah, artist: Jeff Buckley}, tags: [song, by-artist, same-title, holdout]}
+- {say: play drivers license by olivia rodrigo, want: {type: track, name: drivers license, artist: Olivia Rodrigo}, tags: [song, by-artist, holdout]}
+- {say: play thinking out loud by ed sharon, want: {type: track, name: Thinking Out Loud, artist: Ed Sheeran}, tags: [song, by-artist, misheard, holdout]}
+- {say: play the eagles, want: {type: artist, artist: Eagles}, tags: [artist, the-band, holdout]}
+- {say: play the doors, want: {type: artist, artist: The Doors}, tags: [artist, the-band, holdout]}
+- {say: play coldplay, want: {type: artist, artist: Coldplay}, tags: [artist, holdout]}
+- {say: play drake, want: {type: artist, artist: Drake}, tags: [artist, holdout]}
+- {say: play prince, want: {type: artist, artist: Prince}, tags: [artist, holdout]}
+- {say: play madonna, want: {type: artist, artist: Madonna}, tags: [artist, holdout]}
+- {say: play peso pluma, want: {type: artist, artist: Peso Pluma}, tags: [artist, spanish, holdout]}
+- {say: play some adele, want: {type: artist, artist: Adele}, tags: [artist, phrasing, holdout]}
+- {say: play something by bruno mars, want: {type: artist, artist: Bruno Mars}, tags: [artist, phrasing, holdout]}
+- {say: play ariana grandey, want: {type: artist, artist: Ariana Grande}, tags: [artist, misheard, holdout]}
+- {say: play the album back in black, want: {type: album, name: Back in Black, artist: AC/DC}, tags: [album, holdout]}
+- {say: play 1989 by taylor swift, want: {type: album, artist: Taylor Swift}, tags: [album, by-artist, holdout]}
+- {say: play random access memories, want: {type: album, name: Random Access Memories, artist: Daft Punk}, tags: [album, holdout]}
+- {say: play the album renaissance by beyonce, want: {type: album, name: Renaissance, artist: Beyoncé}, tags: [album, holdout]}
+- {say: play some country music, want: {type: playlist, name_has: [country]}, tags: [genre, holdout]}
+- {say: play 70s rock, want: {type: playlist, name_has: ["70s", rock]}, tags: [genre, holdout]}
+- {say: play salsa music, want: {type: playlist, name_has: [salsa]}, tags: [genre, spanish, holdout]}
+- {say: play focus music, want: {type: playlist, name_has: [focus, study, concentration]}, tags: [genre, holdout]}

@@ -85,6 +85,10 @@ case("rain", "is it going to rain tomorrow",
      _forecast(daily_rain=[0, 15] + [0] * 5),
      "Tomorrow looks dry, only about 15 percent.")
 
+case("rain", "will it rain tomorrow",
+     _forecast(daily_rain=[0] * 7),
+     "Tomorrow looks dry.")
+
 case("rain", "any rain this weekend",
      _forecast(daily_rain=[0, 0, 0, 80, 15, 0, 0]),
      "It looks like Saturday is the wet one, around 80 percent. "
@@ -163,6 +167,47 @@ def run():
     assert w.resolve_timeframe("weather this weekend", NOW).kind == "range"
     assert w.resolve_timeframe("weather in 20 days", NOW).kind == "beyond"
     assert w.resolve_timeframe("what's the weather", NOW).kind == "current"
+
+    # Provider: one fetch per location at a time, however many callers ask.
+    import threading
+    import time
+
+    class SlowProvider(w.WeatherProvider):
+        fetches = 0
+        fail = False
+
+        def _fetch(self, loc):
+            SlowProvider.fetches += 1
+            time.sleep(0.2)
+            if self.fail:
+                raise OSError("down")
+            return _forecast()
+
+    prov = SlowProvider(HOME)
+    callers = [threading.Thread(target=prov.get) for _ in range(4)]
+    for c in callers:
+        c.start()
+    for c in callers:
+        c.join()
+    assert SlowProvider.fetches == 1, SlowProvider.fetches
+    # Stale: prewarm refreshes (blocking) while a get() in the middle of it
+    # serves the old forecast without starting a second fetch.
+    k = prov._key(HOME)
+    prov._cache[k] = (prov._cache[k][0], time.time() - prov._ttl - 1)
+    pw = threading.Thread(target=prov.prewarm, args=([],))
+    pw.start()
+    time.sleep(0.05)
+    assert prov.get() is not None
+    pw.join()
+    time.sleep(0.05)
+    assert SlowProvider.fetches == 2, SlowProvider.fetches
+    assert time.time() - prov._cache[k][1] < 5   # prewarm left it fresh
+    # A failed cold fetch caches None; once due again, get() retries cleanly.
+    down = SlowProvider(HOME)
+    down.fail = True
+    assert down.get() is None
+    down._cache[k] = (None, time.time() - down._ttl - 1)
+    assert down.get() is None
 
     if failed:
         print(f"\n{failed} snapshot(s) failed")

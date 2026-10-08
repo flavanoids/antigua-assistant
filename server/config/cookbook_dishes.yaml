@@ -1,0 +1,418 @@
+# The offline cookbook's dish list (scripts/build_cookbook.py).
+#
+# Each dish is searched like "how do I make <dish>" would be, and only recipes
+# rated 4.5 or better by at least 50 people are kept (recipe.COOKBOOK_MIN_*),
+# up to 3 per dish. A dish with no recipe that popular stays online-only.
+# "dish | alias, alias" adds names that find the same entry.
+# Recipes asked for by voice join the cookbook on their own when they clear
+# the same bar, so this list is a head start, not the limit.
+
+breakfast:
+  - pancakes | pancake, buttermilk pancakes
+  - waffles | belgian waffles
+  - french toast
+  - scrambled eggs
+  - omelette | omelet
+  - eggs benedict
+  - shakshuka
+  - breakfast burritos | breakfast burrito
+  - huevos rancheros
+  - chilaquiles
+  - biscuits and gravy
+  - buttermilk biscuits | biscuits
+  - blueberry muffins
+  - banana bread
+  - cinnamon rolls
+  - overnight oats
+  - granola
+  - chia seed pudding | chia pudding
+  - quiche lorraine | quiche
+  - avocado toast
+  - hash browns
+  - crepes | crepe
+  - dutch baby pancake | dutch baby
+  - tamagoyaki | japanese omelette
+  - congee | rice porridge, jook
+  - masala dosa | dosa
+  - aloo paratha
+  - poha
+
+american:
+  - mac and cheese | macaroni and cheese
+  - meatloaf
+  - pot roast
+  - fried chicken
+  - buffalo wings | chicken wings, hot wings
+  - barbecue pulled pork | pulled pork
+  - baby back ribs | ribs
+  - chili | chili con carne, beef chili
+  - cornbread
+  - chicken pot pie | pot pie
+  - sloppy joes
+  - smash burgers | cheeseburger, burgers, hamburger
+  - grilled cheese sandwich | grilled cheese
+  - clam chowder | new england clam chowder
+  - chicken noodle soup
+  - shrimp and grits
+  - jambalaya
+  - gumbo | chicken and sausage gumbo
+  - red beans and rice
+  - chicken fried steak | country fried steak
+  - coleslaw
+  - potato salad
+  - deviled eggs
+  - baked beans
+  - green bean casserole
+  - mashed potatoes
+  - roast turkey | thanksgiving turkey
+  - stuffing | thanksgiving stuffing
+  - roast chicken | whole roast chicken
+  - beef stew
+  - lobster rolls | lobster roll
+  - philly cheesesteak | cheesesteak
+  - crab cakes
+  - chicken and dumplings
+  - tuna noodle casserole
+  - twice baked potatoes
+
+mexican:
+  - tacos al pastor | al pastor
+  - carne asada
+  - carnitas
+  - birria tacos | birria
+  - chicken enchiladas | enchiladas
+  - enchiladas verdes
+  - chiles rellenos | chile relleno
+  - pozole | pozole rojo
+  - tamales
+  - mole poblano | mole
+  - guacamole
+  - pico de gallo
+  - salsa verde
+  - restaurant style salsa | salsa
+  - mexican rice | spanish rice, arroz rojo
+  - refried beans
+  - charro beans | frijoles charros
+  - chicken tortilla soup | tortilla soup
+  - sopa de fideo | fideo
+  - elote | mexican street corn
+  - quesadillas | quesadilla
+  - fajitas | chicken fajitas
+  - tostadas
+  - flautas | taquitos
+  - chicken tinga | tinga
+  - menudo
+  - caldo de res
+  - albondigas soup | albondigas
+  - ceviche
+  - churros
+  - tres leches cake | tres leches
+  - flan
+  - conchas
+  - arroz con leche | rice pudding
+
+tex_mex_and_latin:
+  - queso dip | queso, chile con queso
+  - breakfast tacos
+  - nachos
+  - arroz con pollo
+  - empanadas
+  - pupusas
+  - arepas
+  - picadillo
+  - ropa vieja
+  - cuban sandwich | cubano
+  - tostones
+  - maduros | fried sweet plantains
+  - black beans and rice | cuban black beans
+  - pernil
+  - jerk chicken
+  - rice and peas | jamaican rice and peas
+  - chimichurri
+  - lomo saltado
+  - pao de queijo | brazilian cheese bread
+
+italian:
+  - spaghetti carbonara | carbonara
+  - cacio e pepe
+  - fettuccine alfredo | alfredo
+  - lasagna | lasagne
+  - spaghetti and meatballs | meatballs
+  - chicken parmesan | chicken parm
+  - eggplant parmesan | eggplant parm
+  - bolognese | spaghetti bolognese
+  - pesto | basil pesto
+  - risotto | mushroom risotto
+  - margherita pizza | pizza
+  - pizza dough
+  - minestrone | minestrone soup
+  - focaccia
+  - chicken piccata
+  - chicken marsala
+  - osso buco
+  - penne alla vodka | vodka pasta
+  - shrimp scampi
+  - gnocchi
+  - bruschetta
+  - caprese salad
+  - tiramisu
+  - panna cotta
+  - cannoli
+
+french:
+  - french onion soup
+  - coq au vin
+  - beef bourguignon | boeuf bourguignon
+  - ratatouille
+  - croque monsieur
+  - chocolate souffle | souffle
+  - creme brulee
+  - chocolate mousse
+  - madeleines
+  - croissants
+
+mediterranean_and_middle_eastern:
+  - hummus
+  - falafel
+  - tabbouleh
+  - fattoush
+  - baba ganoush
+  - chicken shawarma | shawarma
+  - chicken souvlaki | souvlaki
+  - gyros | gyro
+  - tzatziki
+  - greek salad
+  - spanakopita
+  - moussaka
+  - avgolemono soup | avgolemono
+  - lentil soup
+  - mujadara
+  - shakshuka
+  - chicken kofta | kofta
+  - baklava
+  - paella
+  - gazpacho
+  - spanish tortilla | tortilla espanola
+  - patatas bravas
+  - chicken tagine | tagine
+
+indian:
+  - butter chicken | murgh makhani
+  - chicken tikka masala | tikka masala
+  - chana masala | chole
+  - palak paneer | saag paneer
+  - dal tadka | dal, dhal
+  - dal makhani
+  - chicken biryani | biryani
+  - chicken curry | indian chicken curry
+  - aloo gobi
+  - rajma
+  - paneer tikka
+  - samosas | samosa
+  - naan
+  - chapati | roti
+  - jeera rice | cumin rice
+  - raita
+  - vindaloo | chicken vindaloo
+  - korma | chicken korma
+  - pav bhaji
+  - gulab jamun
+  - kheer
+  - mango lassi
+  - masala chai | chai, chai tea
+
+thai:
+  - pad thai
+  - green curry | thai green curry
+  - red curry | thai red curry
+  - massaman curry
+  - panang curry
+  - tom yum soup | tom yum
+  - tom kha gai | tom kha
+  - pad see ew
+  - drunken noodles | pad kee mao
+  - thai basil chicken | pad kra pao
+  - thai fried rice | khao pad
+  - larb
+  - papaya salad | som tum
+  - mango sticky rice
+  - thai iced tea
+
+chinese:
+  - egg drop soup
+  - hot and sour soup
+  - wonton soup
+  - fried rice | egg fried rice
+  - chicken lo mein | lo mein
+  - chow mein
+  - kung pao chicken
+  - orange chicken
+  - general tso's chicken | general tso chicken
+  - sesame chicken
+  - beef and broccoli
+  - mongolian beef
+  - sweet and sour chicken | sweet and sour pork
+  - mapo tofu
+  - dumplings | potstickers, pork dumplings
+  - scallion pancakes
+  - char siu | chinese bbq pork
+  - egg rolls
+  - dan dan noodles
+  - steamed fish | chinese steamed fish
+  - egg tarts
+
+japanese:
+  - chicken teriyaki | teriyaki chicken
+  - chicken katsu | tonkatsu
+  - japanese curry
+  - ramen | shoyu ramen
+  - miso soup
+  - gyoza
+  - oyakodon
+  - gyudon | beef bowl
+  - yakisoba
+  - okonomiyaki
+  - onigiri | rice balls
+  - sushi rice
+  - california roll | sushi rolls
+  - chicken karaage | karaage
+  - tempura
+  - salmon teriyaki
+  - japanese milk bread | milk bread
+  - matcha latte
+
+korean:
+  - bibimbap
+  - bulgogi
+  - kimchi fried rice
+  - kimchi jjigae | kimchi stew
+  - japchae
+  - korean fried chicken
+  - tteokbokki
+  - kimchi
+  - galbi | korean short ribs
+  - sundubu jjigae | soft tofu stew
+  - korean pancakes | pajeon
+
+vietnamese_and_southeast_asian:
+  - pho | beef pho
+  - banh mi
+  - spring rolls | fresh spring rolls, summer rolls
+  - bun cha
+  - vietnamese iced coffee
+  - chicken adobo | adobo
+  - pancit
+  - lumpia
+  - chicken satay | satay
+  - nasi goreng
+  - laksa
+
+african_and_more:
+  - jollof rice
+  - doro wat
+  - bobotie
+  - shakshuka
+  - chicken stew | african chicken stew
+  - goulash | hungarian goulash
+  - pierogi
+  - schnitzel | wiener schnitzel
+  - beef stroganoff | stroganoff
+  - borscht
+  - shepherd's pie | cottage pie
+  - fish and chips
+  - bangers and mash
+
+soups_salads_sides:
+  - tomato soup
+  - broccoli cheddar soup
+  - potato soup
+  - butternut squash soup
+  - split pea soup
+  - black bean soup
+  - caesar salad
+  - cobb salad
+  - roasted vegetables
+  - roasted brussels sprouts
+  - garlic bread
+  - dinner rolls
+  - mashed sweet potatoes
+  - roasted potatoes
+  - rice pilaf
+  - mexican street corn salad | esquites
+
+desserts:
+  - chocolate chip cookies
+  - oatmeal raisin cookies
+  - peanut butter cookies
+  - snickerdoodles
+  - sugar cookies
+  - brownies
+  - blondies
+  - lemon bars
+  - cheesecake | new york cheesecake
+  - chocolate cake
+  - carrot cake
+  - red velvet cake
+  - pound cake
+  - vanilla cake | yellow cake
+  - pineapple upside down cake
+  - apple pie
+  - pumpkin pie
+  - pecan pie
+  - key lime pie
+  - peach cobbler
+  - apple crisp
+  - banana pudding
+  - bread pudding
+  - rice krispie treats
+  - cupcakes | vanilla cupcakes
+  - chocolate truffles
+  - fudge
+  - mochi
+  - sopapillas
+  - buñuelos | bunuelos
+  - pan dulce
+  - polvorones | mexican wedding cookies
+  - tres leches cake
+  - homemade ice cream | vanilla ice cream
+
+drinks:
+  - horchata
+  - agua fresca | watermelon agua fresca
+  - agua de jamaica | jamaica, hibiscus tea
+  - mexican hot chocolate
+  - champurrado
+  - atole
+  - lemonade
+  - sweet tea
+  - iced coffee
+  - cold brew coffee | cold brew
+  - hot chocolate | hot cocoa
+  - masala chai | chai
+  - mango lassi
+  - bubble tea | boba tea
+  - thai iced tea
+  - matcha latte
+  - pumpkin spice latte
+  - eggnog
+  - margarita
+  - michelada
+  - mojito
+  - paloma
+  - sangria
+  - pina colada
+  - old fashioned
+  - moscow mule
+
+smoothies:
+  - strawberry banana smoothie
+  - green smoothie
+  - mango smoothie
+  - berry smoothie | mixed berry smoothie
+  - peanut butter banana smoothie
+  - pineapple smoothie
+  - acai bowl
+  - smoothie bowl
+  - protein shake | protein smoothie
+  - milkshake | vanilla milkshake
+  - chocolate milkshake

@@ -80,7 +80,82 @@ def _money(amount: float, code: str = "USD") -> str:
     return f"{num2words(whole)} {unit} and {num2words(cents)} cents"
 
 
+# ── spoken numbers → digits ─────────────────────────────────────────────────
+# Whisper usually writes digits, but not always ("twelve times twelve"). Run
+# only on turns already headed for calc, so "which one" etc. never sees it.
+
+_UNITS = {w: i for i, w in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve "
+    "thirteen fourteen fifteen sixteen seventeen eighteen nineteen".split())}
+_TENS = {w: 10 * i for i, w in enumerate(
+    "twenty thirty forty fifty sixty seventy eighty ninety".split(), 2)}
+_SCALES = {"hundred": 100, "thousand": 1000, "million": 10**6, "billion": 10**9}
+_NUM_WORD = "|".join(sorted([*_UNITS, *_TENS, *_SCALES], key=len, reverse=True))
+_NUM_RUN_RE = re.compile(
+    r"\b(?:a(?=\s+(?:hundred|thousand|million|billion)\b)|" + _NUM_WORD + r")"
+    r"(?:(?:\s+|-|(?:(?<=hundred)|(?<=thousand)|(?<=million))\s+and\s+)"
+    r"(?:" + _NUM_WORD + r")\b)*"
+    r"(?:\s+point(?:\s+(?:" + "|".join(_UNITS) + r")\b)+)?"
+    r"(?!\s+(?:thirds?|quarters?)\b)", re.I)  # "three quarters of 200" stays for _FRAC_RE
+_ORDINALS = {w: i for i, w in enumerate(
+    "second third fourth fifth sixth seventh eighth ninth tenth eleventh "
+    "twelfth".split(), 2)}
+_POWER_ORD_RE = re.compile(r"\bto\s+the\s+(" + "|".join(_ORDINALS) + r")\b", re.I)
+
+
+def _run_value(run: str) -> str:
+    whole, _, frac = run.lower().partition(" point ")
+    total = cur = 0
+    for w in re.split(r"[\s-]+", whole):
+        if w in _UNITS or w in _TENS:
+            cur += _UNITS.get(w, _TENS.get(w))
+        elif w == "hundred":
+            cur = (cur or 1) * 100
+        elif w in _SCALES:
+            total, cur = total + (cur or 1) * _SCALES[w], 0
+    out = str(total + cur)
+    if frac:
+        out += "." + "".join(str(_UNITS[d]) for d in frac.split())
+    return out
+
+
+def spoken_to_digits(text: str) -> str:
+    """'what's twelve times twelve' -> 'what's 12 times 12'; '5 thousand' -> '5000';
+    'negative 4' -> '-4'; 'to the tenth' -> 'to the 10th'."""
+    s = re.sub(r"\b(\d+(?:\.\d+)?)\s+(hundred|thousand|million|billion)\b",
+               lambda m: _trim(float(m.group(1)) * _SCALES[m.group(2).lower()]), text, flags=re.I)
+    s = _NUM_RUN_RE.sub(lambda m: _run_value(m.group(0)), s)
+    s = re.sub(r"\bnegative\s+(?=\d)", "-", s, flags=re.I)
+    return _POWER_ORD_RE.sub(lambda m: f"to the {_ORDINALS[m.group(1).lower()]}th", s)
+
+
 # ── arithmetic ──────────────────────────────────────────────────────────────
+
+# Powers become "**" before the general path strips non-math characters —
+# otherwise "3 to the power of 4" would collapse to "3 4".
+_POW_OPS = [
+    (re.compile(r"\s*(?:squared|²)", re.I), "**2"),
+    (re.compile(r"\s*(?:cubed|³)", re.I), "**3"),
+    (re.compile(r"\s*\^\s*"), "**"),
+    (re.compile(r"\b(?:raised\s+)?to\s+the\s+power\s+of\b", re.I), "**"),
+    (re.compile(r"\b(?:raised\s+)?to\s+the\s+(\d+)(?:st|nd|rd|th)?(?:\s+power)?\b", re.I),
+     r"**\1"),
+    (re.compile(r"\braised\s+to\b", re.I), "**"),
+]
+_ROOT_RE = re.compile(
+    r"\b(square|cube)\s+root\s+of\s+(-?\d[\d,]*(?:\.\d+)?)", re.I)
+_ROOT_ONLY_RE = re.compile(
+    r"^(?:(?:what(?:'s| is)|whats|how much is|calculate|compute)\s+)?(?:the\s+)?"
+    + _ROOT_RE.pattern + r"$", re.I)
+
+
+def _root(kind: str, x: float) -> float:
+    if kind.lower() == "square":
+        if x < 0:
+            raise ValueError("negative square root")
+        return x ** 0.5
+    return -((-x) ** (1 / 3)) if x < 0 else x ** (1 / 3)
+
 
 _WORD_OPS = [
     (re.compile(r"\bmultiplied by\b", re.I), "*"),
@@ -94,9 +169,10 @@ _WORD_OPS = [
 
 _ALLOWED_NODES = (
     ast.Expression, ast.BinOp, ast.UnaryOp,
-    ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod,
+    ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow,
     ast.USub, ast.UAdd,
 )
+_MAX_EXPONENT = 64  # 9**9**9 would hang building the int; >1e12 is rejected anyway
 
 
 def _safe_eval(expr: str):
@@ -108,6 +184,10 @@ def _safe_eval(expr: str):
                 raise ValueError("non-numeric constant")
         elif not isinstance(node, _ALLOWED_NODES):
             raise ValueError(f"disallowed node: {type(node).__name__}")
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+            exp = node.right.operand if isinstance(node.right, ast.UnaryOp) else node.right
+            if not isinstance(exp, ast.Constant) or abs(exp.value) > _MAX_EXPONENT:
+                raise ValueError("exponent too large")
     val = eval(compile(tree, "<calc>", "eval"), {"__builtins__": {}}, {})  # noqa: S307
     if isinstance(val, complex) or abs(val) > 1e12:
         raise ValueError("out of range")
@@ -194,13 +274,21 @@ def _arith(text: str):
     # wrong. Better to hand those to the LLM.
     if re.search(r"%|\bpercent\b", s):
         return None
-    expr = s
-    for pat, op in _WORD_OPS:
+    m = _ROOT_ONLY_RE.match(s)
+    if m:
+        try:
+            val = _root(m.group(1), _f(m.group(2)))
+        except ValueError:
+            return None
+        shown = _approx(val) if val >= 0 else _signed(val)
+        return f"The {m.group(1).lower()} root of {_signed(_f(m.group(2)))} is {shown}."
+    expr = _ROOT_RE.sub(lambda m: f"({_root(m.group(1), _f(m.group(2))):.12f})", s)
+    for pat, op in _POW_OPS + _WORD_OPS:
         expr = pat.sub(op, expr)
     expr = re.sub(r"(\d),(\d{3})\b", r"\1\2", expr)
     expr = re.sub(r"(?:%|percent)", " ", expr)
     expr = re.sub(r"[^0-9+\-*/().\s]", " ", expr).strip()
-    if not re.search(r"\d\s*[-+*/]\s*[-(]*\s*\d", expr):
+    if not re.search(r"[\d)]\s*(?:\*\*|[-+*/])\s*[-(]*\s*\d", expr):
         return None
     try:
         val = _safe_eval(expr)
@@ -418,6 +506,7 @@ def answer(text: str, *, rates=None) -> str | None:
     """
     if not text:
         return None
+    text = spoken_to_digits(text)
     try:
         reply = _currency(text, rates)
     except Exception:  # noqa: BLE001

@@ -47,11 +47,15 @@ def _centroid(embeddings: list[list[float]]) -> list[float]:
 class SpeakerProfiles:
     """Enrolled per-person voice centroids, JSON-persisted."""
 
-    def __init__(self, path: Path = None, min_similarity: float = None):
+    def __init__(self, path: Path | None = None, min_similarity: float | None = None,
+                 min_margin: float | None = None):
         # Resolved at call time — settings.configure() runs after import.
         self._path = path or settings.SPEAKER_PROFILES_PATH
         self._min_similarity = (
             min_similarity if min_similarity is not None else settings.SPEAKER_MIN_SIMILARITY
+        )
+        self._min_margin = (
+            min_margin if min_margin is not None else settings.SPEAKER_MIN_MARGIN
         )
         self._lock = Lock()
         self._profiles: dict[str, list[float]] = {}  # person -> centroid
@@ -93,17 +97,19 @@ class SpeakerProfiles:
 
     def identify(self, embedding: list[float]) -> tuple[str, float] | None:
         """Return (person, similarity) for the best match above the
-        similarity floor, or None. Callers must also gate on minimum audio
+        similarity floor that also beats the runner-up by min_margin, or None. Callers must also gate on minimum audio
         duration before extracting embedding() — a short clip and a
         low-confidence match are the same failure mode."""
         with self._lock:
             profiles = dict(self._profiles)
-        best_person, best_score = None, -1.0
-        for person, centroid in profiles.items():
-            score = cosine_similarity(embedding, centroid)
-            if score > best_score:
-                best_person, best_score = person, score
-        if best_person is not None and best_score >= self._min_similarity:
+        scores = sorted(
+            ((cosine_similarity(embedding, c), p) for p, c in profiles.items()), reverse=True
+        )
+        if not scores:
+            return None
+        best_score, best_person = scores[0]
+        runner_up = scores[1][0] if len(scores) > 1 else -1.0
+        if best_score >= self._min_similarity and best_score - runner_up >= self._min_margin:
             return best_person, best_score
         return None
 

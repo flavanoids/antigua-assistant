@@ -8,6 +8,9 @@ Writes 48 kHz stereo WAVs next to this file:
                          pluck at A5.
   endpoint.wav         — end of speech / now processing: a quick two-note pluck
                          down (A5 -> E5), a "got it, closing" gesture.
+  chat_end.wav         — conversation mode ended on its own (silence, or speech
+                         that wasn't for her): a soft, slow E5 -> A4 fall. Also
+                         copied to server/static_audio/ for the kitchen bridge.
 
 The satellite (antigua_satellite.py) plays these via beep_wake() / beep_thinking()
 and falls back to a synth beep if the file is missing. Levels are deliberately
@@ -80,7 +83,19 @@ def endpoint():
     return _finalize(_room(sig, decay=10), peak_db=-18)
 
 
+A4 = 440.00
+
+
+def chat_end():
+    sig = _add(np.zeros(1), _pluck(E5, 0.30, decay_scale=0.7), 0.0, gain=0.8)
+    sig = _add(sig, _pluck(A4, 0.55, decay_scale=0.6), 0.16)
+    return _finalize(_room(sig, wet=0.18), peak_db=-20)
+
+
 if __name__ == "__main__":
-    for name, fn in (("start_listening", start_listening), ("endpoint", endpoint)):
+    for name, fn in (("start_listening", start_listening), ("endpoint", endpoint),
+                     ("chat_end", chat_end)):
         sf.write(str(HERE / f"{name}.wav"), fn(), SR, subtype="PCM_16")
         print(f"wrote {name}.wav")
+    sf.write(str(HERE.parent / "server/static_audio/chat_end.wav"), chat_end(), SR, subtype="PCM_16")
+    print("wrote server/static_audio/chat_end.wav")

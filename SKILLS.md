@@ -34,16 +34,25 @@ each skill works inside, see [ANTIGUA_SKILLS/](ANTIGUA_SKILLS/README.md).
 - "Don't let me forget to take the trash out tonight" / "remind me to take my pills every day at 8"
 - "How much time is left?" / "How long on the pasta timer?" / "When's my alarm?" / "What are my reminders?"
 - "Add 5 minutes to the timer" / "Reset the timer" / "Cancel my 7 AM alarm" / "Cancel the dentist reminder" / "Cancel everything"
-- "Snooze" / "Snooze for 10 minutes" (after an alarm rings)
+- "Snooze" / "Snooze for 10 minutes" / "Snooze 10 more minutes" (after something rings)
+- "Set a timer for 10" (minutes) / "Set a timer" → "For how long?" / "Set an alarm" → "For what time?"
+- "Set an alarm for half past six" / "quarter to seven" / "noon" / "6 AM on weekdays" / "Monday through Friday"
+- "Take 2 minutes off the timer" / "Add five more minutes" / "Pause the timer" / "Resume the timer"
+- "Change my alarm to 7:30" / "Push my alarm back 15 minutes" / "Move tomorrow's alarm to 8" (just that day)
+- "Skip tomorrow's alarm" / "Turn off my alarm for tomorrow" (a repeating alarm sits that day out)
+- "Remind me to stretch every hour" / "every 30 minutes"
+- "Is my alarm set?" / "What time is my alarm?" / "Do I have any alarms tomorrow?"
+- "Stop" / "Turn it off" / "I'm up" while something is ringing
 
 **Behavior**:
 - Fires: alarm sound + TTS voice ("Your pasta timer is done." / "Good morning, your alarm is going off." / "Reminder: move the laundry.")
 - A reminder with no time ("remind me to buy milk") can't be set — she answers from the LLM instead.
 - Bare daypart words default: morning 8 AM, afternoon 2 PM, evening 7 PM, night/tonight 9 PM.
 - If you give a day but no time ("remind me to call the dentist tomorrow"), she asks "What time tomorrow?" and sets it from your answer.
-- Rings for `alarm_ring_seconds` (default 5s — the mic sits next to the speaker, so the wake word is unreliable while it rings), or until you say the wake word, which also drops into conversation mode so you can immediately say "snooze"
+- Rings (announcement + a 5s bell; a soft chime for reminders) every 30s until you say the wake word or "stop", for up to 5 minutes. The bell stays short because the mic sits next to the speaker: the wake word is heard in the quiet between rings. `alarm_repeat_seconds` / `alarm_max_seconds` / `alarm_ring_seconds` in `satellite.yaml`
+- "Cancel my alarm" with several set asks which one
 - Recurring alarms reschedule themselves after each fire
-- Multiple timers/alarms supported; survive a server restart (alarm day-labels refresh on reload)
+- Multiple timers/alarms supported; survive a server restart (alarm day-labels refresh on reload), and one that came due during a restart still rings if it's under 10 minutes late
 
 ---
 
@@ -62,6 +71,22 @@ each skill works inside, see [ANTIGUA_SKILLS/](ANTIGUA_SKILLS/README.md).
 - "50 dollars in euros" / "how much is 20 pounds in dollars" / "convert 100 yen to dollars"
 
 **Limits**: No algebra, word problems, square roots, or date math — those go to the LLM. Single-unit answers only ("2 cups", not "1 lb 4 oz"). Say "fluid ounce" when you mean volume — plain "ounce" is weight. Currency rates are daily reference rates (not live/tradeable) and cover ~30 common currencies; anything else falls to the LLM.
+
+---
+
+## Drive Times & Traffic
+
+**What she knows**: Drive time by car from home to any business, address, town or saved favorite, and whether traffic is worse than usual (and why). Deterministic, no LLM, no Google. Places come from OpenStreetMap (Photon). Routes come from TomTom with live traffic when a key is set, else OSRM. Live Houston speeds and incidents come from TranStar.
+
+**How to ask**:
+- "How long to get to Lowe's on Ella?" / "How long to drive to HEB Bunker Hill?"
+- "How long to Niko Niko's?" (two nearby, so she asks "which one?"; answer "the Montrose one", "the one by the beltway", "the closer one")
+- "How far is Mom's house?" / "What's my ETA to work?"
+- "How's traffic to work?" / "How's traffic?" / "Is there traffic on I-10?" / "Any wrecks on 610?"
+
+**Setup**: home and favorites (friends, family, work) go in `server/config/places.yaml`. That file is private: git-ignored, chmod 600, never spoken back or logged. Copy it from `places.example.yaml`. Optional: a free TomTom developer key as `TOMTOM_API_KEY` in `server/config/mcp.env`.
+
+**Limits**: Car only, always from home ("from X to Y" goes to the LLM). Live traffic is Houston-area only, and on the keyless OSRM route it covers only the roads TranStar measures. Elsewhere she says the time is "without live traffic".
 
 ---
 
@@ -126,6 +151,18 @@ each skill works inside, see [ANTIGUA_SKILLS/](ANTIGUA_SKILLS/README.md).
 
 ---
 
+## Funny Sounds
+
+**What she does**: Plays a random clip from the top 50 of myinstants' US sound effects (vine boom, airhorn, bruh...) at half her speaking volume.
+
+**How to ask**:
+- "Play a funny sound"
+- "Play another funny sound" / "Make a funny noise"
+
+**Setup**: the clips aren't in git. Download them with `uv run --no-project --with curl_cffi python server/scripts/fetch_funny_sounds.py`. See [ANTIGUA_SKILLS/funny_sound/](ANTIGUA_SKILLS/funny_sound/README.md).
+
+---
+
 ## Govee Lights
 
 **What she does**: Controls Govee lights (power, color, brightness, white warmth) through the Govee MCP server, over the LAN when the light allows it and through the Govee cloud otherwise. Works from the backup server too.
@@ -141,6 +178,23 @@ each skill works inside, see [ANTIGUA_SKILLS/](ANTIGUA_SKILLS/README.md).
 **Devices**: whatever is listed under `govee.devices` in `server.yaml`, by the names you give them. Groups work too ("hallway lights", "all the lights").
 
 **Behavior**: Confirms immediately; the command reaches the light a moment later (well under a second over LAN, 1–2 seconds via the cloud). If the light or the Govee cloud is unreachable, the failure is only logged, not spoken.
+
+---
+
+## PinedaDisplay (the airplaypi screen)
+
+**What she does**: Controls the PinedaDisplay dashboard on the airplaypi kiosk and answers questions about what's on it. Details: [ANTIGUA_SKILLS/pineda_display/](ANTIGUA_SKILLS/pineda_display/README.md).
+
+**How to ask**:
+- "Change the theme to ocean" / "Switch to the groovy theme" / "Random theme" / "What themes are there?"
+- "Restart the display" / "Reboot the Pi" (she asks you to say yes first)
+- "Who said this quote?" / "Read the quote" / "Tell me more about this quote"
+- "Say the Spanish phrase" / "What's the word of the day?"
+- "When was this photo taken?"
+
+**Behavior**: Theme changes stick until you change them again, and each light theme still turns to its night version at sundown. The Spanish phrase plays in the Spanish voice, then the meaning in English, then the Spanish again. Running timers show in the display's small moon card.
+
+**Limits**: Only the primary server can reach the display. Photos without a camera date (screenshots, edited images) can't be dated. A reboot takes music and her voice away for about a minute.
 
 ---
 
@@ -160,6 +214,21 @@ each skill works inside, see [ANTIGUA_SKILLS/](ANTIGUA_SKILLS/README.md).
 
 ---
 
+## News podcasts (Apple News Today, Up First)
+
+**What she does**: Plays the day's episode of Apple News Today or NPR's Up First on the music speakers.
+
+**How to ask**:
+- "Play Apple News Today" / "Play the Apple News podcast"
+- "Play yesterday's Apple News Today" / "Play Friday's Apple News" / "Put on the latest Apple News Today"
+- "Play Apple News Today on the soundbar"
+- "Play Up First" / "Play NPR's Up First" / "Play Saturday's Up First"
+- "Stop Apple News" / "Pause the podcast" / "Resume the podcast"
+
+**Behavior**: She plays today's episode. If it isn't out yet (both drop around 5am Central), she plays the latest one instead. On a day with no news episode she asks "Want me to play Friday's?": Apple News Today skips weekends, and Up First's Sunday episode is a long-form story, not the news. Say the wake word and "yes" within a minute. Shows are listed under `podcasts:` in server.yaml. Apple News Today has no RSS feed, so its episodes come from its Apple Podcasts page.
+
+---
+
 ## Living Room TV
 
 **What she does**: Controls the living room TV through two MCP servers. The Apple TV ("Living Room") handles power, volume, mute, apps, navigation and play/pause, and reaches the TV itself over HDMI-CEC. The Roku TV handles switching inputs. Works from the backup server too.
@@ -176,11 +245,55 @@ each skill works inside, see [ANTIGUA_SKILLS/](ANTIGUA_SKILLS/README.md).
 
 ---
 
+## People, History & Events
+
+**How to ask**: "Who was Frida Kahlo?", "Tell me about the Cuban Missile Crisis", "What was Watergate?", "What happened at Chernobyl?", "Quién fue Benito Juárez?"
+
+**Behavior**: A short but substantive overview (3–4 sentences) from the subject's Wikipedia article: who or what, when and where, what they're known for, and one notable detail. Nothing is added that the article doesn't say.
+
+**Follow-ups**: For 15 minutes afterward, wake her and ask about the same subject: "Was she married?", "What's her hometown?", "What are her notable achievements?", "How did it end?", "Tell me more". Answers come from the same article and its Wikidata facts. If the article doesn't cover it, she says she doesn't have that detail.
+
+**Limits**: Role and live questions ("Who is the CEO of…", "Who is playing tonight") go to web search instead.
+
+---
+
+## Recipes
+
+**How to ask**: "How do I make cheesecake?", "Give me a recipe for chicken noodle soup", "Let's bake banana bread", "Chicken noodle soup for 4 people", "Pozole recipe"
+
+**Behavior**: She finds a real recipe online and says where it's from, how many it serves and how long it takes, with a heads-up for long waits like chilling overnight. Then she reads the ingredients (grouped, like "For the crust…") and any special equipment, and asks "Do you have everything?" Recipes are never made up: if she can't find one online, she says so.
+
+**Size**: Ask for "…for 4 people" and the recipe starts scaled to 4. Mid-recipe, "make it for 4", "I'm cooking for 6 people", "double it", "halve it", "back to the original" rescale the amounts; "how many does it serve?" says the current size. She never scales times, temperatures or pan sizes — she says they're from the original recipe, and warns when you may need a bigger or smaller pan. A "for 4" request carries into "another recipe"; a plain "double it" resets with it.
+
+Say "one at a time" and she reads them one by one, waiting for "got it" or "I don't have it".
+
+**Missing something**: "No, I don't have sour cream." She suggests a substitute ("the same amount of plain Greek yogurt. Do you have that?"). Say no and she offers the next one. If nothing works, she tells you it can be left out (a spice, herb or vegetable), or offers to put an essential ingredient on the shopping list and asks whether you want a different recipe.
+
+**Cooking**: "Ready for step one?" Each step ends with "Let me know when you're ready for the next step." Say (with the wake word each time):
+- "Next", "I'm ready", "Done": the next step
+- "Go back", "Repeat that", "Start over", "Go to step 4"
+- "What was step 3?" (reads it without losing your place), "How many steps are left?"
+- "How much sugar?", "How long in the oven again?", "What temperature?": answered from the recipe
+- "Can I skip the vanilla?", "Is the sour cream really necessary?": the recipe's optional/essential rule, straight
+- "How do I know when it's done?", "What's it supposed to look like?": the step's own doneness cue
+- "What can I use instead of butter?", "Read the ingredients again"
+- "Make it for 4", "Double it", "Halve it", "Back to the original", "How many does it serve?"
+- "Another recipe", "Something simpler", "One without nuts"
+- "Stop the recipe" / "I'm done cooking"
+
+On a timed step ("bake 45 minutes") she offers to set a timer. While a recipe is on its steps, a bare "next" means the next step; say "next song" to skip music.
+
+**Asking anything else**: "Can I use a hand mixer?", "Why a water bath?", "Can I make this the day before?" — she answers from the recipe she's reading you, plus general kitchen technique. She'll never quote an amount, time, temperature or pan size the recipe doesn't state (a code check, not just a promise); if the recipe doesn't say, she says so.
+
+**Limits**: The recipe stays open for 4 hours after the last thing you said about it. Only one recipe is open at a time, for the whole house. English only for now. The backup server can't look up recipes.
+
+---
+
 ## General Knowledge
 
 **What she knows**: History, science, math, cooking, language, culture, stories — anything from her training data.
 
-**How to ask**: Just ask. "Who was the first president of Mexico?", "How do you make risotto?", "Tell me a joke."
+**How to ask**: Just ask. "Who was the first president of Mexico?", "Why is the sky blue?", "Tell me a joke."
 
 **Limits**: She doesn't know anything after her training cutoff. For live data (stock prices, traffic), she'll say so briefly.
 

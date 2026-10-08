@@ -61,6 +61,7 @@ class FakeMA:
     def __init__(self):
         self.calls = []
         self.queues = {}          # pid -> {"state", "current_item"}
+        self.groups = {}          # leader pid -> synced pids
 
     def cmd(self, command, timeout=None, **args):
         self.calls.append((command, args))
@@ -89,6 +90,8 @@ class FakeMA:
         if command == "music/artists/artist_albums":
             return ALBUMS[args["item_id"]]
         if command == "player_queues/play_media":
+            if args.get("option", "replace") != "replace":
+                return None                     # queued behind the current song
             media = args["media"]
             first = media[0] if isinstance(media, list) else media
             self.queues[args["queue_id"]] = {"state": "playing", "current_item": {
@@ -100,7 +103,20 @@ class FakeMA:
             self.queues[args["target_queue_id"]] = self.queues.pop(args["source_queue_id"])
             return None
         if command == "players/get":
-            return {"player_id": args["player_id"], "volume_level": 40}
+            pid = args["player_id"]
+            kids = self.groups.get(pid, [])
+            return {"player_id": pid, "volume_level": 40,
+                    "can_group_with": [p for p in PLAYERS.values() if p != pid],
+                    "group_members": [pid, *kids] if kids else []}
+        if command == "players/cmd/group_many":
+            self.groups.setdefault(args["target_player"], []).extend(args["child_player_ids"])
+            return None
+        if command in ("players/cmd/ungroup", "players/cmd/ungroup_many"):
+            for pid in args.get("player_ids") or [args.get("player_id")]:
+                for kids in self.groups.values():
+                    if pid in kids:
+                        kids.remove(pid)
+            return None
         if command == "player_queues/get":
             return self.queues.get(args["queue_id"], {"state": "idle", "current_item": None})
         return None
@@ -113,11 +129,19 @@ def make():
     mc = MusicControl({"music": {"labels": {"Soundbar": "the soundbar",
                                             "Bedroom (2)": "the bedroom HomePod"}}}, "tok")
     mc.ma = FakeMA()
-    mc._played_path = Path(tempfile.mkdtemp()) / "played.json"
+    tmp = Path(tempfile.mkdtemp())
+    mc._played_path, mc._prefs_path, mc._fans_path = tmp / "played.json", tmp / "prefs.json", tmp / "fans.json"
+    mc._prefs, mc._fans = {}, {}
     mc._vocab_at = time.time()          # no background library/chart fetch
     mc._popular = lambda heard: set()   # no Deezer calls
+    mc._dz = lambda kind, q: []
+    mc._itunes = lambda term: []
     mc.play_in_background = False
     return mc
+
+
+def _n(c):
+    return f"{c.item['name']} — {music_mod._artists(c.item)}"
 
 
 def say(mc, text):
@@ -293,6 +317,183 @@ def main():
 
     # Nothing found
     assert say(mc, "play Zzqxv Blorp") == "I couldn't find Zzqxv Blorp on Apple Music."
+
+    # ── resolver: one scored pool instead of a fixed cascade
+    # Parsing: punctuation, "the artist X", and "X by Y" left to the resolver
+    it = parse_music("Play the song, So Sick.")
+    assert (it.action, it.query) == ("track", "So Sick"), it
+    it = parse_music('Play "Chapel Rhone."')
+    assert (it.action, it.query) == ("any", "Chapel Rhone"), it
+    assert parse_music("play the artist Cheetah Girls").action == "artist"
+    it = parse_music("play so sick by nia")
+    assert (it.action, it.query, it.artist) == ("any", "so sick", "nia"), it
+    assert parse_music("play 90s hip hop").genre and parse_music("play something relaxing").genre
+    assert not parse_music("play uptown funk").genre           # a genre word alone isn't a genre
+    assert parse_music("play the killers").query == "the killers"
+    assert MusicControl._hypotheses(parse_music("play stand by me by ben e king")) == [
+        ("stand", "me by ben e king"), ("stand by me", "ben e king"), ("stand by me by ben e king", "")]
+
+    def song(name, artist, uri):
+        return {"name": name, "uri": uri, "media_type": "track", "artists": [{"name": artist}]}
+    hits = {"halo": [song('Halo [From "Glee" Season 1]', "Glee Cast", "am://tr/glee"),
+                     song("Halo", "Mosimann", "am://tr/mos"), TRACKS[0]],
+            "flowers": [song("Flowers", "Faye Webster", "am://tr/fw"), song("Flowers", "Miley Cyrus", "am://tr/mc")],
+            "killers": [song("Killers", "Iron Maiden", "am://tr/im")]}
+    artists = {"the killers": [{"name": "The Killers", "uri": "am://ar/tk", "media_type": "artist"}],
+               "killers": [{"name": "Killers", "uri": "am://ar/k", "media_type": "artist"},
+                           {"name": "The Killers", "uri": "am://ar/tk", "media_type": "artist"}]}
+
+    class CatalogMA(FakeMA):
+        def cmd(self, command, timeout=None, **args):
+            if command == "music/search":
+                q = music_mod._norm(args["search_query"])
+                out = {}
+                if "track" in args["media_types"]:
+                    out["tracks"] = hits.get(q.removeprefix("the "), [])
+                if "artist" in args["media_types"]:
+                    out["artists"] = artists.get(q, [])
+                return out
+            return super().cmd(command, timeout, **args)
+    mc = make()
+    mc.ma = CatalogMA()
+    fans = {"Beyoncé": 30_000_000, "Mosimann": 50_000, "The Killers": 5_000_000,
+            "Killers": 2_000, "Iron Maiden": 9_000_000, "Faye Webster": 200_000, "Miley Cyrus": 20_000_000}
+    mc._dz = lambda kind, q: [{"name": q, "nb_fan": fans.get(q, 0)}]
+    # A cover or soundtrack re-recording loses to the original even when
+    # Apple lists it first; so does a less popular namesake.
+    assert say(mc, "play Halo") == "Playing Halo by Beyoncé.", mc._last
+    # iTunes' popularity order breaks a tie Apple's catalogue order gets wrong
+    mc._itunes = lambda term: [{"trackName": "Flowers", "artistName": "Miley Cyrus"},
+                               {"trackName": "Flowers", "artistName": "Faye Webster"}]
+    assert say(mc, "play flowers") == "Playing Flowers by Miley Cyrus.", [(c.score, c.item["name"]) for c in mc._last]
+    # "the killers" names the band; the article decides it
+    assert say(mc, "play the killers").startswith("Playing The Killers"), mc._last
+
+    # Corrections act on the pool behind the last play, only while it's fresh
+    from antigua_core.music_intents import parse_correction
+    assert say(mc, "play Halo") == "Playing Halo by Beyoncé." and mc.correctable()
+    assert mc.correct(parse_correction("no, the Mosimann one")) == "Playing Halo by Mosimann."
+    # Remembered: next time "play Halo" means Mosimann's, the one chosen by name
+    assert say(mc, "play Halo") == "Playing Halo by Mosimann.", [(c.score, _n(c)) for c in mc._last]
+    # "the other one" never goes back to a version already corrected away from,
+    # and a blind pick isn't remembered as wanted
+    mc._prefs.clear()
+    assert say(mc, "play Halo") == "Playing Halo by Beyoncé."
+    assert mc.correct(parse_correction("the other one")) == "Playing Halo by Mosimann."
+    assert mc.correct(parse_correction("the other one")) == 'Playing Halo [From "Glee" Season 1] by Glee Cast.'
+    assert mc.correct(parse_correction("the other one")) == "That's the only match I found."
+    assert not any(p["want"] for p in mc._prefs.values()), mc._prefs
+    # ...and nothing to correct once it's stale
+    mc._last_at -= mc.CORRECT_TTL + 1
+    assert not mc.correctable()
+    assert parse_correction("play Halo") is None and parse_correction("the album") is None
+
+    # ── playback navigation
+    mc = make()
+    say(mc, "play Halo")                                   # kitchen, queue ap_pi
+    q = mc.ma.queues["ap_pi"]
+    q["current_item"]["duration"] = 261
+    q.update(current_index=2, items=10, elapsed_time=100,
+             next_item={"name": "Stand by Me", "media_item": TRACKS[1]})
+    q["current_item"]["media_item"]["uri"] = "am://tr/halo"
+    assert say(mc, "skip ahead 30 seconds") == ""
+    assert mc.ma.calls[-1] == ("player_queues/skip", {"queue_id": "ap_pi", "seconds": 30})
+    assert say(mc, "rewind") == "" and mc.ma.calls[-1][1]["seconds"] == -15
+    assert say(mc, "go to 1:30") == "" and mc.ma.calls[-1] == ("player_queues/seek", {"queue_id": "ap_pi", "position": 90})
+    assert say(mc, "jump to 5 minutes") == "This song is only 4 minutes 21 seconds long."
+    assert say(mc, "skip two songs") == ""
+    assert mc.ma.calls[-1] == ("player_queues/play_index", {"queue_id": "ap_pi", "index": 4})
+    assert say(mc, "go back two songs") == "" and mc.ma.calls[-1][1]["index"] == 0
+    assert say(mc, "skip ten songs") == "That's past the end of the queue."
+    assert say(mc, "skip to track 3") == "" and mc.ma.calls[-1][1]["index"] == 2
+    assert say(mc, "what's next") == "Next is Stand by Me by Ben E. King."
+    assert say(mc, "how long is this song") == "Halo is 4 minutes 21 seconds long, with about 3 minutes left."
+    assert say(mc, "I like this song") == "Added to your favorites."
+    assert mc.ma.calls[-1] == ("music/favorites/add_item", {"item": "am://tr/halo"})
+    # "play X next" / "add X to the queue" queue behind the current song
+    assert say(mc, "play Shape of You next") == "Shape of You by Ed Sheeran is up next."
+    pm = mc.ma.last("player_queues/play_media")
+    assert pm["option"] == "next" and pm["radio_mode"] is False, pm
+    assert say(mc, "add Stand by Me to the queue") == "Added Stand by Me by Ben E. King to the queue."
+    assert mc.ma.last("player_queues/play_media")["option"] == "add"
+    # Sleep timer: armed, reported, cancelled; fires a pause
+    assert say(mc, "stop the music in 30 minutes") == "Okay, I'll stop the music in half an hour."
+    assert mc._sleep is not None
+    assert say(mc, "cancel the sleep timer") == "Okay, the music will keep playing." and mc._sleep is None
+    assert say(mc, "cancel the sleep timer") == "There's no sleep timer set."
+    assert say(mc, "stop the music after this song") == "Okay, I'll stop after this song."
+    assert 160 < mc._sleep_at - time.time() < 163
+    mc._sleep_fire("ap_pi")
+    assert mc.ma.calls[-1] == ("player_queues/pause", {"queue_id": "ap_pi"})
+    # Dislike: skipped now, and scored down in future searches
+    assert say(mc, "I don't like this song") == "Okay, I won't pick that one again."
+    assert mc.ma.calls[-1] == ("player_queues/next", {"queue_id": "ap_pi"})
+    assert "am://tr/halo" in mc._disliked()
+    # More like this / more by artist / album: answered at once, queued behind
+    # the current song (synchronously here: play_in_background is off)
+    mc.ma.queues["ap_pi"]["current_item"]["media_item"].update(
+        artists=[{"name": "Beyoncé"}], album={"name": "Lemonade"})
+    mc._similar_tracks = lambda artist, cur: [TRACKS[1], TRACKS[2]]
+    assert say(mc, "play more like this") == "More like this after this song."
+    assert mc.ma.last("player_queues/play_media") == {
+        "queue_id": "ap_pi", "media": ["am://tr/sbm", "am://tr/soy"], "option": "replace_next"}
+    assert say(mc, "play more by this artist") == "More Beyoncé after this song."
+    assert mc.ma.last("player_queues/play_media")["media"] == ["am://pl/bey-ess"]
+    assert say(mc, "play the whole album") == "Playing Lemonade."
+    assert mc.ma.last("player_queues/play_media")["media"] == "am://al/lem"
+    # Nothing playing: navigation says so
+    mc = make()
+    assert say(mc, "what's next") == "Nothing's playing right now."
+    # "play X next" with nothing playing just plays it
+    assert say(mc, "play Halo next") == "Playing Halo by Beyoncé."
+
+    # Multi-room: everywhere groups every configured speaker under the one playing
+    mc = make()
+    mc.everywhere = ["Kitchen Speaker", "Soundbar", "Bedroom (2)"]
+    assert say(mc, "play Halo everywhere") == "Playing Halo by Beyoncé everywhere."
+    assert mc.ma.groups == {"ap_pi": ["up_sb", "ap_bed"]}, mc.ma.groups
+    assert mc.ma.last("player_queues/play_media")["queue_id"] == "ap_pi"
+    assert say(mc, "turn the music up") == ""
+    assert mc.ma.calls[-1] == ("players/cmd/group_volume_up", {"player_id": "ap_pi"})
+    assert say(mc, "stop the music in the bedroom") == "Okay, not on the bedroom HomePod."
+    assert mc.ma.calls[-1] == ("players/cmd/ungroup", {"player_id": "ap_bed"}) and mc.ma.groups["ap_pi"] == ["up_sb"]
+    assert say(mc, "stop the music in the bedroom") == "It isn't playing on the bedroom HomePod."
+    assert say(mc, "also play it in the bedroom") == "Adding the bedroom HomePod."
+    assert say(mc, "add the soundbar") == "It's already playing on the soundbar."
+    assert say(mc, "just the kitchen") == "Okay, just the kitchen speaker."
+    assert mc.ma.groups["ap_pi"] == []
+    assert say(mc, "play this everywhere") == "Playing everywhere."
+    assert say(mc, "pause the kitchen").startswith("The kitchen speaker is leading the music")
+    mc = make()
+    assert say(mc, "add the bedroom") == "Nothing's playing right now."
+
+    # LLM fallback router: gate, prompt call, and output cleanup
+    from antigua_core import music_router
+    assert music_router.looks_like_music("throw on some ne-yo")
+    assert music_router.looks_like_music("something upbeat for cooking")
+    assert not music_router.looks_like_music("what's the capital of france")
+    sent = []
+
+    class _R:
+        def __init__(self, text):
+            self.text = text
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"response": self.text}
+    orig_post = music_router.requests.post
+    try:
+        music_router.requests.post = lambda url, json, timeout: sent.append(json) or _R(' "play Ne-Yo"\nextra')
+        kw = dict(ollama_host="http://o", model="m", timeout=1)
+        assert music_router.llm_route_music("throw on some ne-yo", **kw) == "play Ne-Yo"
+        assert "throw on some ne-yo" in sent[-1]["prompt"] and sent[-1]["options"]["temperature"] == 0
+        music_router.requests.post = lambda url, json, timeout: _R("NONE")
+        assert music_router.llm_route_music("who sings this song", **kw) is None
+        n = len(sent)
+        assert music_router.llm_route_music("what's the capital of france", **kw) is None and len(sent) == n
+        assert music_router.llm_route_music("play jazz", enabled=False, **kw) is None
+    finally:
+        music_router.requests.post = orig_post
 
     print("PASS — music suite")
 

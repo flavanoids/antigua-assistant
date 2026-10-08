@@ -115,8 +115,10 @@ def load_config():
         s = cfg["satellite"]
         ANTIGUA_VOLUME_PCT = s.get("antigua_volume_pct", ANTIGUA_VOLUME_PCT)
         _PA_SINK = s.get("output_device", _PA_SINK)
-        global _ALARM_RING_S
+        global _ALARM_RING_S, _ALARM_REPEAT_S, _ALARM_MAX_S
         _ALARM_RING_S = float(s.get("alarm_ring_seconds", _ALARM_RING_S))
+        _ALARM_REPEAT_S = float(s.get("alarm_repeat_seconds", _ALARM_REPEAT_S))
+        _ALARM_MAX_S = float(s.get("alarm_max_seconds", _ALARM_MAX_S))
 
 
 # ── MQTT ─────────────────────────────────────────────────────────────────────
@@ -145,9 +147,20 @@ def _on_mqtt_message(client, userdata, msg):
         except Exception as e:
             log.error(f"antigua/cue error: {e}")
 
+    elif msg.topic == "antigua/stop":
+        # The kitchen bridge heard the wake word mid-reply: cut it off.
+        _stop_alarms("antigua/stop")
+        stop_playback()
+
+    elif msg.topic == "antigua/alarm_stop":
+        # "Stop" / "I'm up" / a snooze, said to the server.
+        _stop_alarms("antigua/alarm_stop")
+
     elif msg.topic == "antigua/listening":
         try:
             active = bool(json.loads(msg.payload).get("active"))
+            if active:
+                _stop_alarms("wake word")   # someone's talking to Antigua: quiet
             Thread(target=_set_duck, args=(active,), daemon=True).start()
         except Exception as e:
             log.error(f"antigua/listening error: {e}")
@@ -159,7 +172,9 @@ def _on_mqtt_message(client, userdata, msg):
             label = data.get("label", "timer")
             if audio_url:
                 # Multiple concurrent alarms are supported; each gets its own thread
-                Thread(target=_alarm_loop, args=(audio_url, label), daemon=True).start()
+                Thread(target=_alarm_loop,
+                       args=(audio_url, label, data.get("kind", "timer"), data.get("id", "")),
+                       daemon=True).start()
         except Exception as e:
             log.error(f"antigua/alarm error: {e}")
 
@@ -168,7 +183,8 @@ def _on_mqtt_connect(client, userdata, flags, rc, props):
     # Subscribe on every (re)connect: the session is clean, so a broker
     # restart drops subscriptions and paho's auto-reconnect won't restore
     # them — the satellite would stay up but never play anything again.
-    for topic in ("antigua/play", "antigua/alarm", "antigua/cue", "antigua/listening"):
+    for topic in ("antigua/play", "antigua/alarm", "antigua/cue", "antigua/listening", "antigua/stop",
+                  "antigua/alarm_stop"):
         client.subscribe(topic)
 
 
@@ -256,6 +272,27 @@ def _set_duck(active: bool):
 
 # Serial play queue — MQTT antigua/play chunks are enqueued here and played one at a time
 _play_queue: queue.Queue = queue.Queue()
+_current_proc = None  # the reply chunk's paplay, so antigua/stop can end it
+_stop_count = 0       # bumped per stop, so a cut-off chunk isn't retried
+
+
+def stop_playback():
+    """Drop queued reply chunks and stop the one playing. The worker then
+    finds the queue empty and publishes antigua/done as usual."""
+    global _stop_count
+    _stop_count += 1
+    dropped = 0
+    while True:
+        try:
+            _play_queue.get_nowait()
+            _play_queue.task_done()
+            dropped += 1
+        except queue.Empty:
+            break
+    proc = _current_proc
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+    log.info(f"Playback stopped (dropped {dropped} queued chunk(s))")
 
 
 def _play_queue_worker():
@@ -301,9 +338,9 @@ def _play_beep(tones, volume=0.25):
                 else:
                     val = 0
                 wf.writeframes(struct.pack("<h", val))
-    tmp = tempfile.mktemp(suffix=".wav", dir="/tmp")
-    with open(tmp, "wb") as f:
+    with tempfile.NamedTemporaryFile(suffix=".wav", dir="/tmp", delete=False) as f:
         f.write(buf.getvalue())
+        tmp = f.name
     subprocess.run(
         ["paplay", "--device", _PA_SINK, *_antigua_vol_args(), tmp],
         capture_output=True
@@ -355,38 +392,82 @@ _alarm_stops: dict[str, Event] = {}
 _alarm_ringing_labels: set[str] = set()
 
 
-_ALARM_RING_S = 5.0  # mic sits next to the speaker — wake word is unreliable while ringing
+# Each ring is the spoken line plus a short bell (a soft chime first, and no
+# bell, for a reminder), and it rings again every _ALARM_REPEAT_S until the
+# wake word, "stop", or _ALARM_MAX_S. The mic sits next to the speaker, so the
+# bell stays short: the quiet between rings is when the wake word gets heard.
+_ALARM_RING_S = 5.0
+_ALARM_REPEAT_S = 30.0
+_ALARM_MAX_S = 300.0
 
 
-def _alarm_loop(audio_url: str, label: str):
-    stop_event = Event()
-    _alarm_stops[label] = stop_event
-    _alarm_ringing_labels.add(label)
-    log.info(f"Alarm ringing: {label} — auto-stops after {_ALARM_RING_S:.0f}s (or wake word)")
+def _stop_alarms(reason: str):
+    if _alarm_stops:
+        log.info(f"Silencing {len(_alarm_stops)} ringing alarm(s): {reason}")
+    for ev in list(_alarm_stops.values()):
+        ev.set()
 
-    # Announce once with TTS voice, then ring the bell for a fixed window
-    download_and_play(audio_url)
 
-    proc = None
-    if ALARM_SOUND.exists():
-        proc = subprocess.Popen(
-            ["paplay", "--device", _PA_SINK, str(ALARM_SOUND)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-    else:
-        beep_alarm()
+def _play_chime():
+    """Two soft rising tones: a reminder, not an alarm."""
+    _play_beep([(660, 140), (0, 60), (988, 260)], volume=0.15)
 
-    end_time = time.time() + _ALARM_RING_S
-    while not stop_event.is_set() and time.time() < end_time:
-        stop_event.wait(timeout=0.2)
 
-    if proc is not None and proc.poll() is None:
+def _play_until(cmd, stop_event: Event, limit_s: float | None = None):
+    """Run a paplay, killing it on stop_event (or after limit_s)."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    end = time.time() + limit_s if limit_s else None
+    while proc.poll() is None and not stop_event.is_set() and (end is None or time.time() < end):
+        stop_event.wait(timeout=0.1)
+    if proc.poll() is None:
         proc.terminate()
 
+
+def _alarm_loop(audio_url: str, label: str, kind: str = "timer", fire_id: str = ""):
+    key = fire_id or label
+    stop_event = Event()
+    _alarm_stops[key] = stop_event
+    _alarm_ringing_labels.add(label)
+    log.info(f"Alarm ringing: {label} ({kind}) — every {_ALARM_REPEAT_S:.0f}s "
+             f"for up to {_ALARM_MAX_S:.0f}s, until the wake word or 'stop'")
+
+    speech = None
+    try:
+        resp = requests.get(audio_url, timeout=10)
+        resp.raise_for_status()
+        with tempfile.NamedTemporaryFile(suffix=".wav", dir="/tmp", delete=False) as f:
+            f.write(resp.content)
+            speech = f.name
+    except Exception as e:
+        log.error(f"Alarm audio download failed: {e}")
+
+    started = time.time()
+    rings = 0
+    while not stop_event.is_set():
+        rings += 1
+        if kind == "reminder":
+            _play_chime()
+        if speech and not stop_event.is_set():
+            _play_until(["paplay", "--device", _PA_SINK, *_antigua_vol_args(), speech], stop_event)
+        if kind != "reminder" and not stop_event.is_set():
+            if ALARM_SOUND.exists():
+                _play_until(["paplay", "--device", _PA_SINK, str(ALARM_SOUND)], stop_event,
+                            _ALARM_RING_S)
+            else:
+                beep_alarm()
+        next_at = started + rings * _ALARM_REPEAT_S
+        if next_at - started >= _ALARM_MAX_S:
+            break
+        stop_event.wait(timeout=max(0.0, next_at - time.time()))
+
+    if speech:
+        Path(speech).unlink(missing_ok=True)
     _alarm_ringing_labels.discard(label)
-    _alarm_stops.pop(label, None)
-    log.info(f"Alarm stopped: {label}")
-    mqtt_publish("antigua/alarm_ack", {"label": label})
+    if _alarm_stops.get(key) is stop_event:
+        _alarm_stops.pop(key, None)
+    log.info(f"Alarm stopped: {label} after {rings} ring(s)"
+             + (" (silenced)" if stop_event.is_set() else " (cap reached)"))
+    mqtt_publish("antigua/alarm_ack", {"label": label, "id": fire_id})
 
 
 def play_audio(wav_path: str, blocking: bool = True):
@@ -401,7 +482,11 @@ def play_audio(wav_path: str, blocking: bool = True):
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
     if blocking:
+        global _current_proc
+        _current_proc = proc
         proc.wait()
+        if proc.returncode == -15:
+            return  # stopped (antigua/stop)
         if proc.returncode != 0:
             log.error(f"paplay failed: {proc.stderr.read().decode()}")
     else:
@@ -503,6 +588,7 @@ def stream_and_play(audio_url: str):
         return
 
     log.info(f"Streaming response audio: {audio_url}")
+    stops = _stop_count
     try:
         resp = requests.get(audio_url, stream=True, timeout=10)
         resp.raise_for_status()
@@ -530,22 +616,33 @@ def stream_and_play(audio_url: str):
             "--channels", str(nchannels),
             "--raw",
         ]
+        global _current_proc
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        _current_proc = proc
 
         # Write PCM data that arrived with the header
         proc.stdin.write(buf[pcm_offset:])
 
         # Stream remaining chunks directly to paplay
         for chunk in resp.iter_content(chunk_size=4096):
+            if proc.poll() is not None:
+                break  # stopped (antigua/stop)
             proc.stdin.write(chunk)
 
-        proc.stdin.close()
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
         proc.wait()
+        if proc.returncode == -15:
+            return  # terminated by stop_playback, not a failure
         if proc.returncode != 0:
             stderr = proc.stderr.read().decode() if proc.stderr else ""
             log.error(f"paplay streaming failed: {stderr}")
     except Exception as e:
+        if _stop_count != stops:
+            return  # cut off by antigua/stop (broken pipe), not a failure
         log.error(f"Streaming playback error: {e}")
         try:
             download_and_play(audio_url)
@@ -579,9 +676,9 @@ def download_and_play(audio_url: str):
         log.error(f"Failed to download audio: {e}")
         return
 
-    tmp_path = tempfile.mktemp(suffix=".wav", dir="/tmp")
-    with open(tmp_path, "wb") as f:
+    with tempfile.NamedTemporaryFile(suffix=".wav", dir="/tmp", delete=False) as f:
         f.write(resp.content)
+        tmp_path = f.name
 
     play_audio(tmp_path, blocking=True)
 

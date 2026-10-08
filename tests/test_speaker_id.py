@@ -47,6 +47,11 @@ def main():
     # this is the safety property: ambiguous audio must never guess.
     assert sp.identify([0.5, 0.5, 0.5]) is None
 
+    # Above the floor but too close to call between two people -> None.
+    sp_m = SpeakerProfiles(path=sp._path, min_similarity=0.3, min_margin=0.1)
+    assert sp_m.identify([0.6, 0.55, 0.0]) is None
+    assert sp_m.identify([0.8, 0.3, 0.0])[0] == "Alex"
+
     # Persistence: a fresh SpeakerProfiles instance over the same path sees
     # the same profiles (matches MemoryStore/ListStore's load-on-init pattern).
     sp2 = SpeakerProfiles(path=sp._path, min_similarity=0.75)

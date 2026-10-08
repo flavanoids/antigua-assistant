@@ -15,7 +15,7 @@ from pathlib import Path
 import _isolated  # noqa: E402,F401  — temp data dir; must precede antigua_core
 sys.path.insert(0, str(Path(__file__).parent.parent / "server"))
 
-from antigua_core import pipeline, settings  # noqa: E402
+from antigua_core import jokes, pipeline, settings  # noqa: E402
 from antigua_core.stores import ListStore, MemoryStore, TimerManager  # noqa: E402
 
 
@@ -78,6 +78,30 @@ def main():
     # One-word garbage exemption end-to-end (routes to volume, not garbage)
     r = run("louder")
     assert r["response"] == "I can't control the TV right now.", r
+
+    # Long fixed replies go out a chunk at a time, first audio fast; short
+    # ones stay one WAV in the response.
+    long_reply = ("Step 1 of 3. In a lidded jar, combine the almond milk, chia seeds, "
+                  "maple syrup, and vanilla. Stir well and let it sit five minutes. "
+                  "Stir again so the seeds don't clump. Cover and chill overnight.")
+    chunks = pipeline._speech_chunks(long_reply)
+    assert len(chunks) == 2 and " ".join(chunks) == long_reply, chunks
+    assert 40 <= len(chunks[0]) < 120, chunks
+    assert pipeline._speech_chunks("That's 48.") == ["That's 48."]
+    pipeline.init(make_backend(""))
+    sent = []
+    real_publish = settings.mqtt_publish
+    settings.mqtt_publish = lambda topic, payload: sent.append(topic)
+    try:
+        r = pipeline._speak(pipeline._Turn(long_reply, "c", 0), long_reply)
+        assert r["streaming"] and r["audio_file"] is None and sent == ["antigua/play"] * 2, (r, sent)
+        sent.clear()
+        r = pipeline._speak(pipeline._Turn("x", "c", 0), "That's 48.")
+        assert r["audio_file"] and not r.get("streaming") and not sent, (r, sent)
+        r = pipeline._speak(pipeline._Turn("x", "c", 0, quiet=True), long_reply)
+        assert r["audio_file"] and not sent, (r, sent)   # dry runs keep one WAV
+    finally:
+        settings.mqtt_publish = real_publish
 
     # Timer set: deterministic confirmation, timer actually set
     pipeline.init(make_backend("set a pasta timer for 10 minutes"))
@@ -171,6 +195,16 @@ def main():
     assert say("both") == "Cancelled both."
     assert pipeline.B.timers.list_active() == []
 
+    # "Which one?" takes its answer without the wake word; the answer doesn't
+    def ask(text):
+        return pipeline.dispatch_text(text, conversation_id="convT", quiet=True)
+    say("set a timer for 5 minutes")
+    say("set a timer for 5 minutes")
+    r = ask("cancel the timer")
+    assert r["response"].startswith("You have two") and r["expects_reply"] is True, r
+    r = ask("both")
+    assert r["response"] == "Cancelled both." and not r.get("expects_reply"), r
+
     # A new request while a "which one?" is pending routes normally
     say("set a timer for 5 minutes")
     say("set a timer for 5 minutes")
@@ -213,8 +247,10 @@ def main():
     r = cturn("remind me to call the dentist tomorrow")
     assert "what time" in r["response"].lower() and "tomorrow" in r["response"].lower(), r
     assert pipeline.B.timers.list_active() == [], r  # nothing set yet
+    assert r["expects_reply"] is True, r                # answered without the wake word
     r = cturn("3 pm")
     assert r["response"] == "Okay, I'll remind you to call the dentist at 3 PM tomorrow.", r
+    assert not r.get("expects_reply"), r
     row = pipeline.B.timers.list_active()[0]
     assert row["kind"] == "reminder" and row["hour"] == 15, row
     pipeline.B.timers.cancel_all()
@@ -223,6 +259,87 @@ def main():
     cturn("remind me to call the plumber on friday", cid="convR2")
     r = cturn("never mind", cid="convR2")
     assert r["response"] == "Okay, no reminder." and pipeline.B.timers.list_active() == [], r
+
+    # No time / no length: Antigua asks, the answer sets it
+    r = cturn("set a timer", cid="convS")
+    assert r["response"] == "For how long?" and r["expects_reply"] is True, r
+    assert cturn("10", cid="convS")["response"] == "Timer set for 10 minutes."
+    assert cturn("start a pasta timer", cid="convS")["response"] == "How long for the pasta timer?"
+    assert cturn("seven minutes", cid="convS")["response"] == "Pasta timer set for 7 minutes."
+    assert cturn("set an alarm", cid="convS")["response"] == "For what time?"
+    assert cturn("7 am", cid="convS")["response"].startswith("Alarm set for 7 AM")
+    cturn("wake me up", cid="convS")
+    assert cturn("never mind", cid="convS")["response"] == "Okay, never mind."
+    pipeline.B.timers.cancel_all()
+
+    # Taking time off, bare "add a minute", pause / resume
+    T = "convP"
+    cturn("set a pasta timer for 10 minutes", cid=T)
+    assert cturn("take 2 minutes off the timer", cid=T)["response"] == \
+        "Took off 2 minutes. Your pasta timer now has 8 minutes left."
+    assert cturn("add five more minutes", cid=T)["response"] == \
+        "Added 5 minutes. Your pasta timer now has 13 minutes left."
+    assert cturn("take 20 minutes off", cid=T)["response"] == "Your pasta timer only has 13 minutes left."
+    assert cturn("pause the timer", cid=T)["response"] == "Paused. Your pasta timer has 13 minutes left."
+    assert cturn("how much time is left", cid=T)["response"] == \
+        "Your pasta timer is paused with 13 minutes left."
+    assert cturn("pause the timer", cid=T)["response"] == "That timer is already paused."
+    assert cturn("resume the timer", cid=T)["response"] == "Resumed. Your pasta timer has 13 minutes left."
+    pipeline.B.timers.cancel_all()
+
+    # "Cancel my alarm" with two set asks instead of cancelling both
+    cturn("set an alarm for 6 am every weekday", cid=T)
+    cturn("set an alarm for 8 am", cid=T)
+    assert cturn("cancel my alarm", cid=T)["response"] == \
+        "Which one? The 6 AM alarm, the 8 AM alarm, or both?"
+    assert cturn("the 8 am one", cid=T)["response"] == "Cancelled the 8 AM alarm."
+    # a question while "which one?" is pending is answered, not taken as the answer
+    cturn("set an alarm for 9 am", cid=T)
+    cturn("cancel the alarm", cid=T)
+    assert cturn("what time is my alarm", cid=T)["response"].startswith("You've got an alarm for 6 AM")
+    pipeline.B.timers.cancel_all()
+
+    # Skip one day of a repeating alarm; change and move alarms
+    cturn("set an alarm for 6 am every day", cid=T)
+    tomorrow = (pipeline.datetime.now() + pipeline.timedelta(days=1)).date()
+    r = cturn("skip tomorrow's alarm", cid=T)["response"]
+    assert r.startswith("Okay, I'll skip tomorrow's 6 AM alarm. The next one is 6 AM"), r
+    assert pipeline.B.timers.list_active()[0]["skip"] == [tomorrow.isoformat()]
+    assert cturn("change my alarm to 6:30", cid=T)["response"].startswith(
+        "Okay, your alarm is now set for 6:30 AM every day")
+    assert cturn("push my alarm back 15 minutes", cid=T)["response"].startswith(
+        "Okay, your alarm is now set for 6:45 AM every day")
+    r = cturn("move tomorrow's alarm to 8", cid=T)["response"]
+    assert r == "Okay, just tomorrow, your 6:45 AM alarm will be at 8 AM.", r
+    assert sorted(a["hour"] for a in pipeline.B.timers.list_active()) == [6, 8]
+    pipeline.B.timers.cancel_all()
+    cturn("set an alarm for 7 pm", cid=T)
+    assert cturn("change my alarm to 7:30", cid=T)["response"].startswith(
+        "Okay, your alarm is now set for 7:30 PM")
+    pipeline.B.timers.cancel_all()
+    assert cturn("change my alarm to 7", cid=T)["response"].startswith("Alarm set for 7 AM")
+    pipeline.B.timers.cancel_all()
+
+    # Something ringing: "stop" silences it (not the music); snooze silences too
+    sent = []
+    real_publish = settings.mqtt_publish
+    settings.mqtt_publish = lambda topic, payload: sent.append(topic)
+    try:
+        pipeline.note_alarm_fired("pasta timer", "timer", None, "f1")
+        assert cturn("stop", cid=T)["response"] == "Okay." and "antigua/alarm_stop" in sent, sent
+        assert cturn("stop", cid=T)["response"] != "Okay."          # nothing ringing now
+        pipeline.note_alarm_fired("pasta timer", "timer", None, "f2")
+        pipeline.note_alarm_ack("f2")                               # wake word silenced it...
+        assert cturn("turn it off", cid=T)["response"] == "Okay."   # ..."stop" still means it
+        pipeline.note_alarm_fired("call mom", "reminder", "call mom", "f3")
+        sent.clear()
+        assert cturn("snooze 10 more minutes", cid=T)["response"] == "Snoozing for 10 minutes."
+        assert "antigua/alarm_stop" in sent, sent
+        row = pipeline.B.timers.list_active()[0]
+        assert (row["kind"], row["message"]) == ("reminder", "call mom"), row   # rings as itself
+    finally:
+        settings.mqtt_publish = real_publish
+    pipeline.B.timers.cancel_all()
 
     # Garbage on a follow-up turn ends silently
     r = run("uh", follow_up=True)
@@ -313,6 +430,13 @@ def main():
     r = home_run("switch to the playstation", hub)
     assert r["response"] == "Switching to Playstation 5", r
     assert hub.calls == [("roku", "press_key", {"key_name": "InputHDMI1"})], hub.calls
+    for text in ("change the TV to input 3", "change the tv input to 3",
+                 "switch the tv to input three", "switch to hdmi 3",
+                 "set the TV to HDMI 3.", "turn the TV to HDMI 3."):
+        hub.calls.clear()
+        r = home_run(text, hub)
+        assert r["response"] == "Switching to HDMI 3", (text, r)
+        assert hub.calls == [("roku", "press_key", {"key_name": "InputHDMI3"})], (text, hub.calls)
     # Apps resolve against the Apple TV's installed list, launched by bundle ID
     hub.calls.clear()
     r = home_run("open disney plus", hub)
@@ -358,6 +482,24 @@ def main():
     be, r = run_with("tell me a joke", "tell me a joke", True)  # careful agrees: LLM as usual
     assert careful and be.music.handled == [], r
     careful.clear()
+
+    # Music the patterns don't know: the router restates it and music runs it;
+    # a NONE (or no router) leaves the turn to the chat LLM.
+    routed = []
+    def run_routed(text, command):
+        be = make_backend(text)
+        be.music = _FakeMusic(False)
+        be.route_music_with_llm = lambda tr: routed.append(tr) or command
+        pipeline.init(be)
+        return be, pipeline.run_pipeline("/x.wav")
+    be, r = run_routed("throw on some frank ocean", "play frank ocean")
+    assert routed == ["throw on some frank ocean"] and be.music.handled == ["any"], r
+    be, r = run_routed("who's your favorite band", None)
+    assert be.music.handled == [] and r["response"] == "Okay.", r
+    routed.clear()
+    be, r = run_routed("set a pasta timer for 10 minutes", "play pasta")   # a skill matched: never asked
+    assert not routed and be.music.handled == [], r
+    pipeline.B.timers.cancel_all()
     be, r = run_with("turn on the tv", "x", True)             # already a skill: untouched
     assert not careful, careful
     # Spanish: language picking. Short or unsure clips stay English.
@@ -386,7 +528,7 @@ def main():
     pipeline.run_pipeline("/x.wav", conversation_id="convES")
     pipeline.run_pipeline("/x.wav", conversation_id="convES")
     assert seen == {"prefer": [None, "es"], "llm": ["es", "es"], "tts": ["es", "es"]}, seen
-    be.transcribe = lambda p, prefer=None: {"text": "tell me a joke", "language": "en", "time_s": 0.0}
+    be.transcribe = lambda p, prefer=None: {"text": "how are you", "language": "en", "time_s": 0.0}
     pipeline.run_pipeline("/x.wav", conversation_id="convES")   # back to English
     assert seen["llm"][-1] == "en" and "convES" not in pipeline._conv_language
     # Spanish commands (Phase 2): run as the English command, answered in
@@ -559,9 +701,19 @@ def main():
     assert "Alex or Katherine" in r["response"], r
 
     # Unmatched utterance streams through the LLM tail
-    pipeline.init(make_backend("tell me a joke", llm_sentences=("Here is a joke.",)))
+    pipeline.init(make_backend("tell me a story", llm_sentences=("Here is a story.",)))
     r = pipeline.run_pipeline("/x.wav")
-    assert r["streaming"] is True and r["response"] == "Here is a joke.", r
+    assert r["streaming"] is True and r["response"] == "Here is a story.", r
+
+    # A plain joke request comes from the bank, not the model, and lands in
+    # the conversation history so a follow-up knows what the joke was.
+    b = make_backend("tell me a joke", llm_sentences=("A model-written joke.",))
+    remembered = []
+    b.remember_exchange = lambda cid, said, reply: remembered.append((cid, said, reply))
+    pipeline.init(b)
+    r = pipeline.run_pipeline("/x.wav", conversation_id="convJoke")
+    assert r["response"] in {j for j, _ in jokes.JOKES}, r
+    assert remembered == [("convJoke", "tell me a joke", r["response"])], remembered
 
     # Multi-sentence answer: first sentence is synthesized alone, the rest as one
     # batched utterance — two synth calls, full text in the response.
@@ -609,6 +761,18 @@ def main():
     pipeline.init(be)
     r = pipeline.run_pipeline("/x.wav")
     assert r["response"], r
+
+    # "Play a funny sound" plays one of the downloaded clips as-is (no TTS),
+    # and says so when there are none.
+    sounds = Path(tempfile.mkdtemp(prefix="antigua_sounds_"))
+    be = make_backend("play a funny sound")
+    be.static_audio_dir = sounds
+    pipeline.init(be)
+    assert pipeline.run_pipeline("/x.wav")["response"] == "I don't have any funny sounds yet."
+    (sounds / "funny_vine-boom.wav").write_bytes(b"RIFF")
+    r = pipeline.run_pipeline("/x.wav")
+    assert r["audio_file"] == str(sounds / "funny_vine-boom.wav"), r
+    assert r["response"] == "vine boom" and r["action"] == "funny_sound", r
 
     # Time queries say "noon"/"midnight" instead of "12:00 PM"/"12:00 AM".
     class _FixedDatetime(datetime):

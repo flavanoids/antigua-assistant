@@ -87,8 +87,11 @@ a firewall guard keeps Antigua's ports off the LAN. See
    [decisions.md](decisions.md)).
 
 Timers, alarms and reminders are the exception to request/response. They fire
-from the server, which publishes `antigua/alarm`. The satellite rings, speaks
-the announcement, and can flash a Govee light scene while it rings.
+from the server, which publishes `antigua/alarm`. The satellite speaks the
+announcement and rings (a soft chime for a reminder), again every 30 s until
+the wake word, a spoken "stop" (`antigua/alarm_stop`) or a 5-minute cap. A
+Govee light scene can flash while it rings. One that came due while the server
+was restarting still rings when it comes back up (if under 10 minutes late).
 
 ## Routes
 
@@ -100,8 +103,9 @@ must reach `music` before `volume`. Each route has a handler in
 ```text
 garbage · govee · tv · music · volume · time_date · weather · display
 memory_save · memory_forget_content · memory_forget_last · medicine_query
-memory_query · list_add · list_query · list_remove · timer_cancel · timer_add
-timer_reset · timer_status · snooze · reminder_set · alarm_set · timer_set
+memory_query · list_add · list_query · list_remove · timer_add · alarm_skip
+timer_cancel · alarm_change · timer_pause · timer_reset · timer_status · snooze
+reminder_set · alarm_set · timer_set
 sports · calc · news · substitution · search · llm
 ```
 
@@ -154,8 +158,9 @@ The broker is Mosquitto on the satellite. The ✱ topics are published only when
 | `antigua/done` | satellite → bridge | `{"state": "complete"}` | Playback finished: unmute the mic, open the follow-up window |
 | `antigua/cue` | bridge → satellite | `{"audio_url"}` | Wake chime |
 | `antigua/listening` | bridge → satellite, server | `{"active"}` | Duck or restore music during a turn |
-| `antigua/alarm` | server → satellite | `{"text", "audio_url", "label", "kind"}` | Ring a timer, alarm or reminder |
-| `antigua/alarm_ack` | satellite → server | `{"label"}` | Alarm dismissed |
+| `antigua/alarm` | server → satellite | `{"text", "audio_url", "label", "kind", "id"}` | Ring a timer, alarm or reminder |
+| `antigua/alarm_stop` | server → satellite | `{}` | "Stop" / snooze: silence whatever is ringing |
+| `antigua/alarm_ack` | satellite → server | `{"label", "id"}` | Ringing ended |
 | `antigua/kitchen_play` | bridge | `{"audio_url"}` | Replies for the reSpeaker's own speaker (`reply_output: device`) |
 | `antigua/status` ✱ | server, satellite | `{"state"}` | Pipeline state; also `fallback_active` / `primary_restored` |
 | `antigua/transcript` ✱ | server | `{"text", …}` | What was heard |
@@ -184,9 +189,14 @@ Two independent paths:
 
 Memories and lists are copied to the backup every 5 minutes by a cron `rsync`
 on the primary. Timers are not synced, because both servers would fire them.
-What the backup can't do: web search is limited when the primary box is
-down, since SearXNG runs there; Music Assistant needs the primary box up; and
-speaker ID is primary-only.
+The backup runs the same internet-backed skills as the primary (Open-Meteo
+weather, currency, sports, recipes) and its own SearXNG, so search and recipes
+keep working. Its display skill talks to the standby pineda-web on the same
+box, which is the server the kiosk fails over to (PinedaDisplay_web,
+docs/OPERATIONS.md#standby-server). What the backup can't do: Music
+Assistant needs the primary box up; speaker ID, Spanish and the careful
+second STT pass are primary-only; and its 2B model is a weaker talker than
+the primary's.
 
 ## Data and retention
 
@@ -197,7 +207,7 @@ speaker ID is primary-only.
 | Speaker profiles | `data/speaker_profiles.json` | Until re-enrolled (none enrolled yet) |
 | Mic captures | `kitchen-mic/bridge/captures/` | 7 days (`captures-prune.timer`) |
 | Logs (they contain transcripts) | `logs/` | 7 days (`antigua.logrotate`) |
-| Reply audio | `audio_out/` | Minutes; the TTS cache for an hour |
+| Reply audio | `audio_out/` | Minutes; the TTS cache 7 days from last use, capped at 200 MB |
 
 Nothing in `data/`, `logs/` or `captures/` is ever committed. The pre-commit
 hook enforces this.

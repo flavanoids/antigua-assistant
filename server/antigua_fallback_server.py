@@ -52,7 +52,15 @@ from antigua_core import server_common
 from antigua_core import settings as core_settings
 from antigua_core.caches import NewsCache, NWSAlertsCache, SearXNGSkill, WeatherCache
 from antigua_core.classify import extract_weather_location
+from antigua_core.knowledge import WikiKnowledge
+from antigua_core.commute import CommuteProvider
+from antigua_core import calc_currency
+from antigua_core.pineda import PinedaClient, TimerMirror
+from antigua_core.recipe import RecipeFinder
+from antigua_core import sports as sports_skill
+from antigua_core import weather as weather_skill
 from antigua_core.pipeline import format_active_timers
+from antigua_core.music_router import llm_route_music
 from antigua_core.router import llm_route_search
 from antigua_core.home_control import HomeControl
 from antigua_core.mcp_client import McpHub, read_env_file
@@ -128,16 +136,32 @@ core_settings.LISTS_STORE_PATH = FALLBACK_BASE / "data" / "lists.json"
 # Last copy of the primary's timers/alarms, refreshed every poll while it's up
 # and adopted on takeover. On disk so a restart mid-outage still has them.
 PRIMARY_TIMERS_PATH = FALLBACK_BASE / "data" / "primary_timers.json"
-# server.yaml says localhost:8080 — that means the primary. From this box the
-# instance is across the LAN; unreachable searches degrade to LLM-only.
-core_settings.SEARCH_URL = f"http://{PRIMARY_HOST}:8080"
+# The primary's SearXNG dies with it, so this box runs its own
+# (searxng/docker-compose.yml, installed by deploy_fallback.sh) on the same
+# localhost:8080 server.yaml names. Search and recipes stay up in an outage.
+core_settings.SEARCH_URL = "http://localhost:8080"
 
 # ── MQTT ─────────────────────────────────────────────────────────────────────
 
 mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="antigua-fallback")
 
 
+def _on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
+    client.subscribe([("antigua/alarm_ack", 1)])   # resubscribe on every reconnect
+
+
+def _on_mqtt_message(client, userdata, msg):
+    # The satellite stopped ringing one: "stop" after it means the music again.
+    if msg.topic == "antigua/alarm_ack":
+        try:
+            pipeline.note_alarm_ack(json.loads(msg.payload).get("id", ""))
+        except (ValueError, AttributeError):
+            pass
+
+
 def mqtt_connect():
+    mqtt_client.on_connect = _on_mqtt_connect
+    mqtt_client.on_message = _on_mqtt_message
     server_common.mqtt_connect(mqtt_client, MQTT_BROKER, MQTT_PORT_NUM)
 
 
@@ -158,16 +182,33 @@ weather_cache = WeatherCache()
 nws_alerts_cache = NWSAlertsCache()
 news_cache = NewsCache()
 searxng = SearXNGSkill()
+knowledge = WikiKnowledge() if core_settings.KNOWLEDGE_ENABLED else None
+# The same internet-backed skills as the primary — none of them need its GPU.
+weather_provider = weather_skill.WeatherProvider(home=weather_skill.Location(
+    lat=core_settings.WEATHER_HOME_LAT, lon=core_settings.WEATHER_HOME_LON,
+    tz=core_settings.WEATHER_HOME_TZ, kind="home"))
+rates_provider = calc_currency.RatesProvider() if core_settings.CALC_CURRENCY_ENABLED else None
+sports_provider = sports_skill.SportsProvider() if core_settings.SPORTS_ENABLED else None
+recipes = (RecipeFinder(core_settings.RECIPE_CACHE_DAYS)
+           if core_settings.RECIPE_ENABLED and core_settings.SEARCH_ENABLED else None)
+# pineda.url is localhost:8090 on both boxes: each runs a pineda-web, and the
+# kiosk fails over to this one's when the primary is down.
+pineda = (PinedaClient(core_settings.PINEDA_URL, profile=core_settings.PINEDA_PROFILE,
+                       device=core_settings.PINEDA_DEVICE)
+          if core_settings.PINEDA_URL else None)
 conversations = ConversationStore()
 memory_store = MemoryStore()
 list_store = ListStore()
 timers = TimerManager(
-    on_fire=lambda label, kind="timer", message=None: _on_timer_fire(label, kind, message)
+    on_fire=lambda label, kind="timer", message=None: _on_timer_fire(label, kind, message),
+    on_change=lambda: timer_mirror and timer_mirror.push(),
 )
+timer_mirror = TimerMirror(pineda, timers.list_active) if pineda else None
 
 
 def _on_timer_fire(label: str, kind: str = "timer", message: str | None = None):
-    pipeline.note_alarm_fired(label)
+    fire_id = uuid.uuid4().hex[:8]
+    pipeline.note_alarm_fired(label, kind, message, fire_id)
     if pipeline.B.home is not None:
         Thread(target=pipeline.B.home.govee_flash, args=(kind,), daemon=True).start()
     text = server_common.timer_fire_text(label, kind, message)
@@ -176,7 +217,7 @@ def _on_timer_fire(label: str, kind: str = "timer", message: str | None = None):
         audio_url = f"http://{get_local_ip()}:{FALLBACK_PORT}/audio/{Path(wav_path).name}"
         mqtt_publish(
             "antigua/alarm",
-            {"text": text, "audio_url": audio_url, "label": label, "kind": kind},
+            {"text": text, "audio_url": audio_url, "label": label, "kind": kind, "id": fire_id},
         )
 
 
@@ -196,11 +237,29 @@ def _get_whisper():
         return _whisper_model
 
 
+# Whisper's stock outros for noise it can't place; tiny turned a clatter into
+# "Thanks for watching!" and the LLM answered it.
+_PHANTOM_RE = re.compile(
+    r"^\W*(thanks? (you )?for watching|see (ya|you)( next time)?|"
+    r"(please )?(like and )?subscribe|bye( bye)?)\W*$", re.I)
+
+
 def transcribe(audio_path, hotwords=None, prefer=None):   # English only here
     t0 = time.time()
     model = _get_whisper()
-    segments, _ = model.transcribe(audio_path, language="en", hotwords=hotwords)
-    text = " ".join(s.text for s in segments).strip()
+    segments, _ = model.transcribe(
+        audio_path, language="en", hotwords=hotwords,
+        initial_prompt=cfg.get("whisper", {}).get("prompt") or None,
+        # As on the primary: no temperature fallback, which retries noise
+        # into confident-sounding sentences.
+        temperature=0.0,
+    )
+    # A segment that's both likely silence and a low-confidence guess is noise.
+    text = " ".join(s.text for s in segments
+                    if not (s.no_speech_prob > 0.3 and s.avg_logprob < -1.0)).strip()
+    if _PHANTOM_RE.match(text):
+        log.info("STT dropped phantom %r", text)
+        text = ""
     elapsed = round(time.time() - t0, 2)
     if not text:
         return {"text": "", "confidence": 0.0, "time_s": elapsed}
@@ -289,13 +348,17 @@ _SENTENCE_SPLIT = re.compile(r'(?<=[.!?])["\'’”)]*\s+')
 
 def ask_llm_stream(transcript, conversation_id="", extra_context=None,
                    max_tokens_override=None, temperature_override=None,
-                   grounding_context=None, language="en"):
+                   grounding_context=None, grounding_mode=None, language="en",
+                   turn_hint=None):
     """Stream from Ollama and yield whole sentences as they complete, so the
     pipeline starts TTS on the first sentence while the rest generates.
     Grounding context is folded into the prompt; the small model gets no
-    separate grounding pass."""
+    separate grounding pass. `grounding_mode` is accepted for signature
+    parity and ignored: there is never a recipe session here."""
     t0 = time.time()
     messages = _build_messages(transcript, conversation_id, extra_context or grounding_context)
+    if turn_hint:  # persona.py's stage direction; history keeps the bare transcript
+        messages[-1]["content"] += f"\n({turn_hint})"
     payload = _llm_payload(messages, max_tokens_override, temperature_override, stream=True)
     buf = full = ""
     try:
@@ -324,6 +387,19 @@ def ask_llm_stream(transcript, conversation_id="", extra_context=None,
     full = _strip_think(full.strip())
     log.info("LLM stream [%.2fs] %d chars", time.time() - t0, len(full))
     _remember(conversation_id, transcript, full)
+
+
+def route_music_with_llm(transcript: str):
+    """Restate a music request no pattern knew as a command parse_music does."""
+    return llm_route_music(
+        transcript,
+        ollama_host=OLLAMA_HOST,
+        model=OLLAMA_MODEL,
+        timeout=SEARCH_ROUTER_TIMEOUT,
+        keep_alive=OLLAMA_KEEP_ALIVE,
+        num_ctx=OLLAMA_NUM_CTX,
+        enabled=bool(cfg.get("music", {}).get("llm_fallback", True)),
+    )
 
 
 def route_search_with_llm(transcript: str):
@@ -389,6 +465,19 @@ _ma_token = read_env_file(core_settings.BASE_DIR / cfg.get("mcp", {}).get(
     "env_file", "server/config/mcp.env")).get("MUSIC_ASSISTANT_TOKEN")
 music = MusicControl(cfg, _ma_token) if _ma_token and cfg.get("music", {}).get("enabled", True) else None
 
+# Drive times from home: places.yaml (home + favorites), Photon for places,
+# TomTom (TOMTOM_API_KEY in the mcp env file) or else OSRM for routes, and
+# Houston TranStar for live traffic.
+commute = (CommuteProvider(read_env_file(core_settings.BASE_DIR / cfg.get("mcp", {}).get(
+    "env_file", "server/config/mcp.env")).get("TOMTOM_API_KEY"))
+           if core_settings.COMMUTE_ENABLED else None)
+
+
+def remember_exchange(conversation_id, transcript, reply):
+    conversations.add_message(conversation_id, "user", transcript)
+    conversations.add_message(conversation_id, "assistant", reply)
+
+
 pipeline.init(pipeline.Backend(
     transcribe=transcribe,
     synthesize=synthesize,
@@ -398,11 +487,21 @@ pipeline.init(pipeline.Backend(
     list_store=list_store,
     timers=timers,
     weather_cache=weather_cache,
+    weather_provider=weather_provider,
+    rates_provider=rates_provider,
+    sports_provider=sports_provider,
     news_cache=news_cache,
     searxng=searxng,
     route_search_with_llm=route_search_with_llm,
+    route_music_with_llm=route_music_with_llm,
     home=HomeControl(mcp_hub, cfg),
     music=music,
+    commute=commute,
+    pineda=pineda,
+    knowledge=knowledge,
+    recipes=recipes,
+    remember_exchange=remember_exchange,
+    static_audio_dir=STATIC_AUDIO_DIR,
 ))
 
 run_pipeline = pipeline.run_pipeline
@@ -467,6 +566,8 @@ class FallbackHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/pipeline":
             self._handle_pipeline()
+        elif parsed.path == "/pipeline_text":
+            self._handle_pipeline_text()
         elif parsed.path == "/activate":
             self._handle_activate()
         elif parsed.path == "/deactivate":
@@ -509,6 +610,35 @@ class FallbackHandler(BaseHTTPRequestHandler):
             "conversation_id": result.get("conversation_id", ""),
             "streaming": result.get("streaming", False),
             "end_conversation": result.get("end_conversation", False),
+            "expects_reply": result.get("expects_reply", False),
+        })
+
+    def _handle_pipeline_text(self):
+        """QA seam, as on the primary: the full classify + dispatch on a text
+        string, skipping STT. Silent by default (no antigua/play)."""
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            data = json.loads(self.rfile.read(length))
+        except json.JSONDecodeError:
+            self._json(400, {"error": "invalid JSON"})
+            return
+        text = (data.get("text") or "").strip()
+        if not text:
+            self._json(400, {"error": "empty text"})
+            return
+        t0 = time.time()
+        result = pipeline.dispatch_text(
+            text,
+            conversation_id=data.get("conversation_id", "") or self._conv_id(),
+            follow_up=bool(data.get("follow_up", False)),
+            quiet=bool(data.get("quiet", True)),
+        )
+        self._json(200, {
+            "response": result.get("response", ""),
+            "action": result.get("action", ""),
+            "conversation_id": result.get("conversation_id", ""),
+            "expects_reply": result.get("expects_reply", False),
+            "total_s": round(time.time() - t0, 2),
         })
 
     def _handle_activate(self):
@@ -543,6 +673,17 @@ def _ollama_load(keep_alive):
     ).raise_for_status()
 
 
+def _prewarm_skills():
+    """The home forecast and exchange rates, so the first questions after a
+    takeover don't wait on Open-Meteo / the ECB."""
+    try:
+        weather_provider.prewarm(core_settings.WEATHER_PREWARM_CITIES)
+        if rates_provider is not None:
+            rates_provider.prewarm()
+    except Exception as e:
+        log.warning("Skill prewarm failed: %s", e)
+
+
 def _activate(reason: str):
     global _active, _llm_warm
     with _active_lock:
@@ -557,6 +698,7 @@ def _activate(reason: str):
     pipeline.B.home.warm()
     if music is not None:
         music.refresh_names()   # names STT may mishear, for re-hearing
+    Thread(target=_prewarm_skills, daemon=True, name="prewarm").start()
     try:
         _get_whisper()
         _ollama_load(-1)
@@ -655,7 +797,7 @@ def main():
     log.info("Ollama:  %s @ %s", OLLAMA_MODEL, OLLAMA_HOST)
     log.info("TTS:     %s", REMOTE_TTS_URL)
     log.info("Memory:  %s", core_settings.MEMORY_STORE_PATH)
-    log.info("Search:  %s (via the primary)", core_settings.SEARCH_URL)
+    log.info("Search:  %s (local SearXNG)", core_settings.SEARCH_URL)
 
     try:
         server.serve_forever()

@@ -444,7 +444,8 @@ def phrase_rain(fc: Forecast, tf: Timeframe, now: datetime) -> str:
     h = _hedge(tf.days_out)
     noun = _precip_noun(day.code)
     if v == "unlikely":
-        return f"{h.capitalize()}{tf.label} looks dry, only about {day.rain_pct} percent.".replace("  ", " ")
+        odds = f", only about {day.rain_pct} percent" if day.rain_pct else ""  # not "about 0 percent"
+        return f"{h.capitalize()}{tf.label} looks dry{odds}.".replace("  ", " ")
     lead = "Yes" if v == "likely" else "Maybe"
     return f"{lead}, {h}{tf.label} has about a {day.rain_pct} percent chance of {noun}.".replace("  ", " ")
 
@@ -821,6 +822,7 @@ class WeatherProvider:
         self._cache: dict[tuple, tuple[Forecast, float]] = {}
         self._lock = threading.Lock()
         self._ttl = settings.WEATHER_TTL
+        self._inflight: dict[tuple, threading.Event] = {}  # key -> set when its fetch ends
 
     @staticmethod
     def _key(loc: Location) -> tuple:
@@ -835,12 +837,36 @@ class WeatherProvider:
         if hit:
             fc, at = hit
             if now - at >= self._ttl:
-                threading.Thread(target=self._refresh, args=(loc,), daemon=True).start()
-                fc.stale = now - at >= self._ttl * 4
+                with self._lock:
+                    busy = k in self._inflight
+                if not busy:
+                    threading.Thread(target=self._refresh_once, args=(loc,), daemon=True).start()
+                if fc is not None:   # None = a failed cold fetch, retried here
+                    fc.stale = now - at >= self._ttl * 4
             return fc
-        return self._refresh(loc)
+        return self._refresh_once(loc)
 
     _FAIL_TTL = 90
+
+    def _refresh_once(self, loc: Location) -> Forecast | None:
+        """_refresh, one fetch per location at a time. A caller arriving while
+        one is in flight waits for it instead of fetching again (the prewarm
+        and the answer it pre-speaks used to fetch twice every cycle)."""
+        k = self._key(loc)
+        with self._lock:
+            done = self._inflight.get(k)
+            if done is None:
+                self._inflight[k] = threading.Event()
+        if done is not None:
+            done.wait(settings.WEATHER_TIMEOUT + 2)
+            with self._lock:
+                hit = self._cache.get(k)
+            return hit[0] if hit else None
+        try:
+            return self._refresh(loc)
+        finally:
+            with self._lock:
+                self._inflight.pop(k).set()
 
     def _refresh(self, loc: Location) -> Forecast | None:
         k = self._key(loc)
@@ -861,7 +887,11 @@ class WeatherProvider:
             return None
 
     def prewarm(self, city_names: list[str]):
-        threading.Thread(target=self.get, daemon=True).start()
+        """Refresh home now, blocking, so a reply built right after reads the
+        new forecast (a background refresh left the pre-spoken weather one
+        fetch behind, so it rarely matched what was asked). Cities refresh
+        in the background."""
+        self._refresh_once(self.home)
         for name in city_names or []:
             loc, _ = self.geocode.resolve(name)
             if loc:

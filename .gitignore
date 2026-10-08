@@ -49,6 +49,8 @@ config/satellite.yaml
 *.secret
 server/config/mcp.env
 server/config/pyatv.conf
+# Home + favorite addresses for the commute skill (places.example.yaml is the template)
+server/config/places.yaml
 server/mcp/venv-atv/
 
 # Editor / manual backups
@@ -75,6 +77,8 @@ server/mcp/venv*/
 *.raw
 !/audio/*.wav
 !/server/static_audio/*.wav
+# Downloaded meme clips (server/scripts/fetch_funny_sounds.py), not ours to publish
+/server/static_audio/funny_*.wav
 captures/
 kitchen-mic/bridge/tools/fixtures/
 transcripts/
@@ -86,3 +90,4 @@ server/scripts/deploy.env
 network/hosts.conf
 .githooks/private-patterns
 searxng/searxng/settings.yml
+server/config/places.yaml

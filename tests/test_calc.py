@@ -35,6 +35,26 @@ CASES = [
     ("what is 10 divided by 3", "That's about 3.33."),
     ("what's 2000 times 3", "That's 6000."),
     ("what is 10 divided by 0", "You can't divide by zero."),
+    # powers and roots
+    ("what is 5 squared", "That's 25."),
+    ("what's 3 to the power of 4", "That's 81."),
+    ("what's 2 to the 10th", "That's 1024."),
+    ("10 cubed", "That's 1000."),
+    ("what's 2 times 3 squared", "That's 18."),
+    ("3 squared plus 4 squared", "That's 25."),
+    ("what is the square root of 144", "The square root of 144 is 12."),
+    ("square root of 2", "The square root of 2 is about 1.41."),
+    ("cube root of negative 8", "The cube root of negative 8 is negative 2."),
+    ("square root of 16 plus 2", "That's 6."),
+    # spoken numbers
+    ("nine times six", "That's 54."),
+    ("what is twelve times twelve", "That's 144."),
+    ("two to the tenth power", "That's 1024."),
+    ("what is one hundred and five times three", "That's 315."),
+    ("two point five times four", "That's 10."),
+    ("what's 5 thousand divided by 8", "That's 625."),
+    ("negative 5 plus 3", "That's negative 2."),
+    ("what's twenty-five percent of eighty", "25 percent of 80 is 20."),
     # percentages
     ("what's 15% of 80", "15 percent of 80 is 12."),
     ("what is 20 percent of 250", "20 percent of 250 is 50."),
@@ -75,6 +95,8 @@ DECLINES = [
     "how much do you love me",
     "what's the meaning of life",
     "how many cups in a mile",
+    "square root of negative 4",
+    "what's 9 to the power of 9 to the power of 9",
 ]
 
 # classify() must route these to "calc"
@@ -88,6 +110,11 @@ ROUTES_CALC = [
     "5 miles in km",
     "convert 350 fahrenheit to celsius",
     "half of 250",
+    "what is 5 squared",
+    "what's 3 to the power of 4",
+    "what is the square root of 144",
+    "nine times six",
+    "two to the tenth power",
 ]
 
 # classify() must NOT route these to "calc" (neighbour skills own them)
@@ -97,6 +124,9 @@ ROUTES_NOT_CALC = [
     ("wake me up at 7", "alarm_set"),
     ("is it warmer than yesterday", "weather"),
     ("how many calories in a banana", "llm"),
+    ("set a timer for five minutes", "timer_set"),
+    ("add two eggs to the list", "list_add"),
+    ("which one is better", "llm"),
 ]
 
 _DIGIT_RE = re.compile(r"\d")

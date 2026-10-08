@@ -32,13 +32,17 @@ _TV_INPUT_RE = re.compile(
     r"\b(?:"
     r"switch(?:\s+the\s+(?:tv|roku))?\s+to|"
     r"change(?:\s+the\s+(?:tv|roku))?\s+(?:input\s+)?to|"
+    # "set the TV to HDMI 3" — the TV must be named: bare "set it to 3" is a
+    # timer or volume. "to" keeps "turn the TV on" with _TV_RE.
+    r"(?:set|turn|put|flip)\s+the\s+(?:tv|roku)(?:\s+input)?\s+to|"
     r"(?:tv|roku)\s+input\s+(?:to\s+)?|"
     r"put\s+(?:it|the\s+(?:tv|roku))\s+on"
     r")\s+(.+?)(?:\s+on\s+(?:the\s+)?(?:tv|roku)|[?.,!]|$)",
     re.IGNORECASE,
 )
 
-_HDMI_NUM_RE = re.compile(r"^hdmi[\s\-]?(\w+)$", re.IGNORECASE)
+# "hdmi 3", "input three", or a bare "3" ("change the tv input to 3").
+_HDMI_NUM_RE = re.compile(r"^(?:(?:hdmi|input)[\s\-]?)?(\w+)$", re.IGNORECASE)
 
 # App launching ("open netflix", "put on youtube on the tv"). A command verb
 # is required so "I watched Netflix" stays with the LLM. Checked before

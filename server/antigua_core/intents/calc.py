@@ -3,6 +3,7 @@
 import re
 
 from .. import calc_currency as _calc_currency
+from ..calc import spoken_to_digits
 
 
 # A whitelist, like search: it claims only shapes calc.answer() actually
@@ -34,6 +35,11 @@ _CALC_ROUTE_RE = re.compile(
     r"|\b(?:half|a third|a quarter|two thirds|three quarters|double|triple|twice)"
     r"\s+(?:of\s+)?\$?\d"
     r"|\bconvert\s+\d"
+    # powers and roots: "5 squared", "3 to the power of 4", "2^10", "square root of 144"
+    r"|\b(?:square|cube)\s+root\s+of\s+-?\d"
+    r"|\b\d+(?:\.\d+)?\s*(?:squared|cubed|[²³]|\^\s*\d)"
+    r"|\b\d+(?:\.\d+)?\s+(?:raised\s+)?to\s+the\s+(?:power\s+of\s+-?\d|\d+(?:st|nd|rd|th)?\b)"
+    r"|\b\d+(?:\.\d+)?\s+raised\s+to\s+-?\d"
     r"|\bhow\s+many\s+" + _CALC_UNITS + r"\s+(?:are\s+)?(?:in|per)\b"
     r"|\b\d+(?:\.\d+)?\s*" + _CALC_UNITS + r"\s+(?:in|to|into|as)\s+"
     r"(?:degrees?\s+)?" + _CALC_UNITS + r"\b"
@@ -44,3 +50,9 @@ _CALC_ROUTE_RE = re.compile(
     r"[^?]*\b(?:in|to|into|as)\s+(?:the\s+)?(?:" + _CALC_CCY + r")\b",
     re.IGNORECASE,
 )
+
+
+def is_calc_request(transcript: str) -> bool:
+    """Route check; numbers may be spoken ("nine times six")."""
+    return bool(_CALC_ROUTE_RE.search(transcript)
+                or _CALC_ROUTE_RE.search(spoken_to_digits(transcript)))

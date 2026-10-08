@@ -46,6 +46,56 @@ whatever is playing).
 | "Turn the music up/down" / "Set the music volume to 30" | player volume | silent / "Music volume 30." |
 | "Move the music to the soundbar" / "Play this in the bedroom" | transfer queue | "Moving the music to the soundbar." |
 
+### Navigation, queueing and your library
+
+| She says | What happens |
+|---|---|
+| "Play Halo next" / "After this, play Jolene" | Queued right after the current song ("Halo by Beyoncé is up next.") |
+| "Add Rumours to the queue" / "Queue up Halo" | Added to the end of the queue |
+| "Skip ahead 30 seconds" / "Fast forward a minute" / "Rewind" / "Go back 10 seconds" | Seek within the song (bare: +30s / −15s), *silent* |
+| "Go to 1:30" / "Jump to the 2 minute mark" | Seek to that point, *silent* |
+| "Skip two songs" / "Go back two songs" / "Skip to track 3" | Move within the queue, *silent* |
+| "What's next?" / "What's coming up?" | "Next is Stand by Me by Ben E. King." |
+| "How long is this song?" / "How much is left in this song?" | Length and time left |
+| "Play more like this" / "Play something similar" | After this song: top songs by Apple's similar artists, plus two more by this one, shuffled |
+| "Play more by this artist" | After this song: their Essentials (or top songs) |
+| "Play the whole album" / "Play the album this song is from" | That album from the start |
+| "Play the rest of the album" | After this song: the album's remaining tracks |
+| "Stop the music in 30 minutes" / "Set a sleep timer for 20 minutes" | Pauses then; "cancel the sleep timer" undoes it |
+| "Stop after this song" / "Stop after this album" | Pauses when it ends (not for endless radio queues) |
+| "I like this song" / "Add this to my library" | Added to Music Assistant favorites |
+| "I don't like this song" / "Never play this again" | Skips it, and it's scored down in future searches |
+| "Play my favorites" / "Play my library" | Your favorited tracks / your library, shuffled |
+| "Play my Cocktail Hour playlist" / "Play the playlist Car" | Your playlist by name (Apple's catalogue if you have none by that name) |
+
+### Multi-room
+
+| She says | What happens |
+|---|---|
+| "Play Adele everywhere" / "Play some jazz in every room" | Groups every `everywhere` speaker under the default one, then plays ("Playing … everywhere.") |
+| "Play this everywhere" / "Play the music on all the speakers" | Groups them under whatever's playing |
+| "Also play it in the bedroom" / "Add the soundbar" | Adds that speaker to the group |
+| "Stop the music in the bedroom" / "Take the bedroom out" / "Pause the bedroom" | Drops that speaker from the group (pauses it if it's the only one) |
+| "Just the kitchen" / "Only in the kitchen" | Ungroups everything else |
+
+Volume commands on a group change the whole group. `music.everywhere`
+lists which players "everywhere" means (default: every player in
+`speakers`, including the Apple TV, which only plays with the TV on).
+
+### Anything else
+
+When no pattern matches but the words sound like music ("throw on some
+Ne-Yo", "I'm in the mood for 90s R&B", "this song sucks"), the local model
+restates the request as one of the commands above (`music_router.py`,
+~0.6s) and it runs as if said that way. Questions about music ("who sings
+Halo", "what's the best Beyoncé album") stay with the chat model.
+`music.llm_fallback: false` turns this off.
+
+"More like this", "more by this artist" and the album requests answer at
+once and build the queue in the background (up to ~5s), since the current
+song keeps playing. "How much time is left" without "song" stays with the
+timers skill.
+
 Transport controls stay silent on success, like Alexa: the music doing the
 thing is the confirmation. Bare "turn it up" goes to the `volume` route,
 which steps the music volume when music is playing and the TV otherwise.
@@ -61,19 +111,75 @@ over the restored music. If the "stopped" message is lost, it restores after
 
 ---
 
-## Resolution order for a bare "Play X"
+## How "Play X" is resolved
 
-1. An album from the list Antigua just read out
-2. An artist whose name matches (≥ 0.9 similarity) → Essentials
-3. A song title match → song + radio
-4. An album title match → album
-5. A playlist (for 1–3 word queries: genres and moods) → shuffled
-6. Four or more words: try it as lyrics
-7. The top song result
-8. "I couldn't find X on Apple Music."
+`music.py` `_resolve()` scores one pool of candidates rather than trying
+artist, then song, then album in a fixed order.
 
-"Play Stand by Me" first parses as "Stand" by "Me"; when that finds nothing,
-the whole phrase is retried as a title.
+1. **Readings.** Every " by " is a possible split and the whole phrase may be
+   a title, so "Stand by Me by Ben E. King" is tried as *Stand* by *Me by Ben
+   E. King*, *Stand by Me* by *Ben E. King*, and as a title.
+2. **Candidates.** Music Assistant's Apple Music search runs for each reading
+   (the title with and without the artist) across artists, songs, albums and
+   playlists, in parallel.
+3. **Score.** Each candidate gets:
+   - **name fit**: spelling or sound-alike, whichever is closer, ignoring a
+     leading "The" ("beyond say" ~ Beyoncé; "killers" ~ The Killers). Saying
+     "the" and matching it word for word adds a little.
+   - **artist fit** when an artist was named: soft, so a misheard artist
+     ("So Sick by Nia") doesn't lock out the right song.
+   - **Apple's order** within each type, steeply weighted for songs: it knows
+     Dolly Parton's "Jolene" from Beyoncé's.
+   - **song popularity**: where Apple's public iTunes search (US store,
+     `music.store_country`) ranks that exact song for the title.
+   - **artist popularity**: Deezer fan counts, strongest for artist
+     candidates (Queen the band vs a song called "QUEEN"). Cached in
+     `data/music_artist_pop.json` for 30 days.
+   - **penalties** for covers, karaoke, soundtrack re-recordings, Apple's
+     "Sing" playlists, singles/EPs standing in for a song, and live/remix
+     versions, unless the request asked for one.
+   - **type hints**: "the song X", "the album X", "the artist X" favor that
+     type; a bare title leans to songs and artists; a genre or mood ("some
+     jazz", "chill music", "90s hip hop", "something relaxing") favors
+     Apple's own playlists.
+4. **Play the best.** An album from the list Antigua just read out still wins
+   outright. With no candidate, four or more words are tried as lyrics.
+
+### Corrections
+
+For 3 minutes after Antigua starts something by name, a correction replaces
+it. The pipeline checks these before normal routing, and only then, so the
+same words mean nothing to music at other times.
+
+| She says | Plays |
+|---|---|
+| "No, the Adele one" / "the one by Lionel Richie" / "Adele's version" / "no, by Adele" | That artist's version, from the same search or a new one |
+| "The other one" / "wrong song" / "not that one" / "that's not it" | The next version of the same title, else the next best match |
+| "No, the original" | The same title without cover, karaoke, live or remix markers (Apple gives no release years, so "original" can't mean "earliest") |
+| "No, I meant the album" / "…the song" / "…the artist" | The best match of that type |
+
+A correction never goes back to a version already rejected for the same
+request. Corrections are remembered in `data/music_prefs.json`, keyed by
+the request: after "play hello" → "no, the one by Adele", "play hello"
+plays Adele's. A named pick ("the Adele one", "the original", "the
+album") is remembered as wanted. "The other one" only marks the rejected
+version as unwanted.
+
+### Benchmark
+
+`venv/bin/python tests/music_bench.py` scores the resolver against the live
+catalogue with playback recorded, not sent. Responses are cached in `data/`,
+so a change is compared on identical search results, and each run is diffed
+against the previous one. Cases live in `tests/music_bench/cases.yaml`; real
+requests from the logs can go in the git-ignored `data/music_bench_local.yaml`.
+
+| 2026-09-30 | Before | After |
+|---|---|---|
+| Tuned cases (139) | 101 (72.7%) | 130 (93.5%) |
+| Held-out cases (40) | 34 (85.0%) | 39 (97.5%) |
+| Corrections (13) | 0 | 13 |
+
+---
 
 ## Lyrics search
 

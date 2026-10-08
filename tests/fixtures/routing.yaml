@@ -30,6 +30,26 @@ routes:
     # One-word trigger — exempted from the garbage filter (2026-07-27)
     - louder
 
+  funny_sound:
+    - Play a funny sound.
+    - play a funny sound
+    - play me a funny sound effect
+    - play another funny sound
+    - make a funny noise
+    - play a random sound
+
+  podcast:
+    - Play Apple News today.
+    - play apple news
+    - play the Apple News Today podcast
+    - play yesterday's Apple News Today
+    - play Friday's apple news today
+    - put on the latest Apple News Today
+    - play Apple News Today on the soundbar
+    - play Up First
+    - play NPR's Up First
+    - play Saturday's Up First
+
   music:
     # Transport controls (was the `media` route)
     - next song
@@ -42,6 +62,11 @@ routes:
     - pause
     - resume the music
     - stop the music
+    # A playing podcast episode is on the music queue (2026-09-28)
+    - stop apple news
+    - pause the podcast
+    - resume the podcast
+    - stop up first
     # Bare Alexa-style controls — used to be dropped as one-word noise (2026-09-25)
     - play
     - Play!
@@ -152,6 +177,42 @@ routes:
     - is it warmer than yesterday
     - what's the weather this Thursday
 
+  security:
+    - lock the front door
+    - can you lock the door
+    # Refused by the handler, but it must reach it (never the LLM).
+    - unlock the front door
+    - is the front door locked
+    - did I lock the door
+    - when was the front door locked
+    - when was the door last unlocked
+    - show me the front door
+    - pull up the doorbell camera
+    - show the garage camera
+    - who's at the door
+    - who triggered the garage cam
+    - when did someone ring the doorbell
+    - how's the doorbell battery
+
+  pineda:
+    - restart the display
+    - refresh the screen
+    - reboot the pi
+    - restart airplaypi
+    - change the theme to ocean
+    # Collision: "switch to ..." is also the TV's input phrase.
+    - switch to the ocean theme
+    - switch the display to groovy
+    - surprise me with a random theme
+    - what themes are there
+    - who said this quote
+    - tell me more about this quote
+    - say the spanish phrase
+    - what's the word of the day
+    # Collision: "when" questions otherwise reach time/date.
+    - when was this photo taken
+    - what year is this picture from
+
   display:
     - show me the city cam
     - show me times square
@@ -210,12 +271,41 @@ routes:
     - cancel both timers
     - cancel the 5 minute timer
     - cancel the first one
+    # 2026-10 polish: "my" + singular is one; a qualifier names it
+    - cancel my reminder to call mom
+    - turn off the alarm
+
+  alarm_skip:
+    - skip tomorrow's alarm
+    - skip my alarm on friday
+    - skip the next alarm
+    - turn off my alarm for tomorrow
+    # a one-off alarm is cancelled, a repeating one sits that day out
+    - cancel the alarm for tomorrow
+
+  alarm_change:
+    - change my alarm to 7:30
+    - move my gym alarm to 6
+    - push my alarm back 15 minutes
+    - reset my alarm to 7
+
+  timer_pause:
+    - pause the timer
+    - pause the pasta timer
+    - resume the timer
+    - start the timer again
 
   timer_add:
     - add 5 minutes to the timer
     - add two minutes to the pasta timer
     - add 2 minutes to the 5 minute timer
     - give it 2 more minutes
+    # 2026-10 polish: bare amounts and taking time off
+    - add five more minutes
+    - add a minute
+    - take 2 minutes off the timer
+    - subtract a minute from the pasta timer
+    - remove 2 minutes from the timer
 
   timer_reset:
     - reset the timer
@@ -238,12 +328,21 @@ routes:
     - when does the pasta timer go off
     - how much time is left on the 5 minute timer
     - how long on the second one
+    # 2026-10 polish
+    - what time is my alarm
+    - is my alarm set
+    - what time did I set my alarm for
+    - how much longer
+    - how much time on the pasta
+    - do I have any alarms tomorrow
 
   snooze:
     - snooze for 5 minutes
     # One-word trigger — exempted from the garbage filter (2026-07-27)
     - snooze
 
+    - snooze 10 more minutes
+    - snooze for half an hour
   timer_set:
     - set a timer for 5 minutes
     - set a pasta timer for 10 minutes
@@ -252,6 +351,12 @@ routes:
     - set a timer for an hour and a half
     - set a timer for two and a half minutes
     - set a 20 minute timer for banana bread
+    # 2026-10 polish: bare numbers are minutes; no length asks
+    - set a timer for 10
+    - set a timer for an hour and 15 minutes
+    - set a timer for 12 minutes for the pasta
+    - set a timer
+    - start a pasta timer
 
   reminder_set:
     - remind me in 30 seconds
@@ -266,6 +371,11 @@ routes:
     # Under-specified (a day, no time) — routes here; the handler asks the time.
     - remind me to call the dentist tomorrow
     - remind me to email the landlord on friday
+    # 2026-10 polish
+    - remind me to check the oven in 10
+    - set a reminder for 5 pm to call dad
+    - remind me to stretch every hour
+    - remind me to take my pills at 9 every night
     # Steal-guards:
     #   "remind me to bring an umbrella" -> llm  (no day and no time)
     #   "wake me up at 7 am"             -> alarm_set
@@ -278,6 +388,16 @@ routes:
     - set an alarm for every weekday at 7
     - every morning at 6:45
     - wake me up at 5 every monday and wednesday
+    # 2026-10 polish: spoken clocks, noon, repeats without "every"; no time asks
+    - set an alarm for half past six
+    - set an alarm for quarter to seven
+    - set an alarm for noon
+    - set an alarm for midnight
+    - set an alarm for 6 am on weekdays
+    - set an alarm for 6:45 monday through friday
+    - set an alarm
+    - wake me up
+    - set an alarm for tomorrow morning
 
   news:
     - what's in the news
@@ -309,6 +429,31 @@ routes:
     #   "add 5 minutes to the timer"  -> timer_add
     #   "is it warmer than yesterday" -> weather      (weather gate runs first)
 
+  commute:
+    # Drive times from home + live traffic (commute.py, transtar.py).
+    - how long to get to Lowe's on Ella
+    - how long to drive to HEB Bunker Hill
+    - how long to Niko Niko's
+    - how long does it take to get to mom's house
+    - what's my ETA to the office
+    - how long is the drive to work
+    - how far is Niko Niko's from here
+    - how far away is mom's
+    - how's traffic to work
+    - is there any traffic getting to the airport
+    - how's traffic
+    - how bad is traffic right now
+    - is there traffic on I-10 right now
+    - any wrecks on 610
+    - How long to The POST
+    - What's traffic look like going to Memorial City Mall
+    - Is traffic bad heading the The Galleria right now?
+    - what's traffic looking like
+    # Steal-guards: these stay with their skills.
+    #   "how long is left on the pasta timer" -> timer_status (timer block runs first)
+    #   "how long to boil an egg"             -> llm
+    #   "how far is the moon"                 -> search
+
   sports:
     # NFL/MLB/NBA/MLS/F1 — answered deterministically by sports.answer()
     # instead of falling to search (moved out of the search: section below).
@@ -330,12 +475,43 @@ routes:
     # Steal-guards: neighbouring skills must keep these.
     #   "I met a Texans fan yesterday" -> llm     (no sports verb nearby)
 
+  recipe:
+    - how do you make risotto
+    - how do I make cheesecake
+    - give me a recipe for chicken noodle soup
+    - recipe for tamales
+    - banana bread recipe
+    - let's bake chocolate chip cookies
+    - I want to make chicken enchiladas tonight
+    - how do I cook a steak
+
   substitution:
     - what can I use instead of buttermilk
     - what's a substitute for eggs
     - I don't have baking powder what can I use
+    # A proposed swap the table knows (recipe_subs.table_swap), search or not.
+    - can I use olive oil instead of butter
+    - can I substitute greek yogurt for sour cream
+
+  knowledge:
+    - who was Frida Kahlo
+    - Who is Bad Bunny?
+    - who were the Beatles
+    - tell me about the Cuban Missile Crisis
+    - tell me about Cesar Chavez
+    - what was Watergate
+    - what was the Battle of Hastings
+    - what is the Magna Carta
+    - what happened at Chernobyl
+    - the history of Mexico
+    - tell me about the 1960 election
+    - who was Frida Kahlo's husband
+    - quién fue Frida Kahlo
+    - háblame de Selena
 
   search:
+    # A how-to that isn't food stays a search, not a recipe.
+    - how to make a bed
     - who is the ceo of starbucks
     - search for the best cast iron skillet
     # Local news routes to search rather than the RSS cache, by design.
@@ -345,9 +521,23 @@ routes:
     # searching a settled fact is harmless — pinning it so a regex change
     # that flips it is at least visible.
     - who was the first president of mexico
+    # Role and live questions stay on search, not the knowledge overview.
+    - who is Taylor Swift dating
+    - who is playing tonight
+    - what is the capital of France
 
   llm:
+    - how long to boil an egg
+    - how long to bake chicken thighs
+    - how long would it take to walk to the park
     - tell me a joke
+    - tell me about yourself
+    - tell me about your day
+    - what was that
+    # Near misses for the display route: not the screen's quote/phrase/theme.
+    - give me an inspirational quote
+    - what does the phrase break a leg mean
+    - what's the theme of macbeth
     # "play" that isn't music
     - play a game with me
     - how do you play chess
@@ -355,7 +545,8 @@ routes:
     # Naming an app without a launch verb isn't a TV command.
     - I watched netflix last night
     - is youtube down
-    - how do you make risotto
+    # Not food: "make" alone doesn't make it a recipe.
+    - how do I make money
     - why is the sky blue
     - what's the difference between baking soda and baking powder
     - tell me a story about a lighthouse

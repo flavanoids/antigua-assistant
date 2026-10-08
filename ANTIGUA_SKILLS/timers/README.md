@@ -2,7 +2,9 @@
 
 **Status:** Active
 **Pipeline stage:** Deterministic routes (`timer_set`, `alarm_set`, `reminder_set`,
-`timer_cancel`, `timer_add`, `timer_reset`, `timer_status`, `snooze`) — Python
+`timer_add`, `alarm_skip`, `timer_cancel`, `alarm_change`, `timer_pause`,
+`timer_reset`, `timer_status`, `snooze`), plus a pre-route `_handle_ringing`
+("stop" while something rings) — Python
 parses the request, builds the spoken reply, and calls TTS directly. The LLM is
 never in the loop, so a parse failure can't turn into "I set your timer" when
 nothing was set.
@@ -22,8 +24,9 @@ Timers, alarms, and reminders are a distinct **`kind`** (`TimerSpec.kind`):
 | Set from | a duration ("10 minutes") | a clock time ("7 AM") | either — "in 40 minutes" **or** "at 3 tomorrow" / "tonight" |
 | Carries an action phrase | no | no | yes — `TimerSpec.message`, spoken on fire |
 | Status reads | time remaining | the clock time / cadence | the action + when |
-| `reset` / `add time` | yes | no (meaningless) | no |
-| Recurring | no | yes ("every weekday") | yes ("every morning") |
+| `reset` / `add time` / pause | yes | no (meaningless) | add / pause yes |
+| Change / skip a day | no | yes | yes |
+| Recurring | no | yes ("every weekday", "on weekdays", "Monday through Friday") | yes ("every morning", "every hour") |
 | Persisted label | fixed | regenerated on load so "tomorrow" never goes stale | the action phrase (no time in it to go stale) |
 
 State persists across restarts (`data/timers.json`); the old
@@ -33,10 +36,11 @@ State persists across restarts (`data/timers.json`); the old
 
 ## How Users Trigger It
 
-**Timers** (`parse_timer_request` → `TimerSpec`):
+**Timers** (`parse_timer_request` → `TimerSpec`; a bare number is minutes, "set a timer for 10"):
 - "Set a timer for 5 minutes" / "for an hour and a half" / "for two and a half minutes" / "for 1 hour 30 minutes"
 - "Set a pasta timer for 10 minutes" / "a 20 minute timer for banana bread"
-- "Set a timer named laundry for 45 minutes"
+- "Set a timer named laundry for 45 minutes" / "for 12 minutes for the pasta" / "... and name it pizza"
+- "Set a timer" / "start a pasta timer" (no length) → "For how long?" / "How long for the pasta timer?"
 - "Countdown 5 minutes" / "give me a 10 minute timer"
 
 **Reminders** (`parse_reminder_request` → `TimerSpec(kind="reminder", message=…)`):
@@ -45,6 +49,7 @@ State persists across restarts (`data/timers.json`); the old
 - "Don't let me forget to take the trash out tonight" / "remind me to water the garden tomorrow morning"
 - "Set a reminder to call mom at 6 PM"
 - **Recurring:** "remind me to take my pills every day at 8 AM" / "remind me to stretch every evening"
+- **Intervals:** "remind me to stretch every hour" / "every 30 minutes" / "hourly" (`repeat="every:<s>"`, at least 5 minutes)
 - The action phrase is spoken back on fire ("Reminder: move the laundry.") and
   in status ("I'll remind you to move the laundry in 12 minutes.").
 - A reminder with **no trigger time** ("remind me to buy milk") isn't one we can
@@ -66,19 +71,27 @@ Same mechanism as the memory "who is this for?" prompt — it works within the
 15 s wake-word continuation window; there's no separate "expecting a reply" flag.
 
 **Alarms** (`parse_alarm_request` → `TimerSpec`):
-- "Wake me up at 7" (am/pm inferred: 5–11 → AM, 1–4 & 12 → PM; "morning"/"evening" override)
+- "Wake me up at 7" (am/pm inferred: 5–11 → AM, 1–4 & 12 → PM; "morning"/"evening"/"night" override; "9 every night" is 9 PM)
+- "Half past six" / "quarter to seven" / "6 30" / "six oh five" (`normalize_clock`), "noon", "midnight"
+- A time already past today ("7 tonight" said at 8 PM) rolls to tomorrow — never rings immediately
+- "Set an alarm" / "wake me up" / "set an alarm for tomorrow morning" (no clock time) → "For what time?"
 - "Set an alarm for 6:30 tomorrow" / "for 8 on Friday" / "for 8 o'clock"
 - "Wake me at seven tomorrow" (word-numbers)
-- **Recurring:** "every weekday at 7", "every morning at 6:45", "every Monday and Thursday at 6", "every day at 10 PM"
+- **Recurring:** "every weekday at 7", "every morning at 6:45", "every Monday and Thursday at 6", "every day at 10 PM", "6 AM on weekdays", "Monday through Friday", "on Saturday and Sunday", "on Mondays"
 - "Set an alarm named gym for 6 AM"
 - "Wake me up in 5 minutes" → parsed as a *timer* (relative time), not a clock alarm
 
 **Manage:**
-- Status: "How much time is left?", "How long on the pasta timer?", "When's my alarm?", "What timers are running?", "Do I have any alarms?", "What are my reminders?"
-- Add time: "Add 5 minutes to the timer" / "to the pasta timer"
+- Status: "How much time is left?", "How long on the pasta timer?", "When's my alarm?", "What timers are running?", "Do I have any alarms?", "What are my reminders?", "Is my alarm set?", "What time is my alarm?", "What time did I set my alarm for?", "How much longer?", "Do I have any alarms tomorrow?"
+- Add time: "Add 5 minutes to the timer" / "to the pasta timer" / "add five more minutes" / "add a minute"
+- Take time off: "Take 2 minutes off the timer" / "subtract a minute from the pasta timer" (negative add; refuses to go past zero)
+- Pause / resume: "Pause the timer" / "Pause the pasta timer" / "Resume the timer" / "Start the timer again" (needs the word "timer" — a bare "pause" is the music)
+- Change: "Change my alarm to 7:30" (no am/pm → nearest to the old time; keeps its day/cadence) / "Push my alarm back 15 minutes" / "Move my alarm 10 minutes earlier" / "Move tomorrow's alarm to 8" (repeating alarm: skips that day, sets a one-off) / "Change my reminder to 4"
+- Skip: "Skip tomorrow's alarm" / "Skip my alarm on Friday" / "Skip the next alarm" / "Turn off my alarm for tomorrow" — a repeating entry sits that day out (`_Entry.skip`); a one-off is cancelled
 - Reset: "Reset the timer" / "Restart my pasta timer" (timers only; picks the soonest when unnamed)
-- Cancel: "Cancel my pasta timer", "Cancel my 7 AM alarm", "Cancel the dentist reminder", "Cancel all timers", "Stop everything"
-- Snooze: "Snooze" (5 min) / "Snooze for 10 minutes" — a bare "snooze" only refers to something that rang in the last 15 minutes
+- Cancel: "Cancel my pasta timer", "Cancel my 7 AM alarm", "Cancel the dentist reminder", "Cancel my reminder to call mom", "Cancel all timers", "Clear my timers", "Stop everything". "Cancel my alarm" (singular) with several set asks which one.
+- Snooze: "Snooze" (5 min) / "Snooze for 10 minutes" / "snooze 10 more minutes" / "snooze 10" — refers to whatever rang in the last 15 minutes; a snoozed timer/reminder rings as itself again. "Give me 5 more minutes" only snoozes if something just rang.
+- Stop the ring: "Stop" / "turn it off" / "I'm up" / "okay thanks" while something rings, or within 30 s of the wake word silencing it
 
 ---
 
@@ -95,7 +108,11 @@ Same mechanism as the memory "who is this for?" prompt — it works within the
 | `_resolve_clock_time(src, now, allow_daypart=…)` | `(target, hour, minute, repeat)` or None — am/pm inference, day words (also caught when they don't follow the time), `_parse_repeat`, daypart defaults. Shared by alarm + reminder parsing |
 | `_extract_reminder_message` | the action phrase, with the framing and the leading/trailing time clause stripped; `None` if nothing's left |
 | `reminder_missing_time` | `(message, day_phrase)` when the request names a day but no time — the pipeline asks; `None` otherwise |
-| `parse_add_time_request` | `(seconds, label_substring)` or None |
+| `parse_add_time_request` | `(seconds, label_substring)` or None; negative for "take 2 minutes off" |
+| `normalize_clock` | "half past 6" → "6:30", "quarter to 7" → "6:45", "6 30" → "6:30" |
+| `alarm_missing_time` / `timer_missing_length` | the pipeline asks "For what time?" / "For how long?" (`_pending_set`) |
+| `parse_alarm_change` / `resolve_new_time` | `(ref, kind, new_time_text, shift_s)`; the new fire time |
+| `parse_skip_request` / `parse_pause_request` / `is_dismiss_request` | skip a day / pause-resume / "stop" while ringing |
 | `parse_timer_cancel_request` | `("all", None)` / `("label", substring)` / None |
 | `parse_timer_reset_request` / `parse_timer_status_request` / `parse_snooze_request` | as before, widened |
 
@@ -113,10 +130,13 @@ skill's timeframe resolver.
 | `set(TimerSpec)` | arms a thread; publishes `antigua/timer_set` |
 | `list_active()` | rows with `kind`, `name`, `repeat`, `fires_at`, `remaining_s`, sorted by fire time |
 | `find(substring)` | label- or name-match, for specific status/cancel |
-| `add_time(sub, secs)` | extends a running timer |
+| `add_time(sub, secs)` / `add_time_id` | extends (or, negative, shortens) a timer; a paused one too |
+| `pause(id)` / `resume(id)` | freezes `paused_left`; the thread idles; persisted |
+| `skip(id, date)` | a repeating entry sits out that date |
+| `reschedule(id, fires_at, hour, minute, repeat)` | change an alarm/reminder in place |
 | `reset(sub)` | timers only; re-arms from `duration_s` |
 | `cancel(sub)` / `cancel_all()` | substring or all |
-| `_load()` | migrates legacy format; rolls a lapsed recurring alarm forward; refreshes alarm labels |
+| `_load()` | migrates legacy format; rings anything under 10 min late (missed during a restart); rolls a lapsed recurring alarm forward however many days it lapsed; refreshes alarm labels |
 
 On fire: `_on_fire(label, kind, message)` (backend hook), then if `repeat` the
 entry re-arms itself at the next matching day (`_next_occurrence`). A recurring
@@ -148,11 +168,21 @@ status never says "14 minutes 59 seconds".
 
 ## Satellite ring (`antigua_satellite.py`)
 
-`_alarm_loop` speaks the announcement once, rings `audio_in/alarm_clock.ogg` for
-`satellite.alarm_ring_seconds` (default **5s** — the mic sits next to the speaker,
-so the wake word is unreliable while it rings), then auto-stops and publishes
-`antigua/alarm_ack`. Saying the wake word stops all ringing alarms early and drops
-into conversation mode, so "snooze for 10 minutes" works immediately.
+`_alarm_loop` speaks the announcement and rings `audio_in/alarm_clock.ogg` for
+`alarm_ring_seconds` (default **5s**), then rings again every
+`alarm_repeat_seconds` (30s) until stopped, for at most `alarm_max_seconds`
+(300s). A reminder plays a soft two-tone chime before its line instead of the
+bell. Every kind repeats.
+
+The bell stays short because the mic sits next to the speaker: the wake word is
+heard in the quiet between rings. Any of these stops all ringing:
+- the wake word (`antigua/listening` active — the bridge publishes it at every recording start)
+- `antigua/alarm_stop` — the server's reply to "stop" / "I'm up" / a snooze
+- `antigua/stop` — the wake word over a reply
+
+When a ring ends the satellite publishes `antigua/alarm_ack {label, id}`; the
+servers track what is ringing (`pipeline._ringing`) so "stop" means the alarm,
+not the music, while it rings and for 30 s after.
 
 ---
 
@@ -160,7 +190,9 @@ into conversation mode, so "snooze for 10 minutes" works immediately.
 
 ```yaml
 satellite:
-  alarm_ring_seconds: 5
+  alarm_ring_seconds: 5      # bell per ring
+  alarm_repeat_seconds: 30   # rings again this often...
+  alarm_max_seconds: 300     # ...until stopped, at most this long
 ```
 
 Persistence path: `settings.TIMER_STORE_PATH` → `data/timers.json`.
@@ -172,10 +204,12 @@ Persistence path: `settings.TIMER_STORE_PATH` → `data/timers.json`.
 | Topic | Direction | Payload | When |
 |---|---|---|---|
 | `antigua/timer_set` | server → Pi | `{id, label, kind, fires_at}` | set / reset |
-| `antigua/alarm` | server → Pi | `{text, audio_url, label, kind}` | fires |
-| `antigua/alarm_ack` | Pi → broker | `{label}` | ring ends |
+| `antigua/alarm` | server → Pi | `{text, audio_url, label, kind, id}` | fires |
+| `antigua/alarm_stop` | server → Pi | `{}` | "stop" / snooze while ringing |
+| `antigua/alarm_ack` | Pi → servers | `{label, id}` | ring ends |
 
-PinedaDisplay subscribes to the same topics to drive its timer card.
+PinedaDisplay subscribes to the same topics to drive its timer card (paused
+timers drop off it until resumed).
 
 ---
 
@@ -184,39 +218,40 @@ PinedaDisplay subscribes to the same topics to drive its timer card.
 - `tests/test_timers.py` — snapshot suite: duration parsing, alarm + reminder
   specs (relative / clock / daypart / recurring), message extraction, phrasing,
   `TimerManager` (type split, `find`, `add_time`, `reset`, message round-trip,
-  fire-callback payload, legacy-format migration, recurring roll-forward).
+  fire-callback payload, legacy-format migration, recurring roll-forward), and
+  the 2026-10 polish: spoken clocks, repeats without "every", intervals,
+  take-off/bare add, snooze forms, ask-for-time, change/skip/pause parsing,
+  "stop" detection, restart rings, pause/resume, skip, reschedule.
 - `tests/test_pipeline.py` — end-to-end: set / cancel / add / status / recurring,
-  plus a reminder set → status → cancel flow.
-- `tests/fixtures/routing.yaml` — `timer_*` / `alarm_set` / `reminder_set` fixtures.
+  a reminder set → status → cancel flow, ask-for-time, take-off / pause,
+  "cancel my alarm" asks, skip / change / move, and "stop" / snooze while ringing.
+- `tests/fixtures/routing.yaml` — `timer_*` / `alarm_*` / `reminder_set` fixtures.
 
 ---
 
 ## Limitations
 
-- "Half past six" / "quarter to seven" don't parse (needs numeric or "N:MM").
-- Snooze targets the most recently fired alarm (within 15 min); with several
-  alarms firing together it may pick the wrong one.
+- Snooze targets the most recently fired entry (within 15 min); with several
+  firing together it may pick the wrong one.
 - Reminder message extraction is heuristic. A phrasing it can't split cleanly
   yields `message=None` (falls back to "Here's your reminder.") — no worse than
   before, never a wrong action.
-- "This morning" that has already passed rolls silently to tomorrow.
+- A time already past rolls silently to tomorrow, and the reply says so ("7 PM tomorrow").
 - Ordinal / calendar dates ("on the first", "on the 15th", "March 3") don't
   parse — only relative days, weekday names, and dayparts.
-- The clarifying prompt only fires for a *day without a time*. "Remind me to
-  buy milk" (nothing at all) still goes to the LLM rather than asking "when?".
-- Recurring alarms/reminders reschedule in-process; they also roll forward
-  correctly on a restart, but a server down across the fire time misses that
-  occurrence.
+- "Remind me to buy milk" (no time at all) still goes to the LLM rather than asking "when?".
+- "On Saturday and Sunday" makes a repeating alarm (said back as "every weekend").
+- "Set two timers, one for 5 and one for 10" sets only the first.
+- A missed alarm rings on restart only if under 10 minutes late. If the fallback
+  already rang it during a short outage, it can ring twice.
 - Timer threads are daemons — a graceful shutdown doesn't wait on them.
+- New replies (pause, change, skip, "Okay." to stop) are English-only; the
+  Spanish reply table doesn't cover them yet.
 
 ---
 
 ## How to Extend
 
 **Per-alarm ring length / sound:** add fields to `TimerSpec`, pass through
-`antigua/alarm`, look up in `_alarm_loop`. A gentler cue for `kind="reminder"`
-(shorter ring, softer sound) would be a natural first use — the `kind` is
-already on the MQTT payload.
-**"Half past" / "quarter to":** extend the clock-time branch of `_resolve_clock_time`.
-**Edit / reschedule a reminder:** "move the dentist reminder to 4" — currently
-you cancel and re-add.
+`antigua/alarm`, look up in `_alarm_loop` (the reminder chime is the model).
+**Calendar dates:** extend `_resolve_clock_time`'s day-word branch.

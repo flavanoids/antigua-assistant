@@ -72,11 +72,50 @@ SPORTS_TEAM_TTL = 300              # team record/schedule cache
 SPORTS_F1_TTL = 300                # F1 scoreboard cache
 SPORTS_TIMEOUT = 4                 # fail fast rather than stall TTS
 
+# ── Commute (drive times from home; antigua_core/commute.py) ────────────────
+COMMUTE_ENABLED = True
+# Home + favorites (people's houses, work). Git-ignored and chmod 600 — the
+# tracked places.example.yaml is only a template and is never read.
+COMMUTE_PLACES_PATH = BASE_DIR / "server" / "config" / "places.yaml"
+COMMUTE_PHOTON_URL = "https://photon.komoot.io"
+COMMUTE_OSRM_URL = "https://router.project-osrm.org"   # used when there's no TomTom key
+COMMUTE_TRANSTAR = True            # Houston TranStar speeds + incidents on the route
+COMMUTE_SEARCH_RADIUS_KM = 35      # businesses farther than this aren't "near you"
+COMMUTE_UNUSUAL_MIN_MINUTES = 5    # slower than usual by at least this much...
+COMMUTE_UNUSUAL_PCT = 20           # ...and by at least this share of the usual time
+COMMUTE_TIMEOUT = 5
+COMMUTE_AREA_RADIUS_KM = 12        # "how's traffic" covers this far around home
+COMMUTE_ROAD_ALIASES: dict = {}    # spoken -> OSM road name, e.g. {"the beltway": "sam houston"}
+
+# ── Knowledge (people, history, events — Wikipedia + Wikidata) ─────────────
+KNOWLEDGE_ENABLED = True
+KNOWLEDGE_TIMEOUT = 4              # fail fast rather than stall TTS
+KNOWLEDGE_TOPIC_TTL = 900          # follow-ups ("was she married?") within 15 min
+KNOWLEDGE_MAX_TOKENS = 220         # overview budget
+KNOWLEDGE_FOLLOWUP_MAX_TOKENS = 130
+KNOWLEDGE_OVERVIEW_SENTENCES = "3 to 4"
+KNOWLEDGE_LEAD_CHARS = 1800        # article lead given to the overview
+KNOWLEDGE_PASSAGE_CHARS = 700      # per passage given to a follow-up
+KNOWLEDGE_CONTEXT_CHARS = 2400     # all passages for one follow-up
+KNOWLEDGE_FACTS_WAIT = 2.0         # how long a follow-up waits on Wikidata
+
+# ── Recipes (real recipes from the web, read step by step) ────────────────────
+RECIPE_ENABLED = True              # also needs search (SearXNG) enabled
+RECIPE_CANDIDATES = 10             # result pages fetched per dish
+RECIPE_FETCH_TIMEOUT = 5           # per page; all pages are fetched in parallel
+RECIPE_CACHE_DAYS = 14             # parsed recipes kept per dish
+RECIPE_SESSION_TTL = 4 * 3600      # a cooking session survives a long bake
+RECIPE_ANSWER_TTL = 600            # bare "yes"/"no" answers a question this recent
+RECIPE_QA_MAX_TOKENS = 110         # grounded answer to a free-form cooking question
+
 # ── News ─────────────────────────────────────────────────────────────────────
 NEWS_TTL = 1200
 NEWS_MAX_TOKENS = 150
 NEWS_SOURCES = []
 NEWS_MAX_ITEMS = 5
+
+# ── Persona ──────────────────────────────────────────────────────────────────
+PERSONA_SASS = 2   # 0 warm .. 3 sharp; how much edge casual chat gets (persona.py)
 
 # ── Search ───────────────────────────────────────────────────────────────────
 SEARCH_ENABLED = False
@@ -90,8 +129,23 @@ SEARCH_ROUTER_TIMEOUT = 3
 SEARCH_MAX_TOKENS_LONG = 220
 SEARCH_MAX_TOKENS = 120
 SEARCH_TIMEOUT = 4
-SEARCH_ENGINES = "google,bing,duckduckgo"
-SEARCH_NEWS_ENGINES = "google news,bing news,google,bing"
+# No Bing for web results: through SearXNG it answers with unrelated pages
+# ("fix a running toilet" -> Microsoft account pages; 2026-10-07, on both
+# SearXNG 2026.8.13 and 2026.10.7). Bing News is fine. SearXNG skips an
+# engine while it's suspended (DuckDuckGo's CAPTCHA, Brave's rate limit).
+SEARCH_ENGINES = "google,duckduckgo,brave"
+SEARCH_NEWS_ENGINES = "google news,bing news,duckduckgo news,google"
+# Fallback for when SearXNG comes back empty: its one working web engine
+# scrapes Google from the home IP and gets rate-limited. Parallel's Search
+# API (https://docs.parallel.ai), "fast" mode ~0.7 s, with a key
+# (server.yaml search.parallel_api_key, or PARALLEL_API_KEY); without one,
+# Parallel's free public MCP endpoint (no key, no SLA, unknown rate limit),
+# unless search.parallel_keyless is false.
+PARALLEL_URL = "https://api.parallel.ai/v1/search"
+PARALLEL_MCP_URL = "https://search.parallel.ai/mcp"
+PARALLEL_API_KEY = ""
+PARALLEL_KEYLESS = True
+PARALLEL_MODE = "fast"
 
 # ── Memory / conversation / timers ──────────────────────────────────────────
 MEMORY_TTL_DAYS = 14
@@ -107,10 +161,18 @@ MEMORY_STORE_PATH = DATA_DIR / "memories.json"
 HOUSEHOLD: list = []
 CONVERSATION_TTL = 300
 MAX_HISTORY = 6
+# Conversation mode ("let's chat", chat.py): more turns of history, and how
+# long the addressee check may take before the chat ends instead.
+CHAT_MAX_HISTORY = 20
+CHAT_ADDRESSEE_TIMEOUT = 2.5
 TIMER_STORE_PATH = DATA_DIR / "timers.json"
 LISTS_STORE_PATH = DATA_DIR / "lists.json"
 SPEAKER_PROFILES_PATH = DATA_DIR / "speaker_profiles.json"
-SPEAKER_MIN_SIMILARITY = 0.75  # cosine similarity floor — see speaker_id.py
+# Kitchen far-field clips score ~0.55 against their own speaker's centroid
+# (2026-10-06, 85 captures), so 0.75 rejected nearly everything. A low floor
+# plus a lead over the runner-up: 0.35/0.10 made zero leave-one-out errors.
+SPEAKER_MIN_SIMILARITY = 0.35  # cosine similarity floor — see speaker_id.py
+SPEAKER_MIN_MARGIN = 0.10      # best must beat the runner-up by this much
 
 # ── Music (Music Assistant + Apple Music) ───────────────────────────────────
 # Spoken speaker name → Music Assistant player name, from server.yaml's
@@ -118,11 +180,19 @@ SPEAKER_MIN_SIMILARITY = 0.75  # cosine similarity floor — see speaker_id.py
 # "on/in the …".
 MUSIC_SPEAKERS: dict = {}
 MUSIC_DEFAULT_PLAYER = ""
+PODCASTS: dict | None = None  # podcast.DEFAULT_SHOWS when unset
 
 # ── Assistant ────────────────────────────────────────────────────────────────
 DISPLAY_ENABLED = False  # optional wall display; see server_common.DISPLAY_TOPICS
 WAKE_WORDS = ["alexa"]
 DISPLAY_COMMANDS = []
+
+# PinedaDisplay Web, from server.yaml's pineda: block (antigua_core/pineda.py).
+PINEDA_URL = None             # e.g. http://127.0.0.1:8090; None = skill off
+PINEDA_PROFILE = "default"    # the kiosk's profile — its theme wins over the global one
+PINEDA_DEVICE = None          # the kiosk's device id, for "this photo"; None = latest screen
+PINEDA_REBOOT_DELAY_S = 10    # airplaypi plays the "rebooting" reply first
+PINEDA_RECIPE_SECONDS = 120   # the full-screen recipe card comes down by itself after this
 WAKE_PREFIX_RE = None  # built by configure() from WAKE_WORDS
 
 
@@ -174,6 +244,41 @@ def configure(cfg: dict, *, mqtt_publish_fn=None):
     g["SPORTS_F1_TTL"] = sp.get("f1_ttl_seconds", SPORTS_F1_TTL)
     g["SPORTS_TIMEOUT"] = sp.get("timeout_seconds", SPORTS_TIMEOUT)
 
+    co = cfg.get("commute", {})
+    g["COMMUTE_ENABLED"] = co.get("enabled", COMMUTE_ENABLED)
+    if co.get("places_file"):
+        g["COMMUTE_PLACES_PATH"] = BASE_DIR / co["places_file"]
+    g["COMMUTE_PHOTON_URL"] = co.get("photon_url", COMMUTE_PHOTON_URL)
+    g["COMMUTE_OSRM_URL"] = co.get("osrm_url", COMMUTE_OSRM_URL)
+    g["COMMUTE_TRANSTAR"] = co.get("transtar", COMMUTE_TRANSTAR)
+    g["COMMUTE_SEARCH_RADIUS_KM"] = co.get("search_radius_km", COMMUTE_SEARCH_RADIUS_KM)
+    g["COMMUTE_UNUSUAL_MIN_MINUTES"] = co.get("unusual_min_minutes", COMMUTE_UNUSUAL_MIN_MINUTES)
+    g["COMMUTE_UNUSUAL_PCT"] = co.get("unusual_pct", COMMUTE_UNUSUAL_PCT)
+    g["COMMUTE_TIMEOUT"] = co.get("timeout_seconds", COMMUTE_TIMEOUT)
+    g["COMMUTE_AREA_RADIUS_KM"] = co.get("area_radius_km", COMMUTE_AREA_RADIUS_KM)
+    g["COMMUTE_ROAD_ALIASES"] = co.get("road_aliases", {})
+
+    k = cfg.get("knowledge", {})
+    g["KNOWLEDGE_ENABLED"] = k.get("enabled", KNOWLEDGE_ENABLED)
+    g["KNOWLEDGE_TIMEOUT"] = k.get("timeout_seconds", KNOWLEDGE_TIMEOUT)
+    g["KNOWLEDGE_TOPIC_TTL"] = k.get("topic_ttl_seconds", KNOWLEDGE_TOPIC_TTL)
+    g["KNOWLEDGE_MAX_TOKENS"] = k.get("max_tokens", KNOWLEDGE_MAX_TOKENS)
+    g["KNOWLEDGE_FOLLOWUP_MAX_TOKENS"] = k.get("max_tokens_followup", KNOWLEDGE_FOLLOWUP_MAX_TOKENS)
+    g["KNOWLEDGE_OVERVIEW_SENTENCES"] = k.get("overview_sentences", KNOWLEDGE_OVERVIEW_SENTENCES)
+    g["KNOWLEDGE_LEAD_CHARS"] = k.get("lead_chars", KNOWLEDGE_LEAD_CHARS)
+    g["KNOWLEDGE_PASSAGE_CHARS"] = k.get("passage_chars", KNOWLEDGE_PASSAGE_CHARS)
+    g["KNOWLEDGE_CONTEXT_CHARS"] = k.get("context_chars", KNOWLEDGE_CONTEXT_CHARS)
+    g["KNOWLEDGE_FACTS_WAIT"] = k.get("facts_wait_seconds", KNOWLEDGE_FACTS_WAIT)
+
+    rc = cfg.get("recipes", {})
+    g["RECIPE_ENABLED"] = rc.get("enabled", RECIPE_ENABLED)
+    g["RECIPE_CANDIDATES"] = rc.get("candidates", RECIPE_CANDIDATES)
+    g["RECIPE_FETCH_TIMEOUT"] = rc.get("fetch_timeout_seconds", RECIPE_FETCH_TIMEOUT)
+    g["RECIPE_CACHE_DAYS"] = rc.get("cache_days", RECIPE_CACHE_DAYS)
+    g["RECIPE_SESSION_TTL"] = rc.get("session_ttl_seconds", RECIPE_SESSION_TTL)
+    g["RECIPE_ANSWER_TTL"] = rc.get("answer_ttl_seconds", RECIPE_ANSWER_TTL)
+    g["RECIPE_QA_MAX_TOKENS"] = rc.get("qa_max_tokens", RECIPE_QA_MAX_TOKENS)
+
     n = cfg.get("news", {})
     g["NEWS_TTL"] = n.get("ttl_seconds", NEWS_TTL)
     g["NEWS_MAX_TOKENS"] = n.get("max_tokens_news", NEWS_MAX_TOKENS)
@@ -194,6 +299,9 @@ def configure(cfg: dict, *, mqtt_publish_fn=None):
     g["SEARCH_TIMEOUT"] = s.get("timeout_seconds", SEARCH_TIMEOUT)
     g["SEARCH_ENGINES"] = s.get("engines", SEARCH_ENGINES)
     g["SEARCH_NEWS_ENGINES"] = s.get("news_engines", SEARCH_NEWS_ENGINES)
+    g["PARALLEL_API_KEY"] = s.get("parallel_api_key") or os.environ.get("PARALLEL_API_KEY", "")
+    g["PARALLEL_MODE"] = s.get("parallel_mode", PARALLEL_MODE)
+    g["PARALLEL_KEYLESS"] = bool(s.get("parallel_keyless", PARALLEL_KEYLESS))
 
     m = cfg.get("memory", {})
     g["MEMORY_TTL_DAYS"] = m.get("ttl_days", MEMORY_TTL_DAYS)
@@ -213,7 +321,19 @@ def configure(cfg: dict, *, mqtt_publish_fn=None):
         g["MUSIC_SPEAKERS"] = {k.lower(): v for k, v in mu["speakers"].items()}
     g["MUSIC_DEFAULT_PLAYER"] = mu.get("default_player", MUSIC_DEFAULT_PLAYER)
 
+    g["PODCASTS"] = cfg.get("podcasts")
+
+    g["PERSONA_SASS"] = int((cfg.get("persona") or {}).get("sass", PERSONA_SASS))
+
     g["DISPLAY_ENABLED"] = bool(cfg.get("display", {}).get("enabled", False))
+
+    # PinedaDisplay Web (the airplaypi kiosk screen). No url = no display skill.
+    pw = cfg.get("pineda") or {}
+    g["PINEDA_URL"] = pw.get("url")
+    g["PINEDA_PROFILE"] = pw.get("profile", PINEDA_PROFILE)
+    g["PINEDA_DEVICE"] = pw.get("device")
+    g["PINEDA_REBOOT_DELAY_S"] = pw.get("reboot_delay_seconds", PINEDA_REBOOT_DELAY_S)
+    g["PINEDA_RECIPE_SECONDS"] = pw.get("recipe_seconds", PINEDA_RECIPE_SECONDS)
 
     a = cfg.get("assistant", {})
     g["WAKE_WORDS"] = [x.lower() for x in a.get("wake_words", WAKE_WORDS)]

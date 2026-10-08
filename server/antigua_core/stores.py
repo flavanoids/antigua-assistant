@@ -76,18 +76,36 @@ def alarm_label(spec_or_entry) -> str:
     return f"{lead}alarm for {_clock_str(e.hour, e.minute)}{suffix}"
 
 
+def _interval_s(repeat: str | None) -> int | None:
+    """Seconds for an interval cadence ("every:3600"), else None."""
+    if repeat and repeat.startswith("every:"):
+        return int(repeat.split(":", 1)[1])
+    return None
+
+
 def _repeat_phrase(repeat: str) -> str:
+    iv = _interval_s(repeat)
+    if iv:
+        if iv % 3600 == 0:
+            h = iv // 3600
+            return "every hour" if h == 1 else f"every {h} hours"
+        m = iv // 60
+        return "every half hour" if m == 30 else f"every {m} minutes"
     if repeat == "daily":
         return "every day"
     if repeat == "weekdays":
         return "every weekday"
     if repeat == "weekends":
         return "every weekend"
-    idx = [int(x) for x in repeat.split(",") if x != ""]
-    return "every " + ", ".join(_WEEKDAY_NAMES[i] for i in idx)
+    names = [_WEEKDAY_NAMES[int(x)] for x in repeat.split(",") if x != ""]
+    if len(names) <= 2:
+        return "every " + " and ".join(names)
+    return "every " + ", ".join(names[:-1]) + ", and " + names[-1]
 
 
 def _repeat_matches(repeat: str, d: datetime) -> bool:
+    if _interval_s(repeat):
+        return True
     wd = d.weekday()
     if repeat == "daily":
         return True
@@ -98,8 +116,21 @@ def _repeat_matches(repeat: str, d: datetime) -> bool:
     return wd in {int(x) for x in repeat.split(",") if x != ""}
 
 
+def _next_future(repeat: str, from_ts: float, skip=()) -> float:
+    """The first occurrence after from_ts that is in the future and not on a
+    skipped date (ISO strings)."""
+    nxt = _next_occurrence(repeat, from_ts)
+    now = time.time()
+    while nxt <= now or datetime.fromtimestamp(nxt).date().isoformat() in skip:
+        nxt = _next_occurrence(repeat, nxt)
+    return nxt
+
+
 def _next_occurrence(repeat: str, from_ts: float) -> float:
     """Next fire time for a repeating alarm, keeping the same time of day."""
+    iv = _interval_s(repeat)
+    if iv:
+        return from_ts + iv
     base = datetime.fromtimestamp(from_ts)
     for step in range(1, 9):
         cand = base + timedelta(days=step)
@@ -124,6 +155,8 @@ class _Entry:
     set_s: float = 0.0           # length as first set ("the 5 minute timer"); add_time
                                  # doesn't change it, so the name still fits after
     origin: str = "local"        # "primary": adopted by the fallback (see adopt())
+    paused_left: float | None = None   # a paused timer: seconds it had left
+    skip: list = field(default_factory=list)   # ISO dates a repeating alarm sits out
     created_at: float = field(default_factory=time.time)
     thread: object = None
 
@@ -131,15 +164,21 @@ class _Entry:
 # An alarm counts as rung by the primary if it was still answering this long
 # after the alarm's time (fire → pop is well under a second).
 _PRIMARY_FIRE_MARGIN_S = 2.0
+# A timer/alarm that came due while the server was restarting still rings on
+# load if it's at most this late (a deploy at 6:59 mustn't eat a 7:00 alarm).
+_MISSED_GRACE_S = 600
 
 
 class TimerManager:
-    def __init__(self, on_fire=None):
+    def __init__(self, on_fire=None, on_change=None):
         self._timers: dict[str, _Entry] = {}
         self._lock = Lock()
         # Injected: what to do when a timer fires (synthesize + publish alarm).
         # A backend concern — the primary and fallback announce differently.
         self._on_fire = on_fire or (lambda *a, **kw: None)  # (label, kind, message)
+        # Injected: after any set/cancel/fire/extend (the primary mirrors its
+        # timers onto the display). Runs outside the lock; must not block.
+        self._on_change = on_change or (lambda: None)
 
     # ── set ─────────────────────────────────────────────────────────────────
 
@@ -175,6 +214,11 @@ class TimerManager:
 
         def _run():
             while True:
+                if entry.paused_left is not None:
+                    if tid not in self._timers:
+                        return       # cancelled while paused
+                    time.sleep(0.5)
+                    continue
                 remaining = entry.fires_at - time.time()
                 if remaining <= 0:
                     break
@@ -191,10 +235,12 @@ class TimerManager:
                 self._persist()
             self._on_fire(entry.label, entry.kind, entry.message)
             if entry.repeat:
+                today = datetime.now().date().isoformat()
+                skip = [d for d in entry.skip if d >= today]
                 nxt = replace(
                     entry, tid=uuid.uuid4().hex[:6],
-                    fires_at=_next_occurrence(entry.repeat, entry.fires_at),
-                    thread=None,
+                    fires_at=_next_future(entry.repeat, entry.fires_at, skip),
+                    skip=skip, thread=None,
                 )
                 if nxt.kind == "alarm":
                     nxt.label = alarm_label(nxt)   # refresh "tomorrow"/day words
@@ -225,13 +271,17 @@ class TimerManager:
                     "kind": e.kind,
                     "name": e.name,
                     "repeat": e.repeat,
+                    "wake": e.wake,
                     "message": e.message,
                     "hour": e.hour,
                     "minute": e.minute,
                     "fires_at": e.fires_at,
-                    "remaining_s": max(0, e.fires_at - now),
+                    "remaining_s": (e.paused_left if e.paused_left is not None
+                                    else max(0, e.fires_at - now)),
+                    "paused": e.paused_left is not None,
                     "set_s": e.set_s,
                     "created_at": e.created_at,
+                    "skip": list(e.skip),
                 }
                 for e in sorted(self._timers.values(), key=lambda x: x.fires_at)
             ]
@@ -277,7 +327,7 @@ class TimerManager:
             if match:
                 spec = TimerSpec(seconds=match.duration_s, label=match.label,
                                  kind=match.kind, name=match.name,
-                                 duration_s=match.duration_s)
+                                 duration_s=match.duration_s, message=match.message)
         if spec is None:
             return None
         self.cancel(spec.label)
@@ -319,9 +369,71 @@ class TimerManager:
                 return None
             e.fires_at += seconds
             e.duration_s += seconds
-            remaining = max(0, e.fires_at - time.time())
+            if e.paused_left is not None:
+                e.paused_left = max(1.0, e.paused_left + seconds)
+            remaining = (e.paused_left if e.paused_left is not None
+                         else max(0, e.fires_at - time.time()))
         self._persist()
         return remaining
+
+    def pause(self, tid: str) -> float | None:
+        """Freeze a running timer; returns the seconds it has left."""
+        with self._lock:
+            e = self._timers.get(tid)
+            if e is None or e.kind == "alarm":
+                return None
+            if e.paused_left is None:
+                e.paused_left = max(1.0, e.fires_at - time.time())
+            left = e.paused_left
+        self._persist()
+        return left
+
+    def resume(self, tid: str) -> float | None:
+        """Restart a paused timer from where it stopped; returns seconds left."""
+        with self._lock:
+            e = self._timers.get(tid)
+            if e is None:
+                return None
+            if e.paused_left is not None:
+                e.fires_at = time.time() + e.paused_left
+                e.paused_left = None
+            left = max(0, e.fires_at - time.time())
+        self._persist()
+        return left
+
+    def skip(self, tid: str, day=None) -> float | None:
+        """Sit out one occurrence of a repeating entry: the one on `day`
+        (a date), or the next one. Returns the new next fire time."""
+        with self._lock:
+            e = self._timers.get(tid)
+            if e is None or not e.repeat:
+                return None
+            nxt_day = datetime.fromtimestamp(e.fires_at).date()
+            day = day or nxt_day
+            if day.isoformat() not in e.skip:
+                e.skip.append(day.isoformat())
+            if nxt_day == day:
+                e.fires_at = _next_future(e.repeat, e.fires_at, e.skip)
+            e.label = alarm_label(e) if e.kind == "alarm" else e.label
+            fires_at = e.fires_at
+        self._persist()
+        return fires_at
+
+    def reschedule(self, tid: str, fires_at: float, hour=None, minute=0,
+                   repeat=None) -> dict | None:
+        """Move an alarm/reminder to a new time (same name, message, cadence
+        unless `repeat` is given). Returns its new list_active row."""
+        with self._lock:
+            e = self._timers.get(tid)
+            if e is None:
+                return None
+            e.fires_at, e.hour, e.minute = fires_at, hour, minute
+            e.repeat = repeat if repeat is not None else e.repeat
+            e.skip = []
+            if e.kind == "alarm":
+                e.label = alarm_label(e)
+        self._persist()
+        return next((r for r in self.list_active() if r["id"] == tid), None)
 
     def cancel_all(self, kind: str | None = None) -> list[str]:
         with self._lock:
@@ -355,12 +467,10 @@ class TimerManager:
             if e.fires_at <= now:
                 rung = e.fires_at + _PRIMARY_FIRE_MARGIN_S <= primary_alive_until
                 if not rung and now - e.fires_at <= grace_s:
+                    # Its past fires_at rings at once; a repeat then keeps its slot.
                     log.warning("Adopting overdue %s now: %s", e.kind, e.label)
-                    e.fires_at = now
                 elif e.repeat:
-                    e.fires_at = _next_occurrence(e.repeat, e.fires_at)
-                    while e.fires_at <= now:
-                        e.fires_at = _next_occurrence(e.repeat, e.fires_at)
+                    e.fires_at = _next_future(e.repeat, e.fires_at, e.skip)
                 else:
                     continue
             if e.kind == "alarm":
@@ -389,6 +499,7 @@ class TimerManager:
                 json.dump(data, f)
         except Exception as e:
             log.warning("Timer persist failed: %s", e)
+        self._on_change()
 
     def _load(self):
         if not settings.TIMER_STORE_PATH.exists():
@@ -405,9 +516,13 @@ class TimerManager:
             kind = entry.get("kind", "timer")
             repeat = entry.get("repeat")
             fires_at = entry["fires_at"]
-            if fires_at <= now and repeat:
-                fires_at = _next_occurrence(repeat, fires_at)
-            if fires_at <= now:
+            if entry.get("paused_left") is not None:
+                fires_at = now + entry["paused_left"]
+            elif fires_at <= now and now - fires_at <= _MISSED_GRACE_S:
+                log.warning("Ringing %s missed during the restart: %s", kind, entry["label"])
+            elif fires_at <= now and repeat:
+                fires_at = _next_future(repeat, fires_at, entry.get("skip") or ())
+            if fires_at <= now - _MISSED_GRACE_S:
                 log.info("Skipping expired %s: %s", kind, entry["label"])
                 continue
             e = _entry_from_dict(entry, fires_at=fires_at)
@@ -422,7 +537,8 @@ def _entry_to_dict(e: _Entry) -> dict:
     return {"label": e.label, "kind": e.kind, "fires_at": e.fires_at,
             "duration_s": e.duration_s, "name": e.name, "repeat": e.repeat,
             "wake": e.wake, "hour": e.hour, "minute": e.minute,
-            "message": e.message, "set_s": e.set_s, "created_at": e.created_at}
+            "message": e.message, "set_s": e.set_s, "created_at": e.created_at,
+            "paused_left": e.paused_left, "skip": list(e.skip)}
 
 
 def _entry_from_dict(d: dict, fires_at: float) -> _Entry:
@@ -436,6 +552,8 @@ def _entry_from_dict(d: dict, fires_at: float) -> _Entry:
         message=d.get("message"),
         set_s=d.get("set_s", 0.0 if d.get("kind") == "alarm" else d.get("duration_s", 0.0)),
         created_at=d.get("created_at", time.time()),
+        paused_left=d.get("paused_left"),
+        skip=list(d.get("skip") or []),
     )
 
 
@@ -501,7 +619,7 @@ class MemoryStore:
     """Persistent voice notepad. Entries are tagged by person + timestamp,
     stored in a JSON file, and expire after settings.MEMORY_TTL_DAYS days."""
 
-    def __init__(self, path: Path = None, ttl_days: int = None):
+    def __init__(self, path: Path | None = None, ttl_days: int | None = None):
         # Defaults resolved at call time, not import time — settings.configure()
         # runs after this module is imported.
         self._path = path or settings.MEMORY_STORE_PATH
@@ -767,7 +885,7 @@ class ListStore:
     into a shopping list, which is exactly wrong.
     """
 
-    def __init__(self, path: Path = None):
+    def __init__(self, path: Path | None = None):
         # Resolved at call time — settings.configure() runs after import.
         self._path = path or settings.LISTS_STORE_PATH
         self._lock = Lock()
@@ -881,12 +999,18 @@ class ConversationStore:
         with self._lock:
             entry = self._get_or_create_nolock(conv_id)
             entry["messages"].append({"role": role, "content": content})
-            if len(entry["messages"]) > self._max_hist:
+            max_hist = entry.get("max_hist", self._max_hist)
+            if len(entry["messages"]) > max_hist:
                 entry["messages"] = [
                     entry["messages"][0],
-                    *entry["messages"][-(self._max_hist - 1) :],
+                    *entry["messages"][-(max_hist - 1) :],
                 ]
             entry["last_used"] = time.time()
+
+    def set_max_history(self, conv_id, max_hist):
+        """A longer (or shorter) history for one conversation — chat mode."""
+        with self._lock:
+            self._get_or_create_nolock(conv_id)["max_hist"] = max_hist
 
     def get_messages(self, conv_id):
         with self._lock:

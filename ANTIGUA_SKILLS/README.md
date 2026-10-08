@@ -12,13 +12,18 @@ Each subfolder documents one skill: what it does, how it's triggered, where the 
 | [`timers/`](timers/) | `timer_*`, `alarm_set`, `reminder_set`, `snooze` | No |
 | [`time_date/`](time_date/) | `time_date` | No |
 | [`calc/`](calc/) | `calc` | No |
+| [`commute/`](commute/) | `commute` | No: Photon + TomTom/OSRM + Houston TranStar |
 | [`remember/`](remember/) | `memory_*`, `medicine_query` | Only for general memory questions |
 | [`lists/`](lists/) | `list_*` | No |
 | [`music/`](music/) | `music` | No |
 | [`living_room_tv/`](living_room_tv/) | `tv` | No (Apple TV + Roku via MCP) |
 | [`govee_lights/`](govee_lights/) | `govee` | No (via MCP) |
+| [`pineda_display/`](pineda_display/) | `pineda` | Only for "tell me more about this quote" |
 | [`volume/`](volume/) | `volume` | No |
+| [`funny_sound/`](funny_sound/) | `funny_sound` | No: a random downloaded clip |
 | [`news/`](news/) | `news` | Yes: reads the fetched headlines |
+| [`knowledge/`](knowledge/) | `knowledge`, plus follow-ups on `llm`/`search`/`memory_query` | Yes: answers from the Wikipedia article + Wikidata facts |
+| [`recipes/`](recipes/) | `recipe`, plus a cooking session that claims turns before routing | No: real recipes from the web, read as published |
 | [`search/`](search/) | `search`, plus the router on `llm` | Yes: answers from SearXNG results |
 | [`substitution/`](substitution/) | `substitution` | Yes |
 | [`conversation/`](conversation/) | `llm` | Yes |
@@ -45,8 +50,8 @@ Audio in
        └─ STT corrections (correct_transcript)
             └─ classify(transcript) → route
                  ├─ [BYPASS] Weather, Timers, Time/Date, Calc, Sports, Lists, Memory,
-                 │           Music, TV, Govee, Volume  ← handler replies in code, no LLM
-                 ├─ [INJECT]  Memory query, News, Substitution, Search  ← context into the LLM tail
+                 │           Music, TV, Govee, Volume, Recipes  ← handler replies in code, no LLM
+                 ├─ [INJECT]  Memory query, News, Substitution, Knowledge, Search  ← context into the LLM tail
                  └─ LLM tail (Backend.ask_llm_stream), grounding guard
                       └─ TTS (first sentence alone, rest as one utterance)
                            └─ MQTT antigua/play → satellite plays audio

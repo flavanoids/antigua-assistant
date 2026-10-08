@@ -184,8 +184,8 @@ class HomeControl:
     def _input_key(self, target: str) -> str | None:
         target = re.sub(r"^the\s+", "", target.strip().lower().rstrip("?.,!"))
         hm = _HDMI_NUM_RE.match(target)
-        if hm:
-            return _HDMI_KEYS.get(hm.group(1).lower())
+        if hm and hm.group(1).lower() in _HDMI_KEYS:
+            return _HDMI_KEYS[hm.group(1).lower()]
         if any(w in target for w in ("live tv", "live", "antenna", "cable", "dtv")):
             return "InputTuner"
         if target in ("av", "composite", "aux"):

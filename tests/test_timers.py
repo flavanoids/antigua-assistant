@@ -327,6 +327,210 @@ eq("timer left after kind cancel", [r["id"] for r in tm5.list_active()], [a])
 tm5.cancel_all()
 
 
+# ── Polish (2026-10): phrasing the parser used to get wrong ─────────────────
+for text, secs in [
+    ("set a timer for an hour and 15 minutes", 4500),
+    ("set a timer for 1 hour and a half", 5400),
+    ("add a minute", 60),
+    ("half an hour", 1800),                        # fuzzy forms untouched
+    ("a quarter of an hour", 900),
+]:
+    eq(f"duration {text!r}", C.resolve_duration(text), float(secs))
+
+for text, want in [
+    ("set a timer for 10", 600.0),                 # bare number = minutes
+    ("timer for 5", 300.0),
+]:
+    eq(f"bare-minute timer {text!r}", spec(text).seconds, want)
+eq("timer name after the length", spec("set a timer for 12 minutes for the pasta").name, "pasta")
+eq("timer 'name it'", spec("set a timer for 25 minutes and name it pizza").name, "pizza")
+
+for text, want in [
+    ("set an alarm for half past six", (6, 30)),
+    ("set an alarm for quarter to seven", (6, 45)),
+    ("set an alarm for 6 30", (6, 30)),
+    ("set an alarm for six forty five", (6, 45)),
+    ("set an alarm for 6 oh 5", (6, 5)),
+    ("set an alarm for noon", (12, 0)),
+    ("set an alarm for midnight", (0, 0)),
+    ("set an alarm for 12 midnight", (0, 0)),
+]:
+    a = alarm(text)
+    eq(f"clock {text!r}", a and (a.hour, a.minute), want)
+eq("a past time today never rings now", alarm("set an alarm for 12:01 am today").seconds > 0, True)
+eq("'tonight' in the past rolls a day", alarm("set an alarm for 12:01 am tonight").seconds > 0, True)
+
+for text, want in [
+    ("set an alarm for 6 am on weekdays", "weekdays"),
+    ("set an alarm for 6:45 am monday through friday", "weekdays"),
+    ("set an alarm for 8 on saturday and sunday", "weekends"),
+    ("set an alarm for 8 on weekends", "weekends"),
+    ("wake me up at 7 on mondays", "0"),
+    ("set an alarm for 7 on monday and wednesday", "0,2"),
+    ("set an alarm for 7 on friday", None),        # one day is a one-off
+]:
+    eq(f"repeat {text!r}", alarm(text).repeat, want)
+eq("repeat phrase", pipeline._repeat_phrase("0,2,4"), "every Monday, Wednesday, and Friday")
+
+r = rem("remind me to take my pills at 9 every night")
+eq("'every night' is PM", (r.hour, r.repeat), (21, "daily"))
+r = rem("remind me to check the oven in 10")
+eq("reminder bare 'in 10'", (r.message, round(r.seconds)), ("check the oven", 600))
+r = rem("set a reminder for 5 pm to call dad")
+eq("reminder 'for 5 pm to'", (r.message, r.hour), ("call dad", 17))
+r = rem("remind me to stretch every hour")
+eq("reminder every hour", (r.message, r.repeat, round(r.seconds)), ("stretch", "every:3600", 3600))
+r = rem("remind me every 30 minutes to drink water")
+eq("reminder every 30 minutes", (r.message, r.repeat), ("drink water", "every:1800"))
+eq("interval too short", rem("remind me to blink every minute"), None)
+r = rem("remind me to call mom at six thirty tonight")
+eq("reminder spoken clock", (r.message, r.hour, r.minute), ("call mom", 18, 30))
+eq("interval reply", pipeline.format_set_reply(rem("remind me to stretch every hour")),
+   "Okay, I'll remind you to stretch every hour.")
+
+for text, want in [
+    ("cancel my alarm", ("label", "my")),          # one alarm — asks if several
+    ("cancel my timer", ("label", "my")),
+    ("clear my timers", ("all", None)),
+    ("cancel my reminder to call mom", ("label", "call mom")),
+    ("cancel my alarm for tomorrow only", ("label", "tomorrow")),
+    ("remove 2 minutes from the timer", None),     # not a cancel
+]:
+    eq(f"cancel {text!r}", C.parse_timer_cancel_request(text), want)
+eq("'my' names nothing", C.parse_timer_ref("my").empty(), True)
+eq("day ref", C.parse_timer_ref("tomorrow's alarm").day_word, "tomorrow")
+
+for text, want in [
+    ("take 2 minutes off the timer", (-120.0, "it")),
+    ("subtract a minute from the pasta timer", (-60.0, "pasta")),
+    ("knock 30 seconds off", (-30.0, "it")),
+    ("add five more minutes", (300.0, "it")),
+    ("add 30 seconds", (30.0, "it")),
+    ("subtract 5 minutes from 3 hours", None),     # arithmetic, not a timer
+]:
+    eq(f"add/take off {text!r}", C.parse_add_time_request(text), want)
+
+for text, want in [
+    ("snooze", 300), ("snooze for 10 minutes", 600), ("snooze 10 more minutes", 600),
+    ("snooze 10", 600), ("snooze for half an hour", 1800), ("give me 5 more minutes", 300),
+]:
+    eq(f"snooze {text!r}", C.parse_snooze_request(text), want)
+
+for text, want in [
+    ("set an alarm", True), ("wake me up", True), ("set an alarm for tomorrow", True),
+    ("set an alarm for tomorrow morning", True), ("set an alarm for 7", False),
+    ("I walk every morning", False), ("wake me up in 5 minutes", False),
+]:
+    eq(f"alarm missing time {text!r}", C.alarm_missing_time(text), want)
+for text, want in [
+    ("set a timer", ""), ("start a pasta timer", "pasta"),
+    ("set a timer for the rice", "rice"), ("set a timer for 5 minutes", None),
+]:
+    eq(f"timer missing length {text!r}", C.timer_missing_length(text), want)
+
+for text, want in [
+    ("change my alarm to 7:30", ("", "alarm", "7:30", None)),
+    ("move my gym alarm to 6", ("gym", "alarm", "6", None)),
+    ("push my alarm back 15 minutes", ("", "alarm", None, 900.0)),
+    ("move my alarm 10 minutes earlier", ("", "alarm", None, -600.0)),
+    ("set an alarm for 7", None),                  # a new alarm, not a change
+]:
+    eq(f"change {text!r}", C.parse_alarm_change(text), want)
+now0 = datetime.now().replace(hour=10, minute=0, second=0, microsecond=0)
+tgt = C.resolve_new_time("7:30", 19, None, (now0 + timedelta(days=1)).replace(hour=19).timestamp(), now=now0)
+eq("change keeps PM and the day", (tgt[1], tgt[2], tgt[0].date()), (19, 30, (now0 + timedelta(days=1)).date()))
+
+for text, want in [
+    ("skip tomorrow's alarm", ("tomorrow's", "alarm")),
+    ("skip my alarm on friday", ("on friday", "alarm")),
+    ("skip the next alarm", ("next", "alarm")),
+    ("turn off my alarm for tomorrow", ("tomorrow", "alarm")),
+    ("turn off my alarm", None),
+]:
+    eq(f"skip {text!r}", C.parse_skip_request(text), want)
+
+for text, want in [
+    ("pause the timer", ("pause", "")), ("pause the pasta timer", ("pause", "pasta")),
+    ("resume the timer", ("resume", "")), ("start the timer again", ("resume", "")),
+    ("restart the timer", None), ("pause the music", None), ("stop the timer", None),
+]:
+    eq(f"pause {text!r}", C.parse_pause_request(text), want)
+
+for text, want in [
+    ("stop", True), ("stop it", True), ("okay stop", True), ("turn it off", True),
+    ("turn off the alarm", True), ("I'm up", True), ("okay thanks", True),
+    ("stop the music", False), ("cancel my alarm", False), ("what time is it", False),
+]:
+    eq(f"dismiss {text!r}", C.is_dismiss_request(text), want)
+
+for text in ["what time is my alarm", "is my alarm set", "what time did I set my alarm for",
+             "how much longer", "how much time on the pasta", "is there an alarm"]:
+    eq(f"routes {text!r}", C.classify(text), "timer_status")
+eq("status ref by day", C.parse_timer_status_ref("do I have any alarms tomorrow").day_word, "tomorrow")
+
+
+# ── Store: restarts, repeats, skip, pause, reschedule ───────────────────────
+def _load(entries):
+    settings.TIMER_STORE_PATH.write_text(json.dumps(entries))
+    tm = TimerManager(on_fire=lambda label, kind="timer", message=None: rung.append(label))
+    tm._load()
+    return tm
+
+
+rung = []
+now = time.time()
+three_days = datetime.now().replace(hour=7, minute=0, second=0, microsecond=0) - timedelta(days=3)
+tm6 = _load([
+    {"label": "alarm for 7:00 AM, every day", "kind": "alarm", "fires_at": three_days.timestamp(),
+     "repeat": "daily", "hour": 7, "minute": 0},
+    {"label": "egg timer", "kind": "timer", "fires_at": now - 120},              # missed in restart
+    {"label": "old timer", "kind": "timer", "fires_at": now - 3600},             # long gone
+    {"label": "paused timer", "kind": "timer", "fires_at": now - 9999, "paused_left": 240},
+])
+time.sleep(1.3)
+eq("missed-in-restart rings on load", rung, ["egg timer"])
+rows = {r["label"]: r for r in tm6.list_active()}
+eq("daily alarm days behind rolls into the future",
+   rows["alarm for 7:00 AM, every day"]["fires_at"] > time.time(), True)
+eq("daily alarm keeps 7:00", datetime.fromtimestamp(rows["alarm for 7:00 AM, every day"]["fires_at"]).hour, 7)
+eq("paused survives restart", (rows["paused timer"]["paused"], round(rows["paused timer"]["remaining_s"])),
+   (True, 240))
+eq("expired dropped", "old timer" in rows, False)
+tm6.cancel_all()
+
+tm7 = TimerManager(on_fire=lambda label, kind="timer", message=None: rung.append(label))
+rung.clear()
+tid = tm7.set(TimerSpec(0.3, "pasta timer", "timer", name="pasta"))
+eq("pause keeps at least a second", round(tm7.pause(tid)), 1)
+time.sleep(0.8)
+eq("paused timer doesn't ring", rung, [])
+eq("add to a paused timer", round(tm7.add_time_id(tid, 60)), 61)
+eq("resume", round(tm7.resume(tid)) in (60, 61), True)
+eq("resumed is running", tm7.list_active()[0]["paused"], False)
+tm7.cancel_all()
+
+iv = tm7.set(TimerSpec(0.2, "stretch", "reminder", message="stretch", repeat="every:3600", duration_s=0))
+time.sleep(1.2)
+eq("interval reminder rang", rung[-1:], ["stretch"])
+nxt = tm7.list_active()[0]
+eq("interval reminder re-armed an hour on", 3500 < nxt["remaining_s"] <= 3600, True)
+tm7.cancel_all()
+
+wd = C.parse_alarm_request("set an alarm for 6 am every day")
+aid = tm7.set(wd)
+first = datetime.fromtimestamp(tm7.list_active()[0]["fires_at"]).date()
+nxt = tm7.skip(aid, first)
+eq("skip moves past that day", datetime.fromtimestamp(nxt).date(), first + timedelta(days=1))
+later = first + timedelta(days=3)
+tm7.skip(aid, later)
+eq("a later skip is remembered", tm7.list_active()[0]["skip"], [first.isoformat(), later.isoformat()])
+row = tm7.reschedule(aid, (datetime.combine(first + timedelta(days=1), datetime.min.time())
+                           + timedelta(hours=6, minutes=30)).timestamp(), 6, 30)
+eq("reschedule relabels", row["label"], "alarm for 6:30 AM, every day")
+eq("reschedule clears skips", row["skip"], [])
+tm7.cancel_all()
+
+
 if FAILS:
     print(f"\n{len(FAILS)} failure(s)")
     sys.exit(1)

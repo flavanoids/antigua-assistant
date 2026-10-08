@@ -58,6 +58,15 @@ def run():
     assert sc.prune_audio(d, ttl=300, cache_ttl=3600) == 1
     assert sorted(p.name for p in d.iterdir()) == ["cache_abc.wav", "fresh.wav"]
 
+    # Over the size cap, the least recently used cache files go first.
+    d = Path(tempfile.mkdtemp(prefix="antigua_prune_test_"))
+    for i, name in enumerate(("cache_old.wav", "cache_mid.wav", "cache_new.wav")):
+        (d / name).write_bytes(b"x" * 100)
+        t = time.time() - 300 + i * 100
+        os.utime(d / name, (t, t))
+    assert sc.prune_audio(d, ttl=60, cache_ttl=3600, cache_max_bytes=250) == 1
+    assert sorted(p.name for p in d.iterdir()) == ["cache_mid.wav", "cache_new.wav"]
+
     print("All server_common checks passed")
 
 
