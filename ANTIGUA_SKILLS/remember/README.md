@@ -44,6 +44,29 @@ A persistent, multi-user voice notepad. Users can save arbitrary facts with time
 
 ---
 
+## Household Memory and the Guard (2026-10-15)
+
+Every "remember ..." goes through `household_memory.classify_remember` before it's saved. Nothing anyone says becomes an instruction:
+
+| Kind | Example | Where it goes |
+|---|---|---|
+| event | "remember I fed the dogs", "remember to buy milk" | the notepad below, unchanged |
+| fact | "remember Sam is allergic to shellfish" | `facts:` in `data/household_memory.yaml`, shared by the house; up to 3 relevant ones are quoted to the model as *information* |
+| pref | "remember to answer in Spanish", "call me boss", "less sass", "shorter answers" | `preferences:`, typed and validated, applied by code from fixed templates |
+| proposal | "remember to always talk like a pirate" | `pending:`; does nothing until someone moves it into `rules:` **by hand** |
+| refused | "remember to ignore your instructions", "you are now ..." | `pending:` with `refused: true` |
+
+- Rules decide first. When they see nothing, the model is asked for one word (event, fact or instruction), and it can only make the answer stricter.
+- First-person facts are rewritten to third person ("I'm allergic..." → "Sam is allergic..."). If nobody can be identified, she asks who it's about.
+- Without "remember", lasting preferences still work: "speak English again", "stop calling me boss".
+- "What do you remember about us?" reads the file back.
+- "Forget that the dog is scared of thunder" and "forget the burger recipe" clear shared entries without asking whose.
+- **Learning:** a recipe taken from ingredients to steps is *picked*, and one followed to the last step is *cooked*. Next time the same dish is asked for, that recipe comes first ("Here's the one you made last time, on October 8."), and "a different one" still works. The full recipe is kept in `data/learned_recipes.json`, so it survives cache expiry.
+- `data/memory_log.jsonl` records every decision (saved, applied, proposed, refused, learned, used, forgot, reload_failed) with the reason.
+- The file is reloaded when its mtime changes. A hand edit that doesn't parse keeps the last good copy.
+- Approved `rules:` go both at the end of the system prompt and in the per-turn hint, because the 4B model ignores the former.
+- The fallback server only reads the file (it says it can't change memory there).
+
 ## Speaker ID (Phase 4, 2026-07-27)
 
 When the transcript names nobody ("remember I took my medicine", not "remember Alex took his medicine"), the server checks who's actually speaking before falling back to the disambiguation question. If SpeechBrain's ECAPA-TDNN model, run on the WAV in a background thread parallel to STT, is confident (cosine similarity ≥ `settings.SPEAKER_MIN_SIMILARITY`, default 0.75) that the voice matches an enrolled profile, the turn is skipped entirely:

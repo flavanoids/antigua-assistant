@@ -1,9 +1,10 @@
 """PinedaDisplay Web — the dashboard on the airplaypi kiosk screen.
 
-pineda-web runs on this box (noegpu01) and drives the kiosk's Chromium; the
-restart/reboot endpoints reach airplaypi over SSH on their own (see
-PinedaDisplay_Web docs/OPERATIONS.md#split-host-control). Plain HTTP, no
-auth: pineda-web's admin endpoints are open on the LAN.
+pineda-web runs on this box (primary-server) and drives the kiosk's Chromium; the
+restart/reboot tools reach airplaypi over SSH on their own (see
+PinedaDisplay_Web docs/OPERATIONS.md#split-host-control). Antigua talks to it
+over MCP (pineda-web's /mcp, a bearer token per client) — never its open
+REST API.
 
 Also: the reply formatters for the display route (pure, tested offline), the
 timer mirror that shows Antigua's running timers in the display's
@@ -15,12 +16,14 @@ import logging
 import queue
 import random
 import re
+import time
 import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, Thread
+from typing import Any
+from urllib.parse import urlsplit
 
-import requests
 
 log = logging.getLogger("antigua_core")
 
@@ -32,107 +35,218 @@ class PinedaError(RuntimeError):
 
 
 class PinedaClient:
-    def __init__(self, url: str, profile: str = "default", device: str | None = None,
-                 timeout: float = 3.0):
-        self.url = url.rstrip("/")
-        self.profile = profile
-        self.device = device
-        self.timeout = timeout
+    """pineda-web's display, cameras and full-screen cards, through its MCP
+    server (/mcp, docs/MCP.md in PinedaDisplay_Web): `mcp` is an
+    HttpMcpServer. Every call is a tool call, logged with the turn that
+    made it (mcp_client.ToolLog)."""
 
-    def _call(self, method: str, path: str, **kw):
-        try:
-            resp = requests.request(method, self.url + path, timeout=self.timeout, **kw)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            raise PinedaError(f"{method} {path}: {e}") from e
-        return resp.json() if resp.content else None
+    def __init__(self, mcp, device: str | None = None):
+        self.mcp = mcp
+        self.device = device
+
+    @property
+    def url(self) -> str:
+        return self.mcp.urls[0]
+
+    def _tool(self, tool: str, /, **args):
+        r = self.mcp.call(tool, args)
+        if not r.ok:
+            raise PinedaError(f"{tool}: {r.text or 'failed'}")
+        return r.value()
+
+    def status(self) -> dict:
+        """theme, theme_label, clock_mode, screens, takeover (a summary or
+        None), camera_streaming."""
+        return self._tool("display_status")
 
     def themes(self) -> list[dict]:
-        return self._call("GET", "/api/themes")["themes"]
-
-    def current_theme(self) -> str:
-        """The kiosk profile's theme — it overrides the server-wide one."""
-        for p in self._call("GET", "/api/profiles"):
-            if p["id"] == self.profile:
-                return p.get("theme") or self._call("GET", "/api/themes")["current"]
-        raise PinedaError(f"no profile {self.profile!r}")
+        """[{name, label}] — the ones you'd pick by name (no night twins)."""
+        return self._tool("themes_list")
 
     def set_theme(self, name: str) -> None:
-        # The profile, not POST /api/themes/apply: a profile's own theme wins
-        # over the server-wide one, and this one is saved across restarts.
-        self._call("PATCH", f"/api/profiles/{self.profile}", json={"theme": name})
+        self._tool("theme_set", name=name)
 
     def restart_display(self) -> None:
-        self._call("POST", "/api/control/restart-display")
+        self._tool("display_restart")
 
     def reboot(self) -> None:
-        self._call("POST", "/api/control/restart-system")
+        self._tool("display_reboot", confirm=True)
 
     def now_showing(self) -> dict:
-        params = {"device_id": self.device} if self.device else None
-        return self._call("GET", "/api/now-showing", params=params)
+        return self._tool("now_showing", device_id=self.device)
 
     def sync_timers(self, timers: list[dict]) -> None:
-        self._call("PUT", f"/api/timers/sync/{TIMER_SOURCE}", json={"timers": timers})
+        self._tool("timers_sync", source=TIMER_SOURCE, timers=timers)
 
     def show_takeover(self, card: dict, seconds: float) -> None:
         """A full-screen card on every screen until `seconds` pass or
         clear_takeover(); a new one replaces the old."""
-        self._call("PUT", "/api/takeover", json={"card": card, "seconds": seconds})
+        self._tool("takeover_show", card=card, seconds=seconds)
 
     def update_takeover(self, change: dict) -> None:
         """Change what's being read (LIVE_FIELDS) on the card that's up; does nothing
         (and never re-shows it) when none is."""
-        self._call("PATCH", "/api/takeover", json=change)
+        self._tool("takeover_update", change=change)
 
     def takeover(self) -> dict | None:
         """The full-screen card that's up ({card, shown_at, expires_at}), or None."""
-        return self._call("GET", "/api/takeover")
+        return self._tool("takeover_get")
 
     def takeover_up(self) -> bool:
-        return self.takeover() is not None
+        return self.status()["takeover"] is not None
 
     def clear_takeover(self) -> None:
-        self._call("DELETE", "/api/takeover")
+        self._tool("takeover_clear")
+
+    def show_image_collage(self, query: str, images: list[dict], seconds: float = 120) -> None:
+        """Put up a full-screen image search collage on the kiosk display."""
+        card = {
+            "kind": "image_search",
+            "query": query,
+            "images": images,
+            "highlight": None,
+        }
+        self.show_takeover(card, seconds)
+
+    def highlight_image(self, identifier: str) -> None:
+        """Highlight an image ('A', 'B', '1', '2'...) on the active collage."""
+        self.update_takeover({"highlight": identifier.upper()})
+
+    def hold_clock(self, on: bool) -> int:
+        """Clock only on the live screens (the Clock only style each screen
+        has picked: plain or photos), or back to the dashboard. How many
+        screens changed; 0 when they were all that way already."""
+        return self._tool("clock_mode", on=on)["changed"]
+
+    # ── cameras: pineda-web starts and stops the livestream with the card ──
+
+    def show_camera(self, name: str, seconds: float, pip: str | None = None) -> dict:
+        """The camera full screen for `seconds`; over a recipe, the recipe
+        comes back after. The camera that's already up gets more time."""
+        params: dict[str, Any] = {"camera": name, "seconds": seconds}
+        if pip is not None:
+            params["pip"] = pip
+        return self._tool("camera_show", **params)
+
+    def stop_camera(self, name: str | None = None) -> bool:
+        return self._tool("camera_stop", camera=name)["stopped"]
+
+    def caption_camera(self, text: str) -> None:
+        self._tool("camera_caption", text=text)
+
+
+def connect(*urls: str, token_file: str | None = None, device: str | None = None) -> PinedaClient:
+    """A client for the pineda-web(s) at `urls` (http://host:8090), tried in
+    order; the token from `token_file` (PINEDA_MCP_TOKEN=..., root-only)."""
+    from .mcp_client import HttpMcpServer, read_env_file
+
+    token = read_env_file(Path(token_file)).get("PINEDA_MCP_TOKEN") if token_file else None
+    if not token:
+        log.warning("Pineda: no MCP token (%s): the display will refuse every call", token_file)
+    urls = [u for u in urls if u]
+    hosts = ",".join(urlsplit(u).hostname or u for u in urls)
+    return PinedaClient(HttpMcpServer(f"pineda@{hosts}", [f"{u.rstrip('/')}/mcp/" for u in urls],
+                                      token, timeout=5), device=device)
 
 
 # ── timers → the mini card ───────────────────────────────────────────────────
 
 
 def timers_payload(active: list[dict]) -> list[dict]:
-    """TimerManager.list_active() → pineda-web's sync body. Running timers
-    only: alarms and reminders are clock times, and a paused timer has no
-    fires_at to count down to (it reappears on resume)."""
-    return [
-        {
+    """TimerManager.list_active() → pineda-web's sync body: running timers,
+    and alarms and reminders (the display shows when those go off, and takes
+    over the screen when they do). A paused timer has no fires_at to count
+    down to (it reappears on resume); switched-off alarms aren't in
+    list_active at all."""
+    out = []
+    for e in active:
+        kind = e.get("kind", "timer")
+        if e.get("paused"):
+            continue
+        if kind == "alarm":
+            label = e.get("name") or "Alarm"
+        elif kind == "reminder":
+            label = e.get("message") or "Reminder"
+        else:
+            label = e.get("name") or e["label"]
+        out.append({
             "id": e["id"],
-            "label": e.get("name") or e["label"],
+            "label": label,
+            "kind": kind,
             "fires_at": datetime.fromtimestamp(e["fires_at"], timezone.utc).isoformat(),
-        }
-        for e in active
-        if e.get("kind", "timer") == "timer" and not e.get("paused")
-    ]
+        })
+    return out
 
 
 class TimerMirror:
-    """Pushes the whole running-timer list to pineda-web after every change.
-    Each push reads the list fresh under one lock, so however pushes
-    interleave, the last one to land carries the latest state."""
+    """Pushes the whole running-timer list to pineda-web after every change —
+    to each of `clients`: this box's pineda-web and the other box's, so
+    whichever one the kiosk is on shows them. Each push reads the list fresh
+    under one lock, so however pushes interleave, the last one to land
+    carries the latest state. `in_charge` gates it: the fallback pushes only
+    while it's standing in, so it never clobbers the primary's list."""
 
-    def __init__(self, client: PinedaClient, list_active):
-        self._client = client
+    # A pineda-web that failed is skipped for a while, then tried again. The
+    # wait grows: a restart is back within seconds (a flat 5 minutes hid timers
+    # set just after a deploy), a box that's off stays quiet (with the standby
+    # off, every push timed out and logged twice a minute, ~2,900 lines a day).
+    BACKOFF_S = (5, 30, 300)
+    # keep_fresh re-sends an unchanged list this often. pineda-web keeps timers
+    # in memory, so one that restarted lost them, which only matters while some
+    # are running; an empty list just gets a slow heartbeat (an unconditional
+    # minutely re-send was ~93% of the tool log).
+    RESEND_S = 60
+    RESEND_EMPTY_S = 300
+
+    def __init__(self, clients, list_active, in_charge=lambda: True, clock=time.monotonic):
+        self._clients = clients if isinstance(clients, (list, tuple)) else [clients]
         self._list_active = list_active
+        self._in_charge = in_charge
         self._lock = Lock()
+        self._clock = clock
+        self._down_until = {}   # client index -> when to try it again
+        self._fails = {}        # client index -> failures in a row
+        self._sent = {}         # client index -> (body, when) of the last push that landed
 
     def push(self) -> None:
-        Thread(target=self._push, daemon=True, name="pineda-timers").start()
+        if self._in_charge():
+            Thread(target=self._push, daemon=True, name="pineda-timers").start()
 
-    def _push(self) -> None:
+    def keep_fresh(self, every_s: float = 5) -> None:
+        """Check often, send rarely: retries a failed pineda-web once its
+        backoff ends, and re-sends what a restarted one forgot (RESEND_S)."""
+        def loop():
+            while True:
+                time.sleep(every_s)
+                if self._in_charge():
+                    self._push(force=False)
+        Thread(target=loop, daemon=True, name="pineda-timers-fresh").start()
+
+    def _push(self, force: bool = True) -> None:
         with self._lock:
-            try:
-                self._client.sync_timers(timers_payload(self._list_active()))
-            except PinedaError as e:
-                log.warning("Pineda: timer sync failed: %s", e)
+            body = timers_payload(self._list_active())
+            for i, client in enumerate(self._clients):
+                now = self._clock()
+                if now < self._down_until.get(i, 0):
+                    continue
+                last = self._sent.get(i)
+                if (not force and last and last[0] == body
+                        and now - last[1] < (self.RESEND_S if body else self.RESEND_EMPTY_S)):
+                    continue
+                try:
+                    client.sync_timers(body)
+                except PinedaError as e:
+                    fails = self._fails.get(i, 0)
+                    if not fails:
+                        log.warning("Pineda: timer sync to %s failed, backing off: %s", client.url, e)
+                    self._fails[i] = fails + 1
+                    self._down_until[i] = now + self.BACKOFF_S[min(fails, len(self.BACKOFF_S) - 1)]
+                    self._sent.pop(i, None)
+                    continue
+                self._sent[i] = (body, now)
+                self._down_until.pop(i, None)
+                if self._fails.pop(i, None) is not None:
+                    log.info("Pineda: timer sync to %s works again", client.url)
 
 
 # ── recipes → a full-screen card ────────────────────────────────────────────
@@ -346,17 +460,6 @@ def spoken_list(items: list[str]) -> str:
     if len(items) <= 2:
         return " and ".join(items)
     return ", ".join(items[:-1]) + ", and " + items[-1]
-
-
-def theme_label(themes: list[dict], name: str) -> str:
-    """A theme's label, a night twin by its day theme's ("Ocean, night")."""
-    for t in themes:
-        if t["name"] == name:
-            return t["label"]
-    for t in themes:
-        if t.get("night") == name:
-            return f"{t['label']}, night"
-    return name.replace("_", " ")
 
 
 # ── what's on screen ─────────────────────────────────────────────────────────

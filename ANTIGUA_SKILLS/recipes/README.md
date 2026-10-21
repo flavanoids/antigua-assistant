@@ -4,7 +4,6 @@
 **Pipeline stage:** Bypass, with one grounded exception: free-form questions
 are answered by the LLM from the recipe's own text, and every number it says
 is checked against the recipe in code.
-**Plan:** [`docs/recipe_skill_plan.md`](../../docs/recipe_skill_plan.md)
 
 ---
 
@@ -60,9 +59,9 @@ couldn't find one online. If you don't like a recipe, ask for another.
    it's done?" / "what's it supposed to look like?" reads the current step's
    doneness cue (until golden, jiggles, toothpick, springs back…) or the
    nearest step that has one.
-6. **Free-form questions** (`docs/recipe_questions_and_scaling_plan.md` §1):
-   "can I use a hand mixer?", "why a water bath?", "can I make this the day
-   before?" go to the LLM grounded in `question_context()` — the recipe
+6. **Free-form questions**: "can I use a hand mixer?", "why a water bath?",
+   "can I make this the day before?" go to the LLM grounded in
+   `question_context()` — the recipe
    (scaled, swaps and left-outs noted), the equipment, the steps, the current
    step and a scale note — capped at `recipes.qa_max_tokens` (110). The hook
    only claims turns that name an ingredient or tool in the recipe, use
@@ -83,7 +82,7 @@ couldn't find one online. If you don't like a recipe, ask for another.
    With no recipe open, the same question gets the table's general answer,
    falling back to the web search only when the table has nothing. Synonyms
    (broth/stock, scallion/green onion, …) live in `recipe_subs._ALIASES`.
-8. **Scaling** (docs/recipe_questions_and_scaling_plan.md §2): "<dish> for
+8. **Scaling**: "<dish> for
    4 people" scales the recipe from its first sentence, and mid-recipe "make
    it for 4", "double it", "halve it", "back to the original" rescale it.
    Pure arithmetic on the published amounts: fractions snap to eighths and
@@ -154,4 +153,4 @@ answers that recipes need the main server.
 - "One at a time" reads the ingredients one by one ("got it" / "I don't have it"),
   then works through the missing ones.
 - Not built yet: display on PinedaDisplay, Spanish. The free-form Q&A
-  (Phase B) is coded on `development` but not yet deployed to noegpu01.
+  (Phase B) is coded on `development` but not yet deployed to primary-server.

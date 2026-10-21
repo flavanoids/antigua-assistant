@@ -1,0 +1,12 @@
+# misaki G2P for the Kokoro TTS server: Kokoro's own English phonemizer
+# (dictionary + POS-aware stress) instead of espeak. spaCy has no Python 3.14
+# build yet, so this goes in its own Python 3.13 venv (venv-tts):
+#   uv venv -p 3.13 venv-tts && VIRTUAL_ENV=$PWD/venv-tts uv pip install -r server/requirements-tts-g2p.txt
+# Not `misaki[en]`: that extra pulls spacy-curated-transformers and PyTorch
+# (~5 GB) for the trf model, which we don't use. Without these packages the
+# server falls back to espeak.
+-r requirements-tts.txt
+misaki~=0.9.4
+spacy~=3.8.16
+num2words~=0.5.14
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl

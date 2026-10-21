@@ -33,7 +33,7 @@ ssh "$HOST" "mkdir -p $DEST/server/config $DEST/server/mcp $DEST/kitchen-mic/bri
 rsync -az --delete --exclude __pycache__ "$REPO/server/antigua_core/" "$HOST:$DEST/server/antigua_core/"
 rsync -az --delete "$REPO/server/static_audio/" "$HOST:$DEST/server/static_audio/"
 rsync -az "$REPO/server/antigua_fallback_server.py" "$HOST:$DEST/server/"
-rsync -az "$REPO/server/config/server.yaml" "$REPO/server/config/system_prompt.txt" "$HOST:$DEST/server/config/"
+rsync -az --chmod=F600 "$REPO/server/config/server.yaml" "$REPO/server/config/system_prompt.txt" "$HOST:$DEST/server/config/"
 # MCP servers: pinned venv built on the box; secrets (GOVEE_API_KEY) copied
 # from this machine's untracked mcp.env so the fallback can take over lights.
 rsync -az "$REPO/server/mcp/requirements.txt" "$REPO/server/mcp/requirements-atv.txt" \
@@ -58,6 +58,9 @@ fi
 rsync -az "$REPO/kitchen-mic/bridge/kitchen_bridge.py" "$REPO/kitchen-mic/bridge/requirements.txt" \
     "$HOST:$DEST/kitchen-mic/bridge/"
 rsync -az --ignore-existing "$REPO/data/memories.json" "$REPO/data/lists.json" "$HOST:$DEST/data/" 2>/dev/null || true
+# The primary owns the household file (the fallback only reads it), so it's
+# always overwritten; the 5-minute cron keeps it current between deploys.
+rsync -az "$REPO/data/household_memory.yaml" "$HOST:$DEST/data/" 2>/dev/null || true
 # The offline cookbook (recipe.Cookbook): popular recipes stored on the
 # primary, so recipes still work here during an outage, web or no web.
 rsync -az "$REPO/data/cookbook/" "$HOST:$DEST/data/cookbook/" 2>/dev/null || true
@@ -81,11 +84,18 @@ print(yaml.safe_dump(cfg, sort_keys=False), end="")
 PY
 
 # venvs (first run only; delete one to rebuild it)
-ssh "$HOST" "[ -x $DEST/venv/bin/python3 ] || { python3 -m venv $DEST/venv && \
-    $DEST/venv/bin/pip install -q faster-whisper feedparser num2words paho-mqtt requests PyYAML; }"
+# Dependencies on every deploy, not only when the venv is new: a package
+# added on the primary (websocket-client, ...) never reached an existing venv.
+# The freeze taken first is the rollback: pip install -r <that file>.
+STAMP=$(date +%Y%m%d-%H%M%S)
+rsync -az "$REPO/server/requirements.txt" "$HOST:$DEST/server/"
+ssh "$HOST" "[ -x $DEST/venv/bin/python3 ] || python3 -m venv $DEST/venv; \
+    $DEST/venv/bin/pip freeze > $DEST/venv-freeze-$STAMP.txt && \
+    $DEST/venv/bin/pip install -q -r $DEST/server/requirements.txt"
 ssh "$HOST" "$DEST/venv/bin/python3 -c 'from faster_whisper import WhisperModel; WhisperModel(\"tiny\", device=\"cpu\", compute_type=\"int8\")'"
-ssh "$HOST" "[ -x $DEST/kitchen-mic/bridge/venv/bin/python3 ] || { python3 -m venv $DEST/kitchen-mic/bridge/venv && \
-    $DEST/kitchen-mic/bridge/venv/bin/pip install -q -r $DEST/kitchen-mic/bridge/requirements.txt; }"
+ssh "$HOST" "[ -x $DEST/kitchen-mic/bridge/venv/bin/python3 ] || python3 -m venv $DEST/kitchen-mic/bridge/venv; \
+    $DEST/kitchen-mic/bridge/venv/bin/pip freeze > $DEST/bridge-venv-freeze-$STAMP.txt && \
+    $DEST/kitchen-mic/bridge/venv/bin/pip install -q -r $DEST/kitchen-mic/bridge/requirements.txt"
 # openWakeWord's models aren't in the wheel; copy the ones this box already has.
 OWW=$("$REPO/kitchen-mic/bridge/venv/bin/python3" -c 'import openwakeword, os; print(os.path.dirname(openwakeword.__file__))')
 RDIR=$(ssh "$HOST" "$DEST/kitchen-mic/bridge/venv/bin/python3 -c 'import openwakeword, os; print(os.path.dirname(openwakeword.__file__))'")
@@ -99,6 +109,14 @@ rsync -az "$REPO/searxng/docker-compose.yml" "$HOST:$DEST/searxng/"
 rsync -az --chmod=F600 "$REPO/searxng/searxng/settings.yml" "$HOST:$DEST/searxng/searxng/"
 ssh "$HOST" "cd $DEST/searxng && docker compose up -d"
 
+# Same systemd sandbox as the primary's services (server/30-hardening.conf),
+# in place before anything below restarts. Still root.
+for unit in antigua-fallback kitchen-bridge-standby antigua-tts; do
+    ssh "$HOST" "mkdir -p /etc/systemd/system/$unit.service.d && \
+        cat > /etc/systemd/system/$unit.service.d/30-hardening.conf" < "$REPO/server/30-hardening.conf"
+done
+ssh "$HOST" "systemctl daemon-reload"
+
 # Backup Kokoro TTS (antigua-tts.service, :5500) runs the primary's server script.
 rsync -az "$REPO/server/kokoro_tts_server_flask.py" "$HOST:$TTS_DIR/tts_server.py"
 ssh "$HOST" "systemctl restart antigua-tts"
@@ -108,8 +126,24 @@ for unit in server/antigua-fallback.service kitchen-mic/bridge/kitchen-bridge-st
         kitchen-mic/bridge/captures-prune.service kitchen-mic/bridge/captures-prune.timer; do
     $RENDER "$REPO/$unit" | ssh "$HOST" "cat > /etc/systemd/system/$(basename "$unit")"
 done
+# What it hears and says stays private, like on the primary: captures,
+# replies, transcripts in logs and data/.
+ssh "$HOST" "mkdir -p $DEST/audio_out $DEST/kitchen-mic/bridge/captures && \
+    chmod -R go-rwx $DEST/data $DEST/logs $DEST/audio_out $DEST/kitchen-mic/bridge/captures && \
+    chmod 700 $DEST/server/config && chmod 600 $DEST/kitchen-mic/bridge/config.yaml*"
 # 7-day retention for what the standby bridge hears: captures and logs.
 $RENDER "$REPO/server/antigua.logrotate" | ssh "$HOST" "cat > /etc/logrotate.d/antigua-fallback"
 ssh "$HOST" "systemctl daemon-reload && systemctl enable -q --now captures-prune.timer && \
     systemctl enable -q antigua-fallback kitchen-bridge-standby && \
     systemctl restart antigua-fallback kitchen-bridge-standby && systemctl is-active antigua-fallback kitchen-bridge-standby"
+
+# Smoke test: the fallback answers /health (idle is fine) and the standby
+# bridge is running. A failure here means roll back: the venv freezes above
+# and the previous antigua_core (git checkout <tag> && rerun this script).
+for _ in $(seq 1 30); do
+    ssh "$HOST" "curl -sf -o /dev/null http://127.0.0.1:9394/health" && break
+    sleep 2
+done
+ssh "$HOST" "curl -sf http://127.0.0.1:9394/health >/dev/null && systemctl is-active -q kitchen-bridge-standby" \
+    && echo "smoke test: fallback healthy, standby bridge running" \
+    || { echo "smoke test FAILED — see journalctl -u antigua-fallback on $HOST" >&2; exit 1; }

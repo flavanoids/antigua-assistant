@@ -119,7 +119,7 @@ messages.append({"role": "user", "content": f"{transcript} /no_think"})
 | History store | `ConversationStore` class (~line 561, `server/antigua_server.py`) |
 | Get/create session | `ConversationStore.get_or_create(conv_id)` |
 | Add turn | `ConversationStore.add_message(conv_id, role, content)` |
-| History injection | `ask_llm()` (~line 653) — builds message array |
+| History injection | `ask_llm_stream()` in `antigua_server.py` — builds message array |
 | ID generation | `run_pipeline()` — `os.urandom(8).hex()` on first turn |
 | ID header | `send_to_server()` in satellite — `X-Conversation-ID` header |
 | Follow-up window | Satellite `main()` — dual-armed detector + `verify_speech` loop |

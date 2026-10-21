@@ -57,6 +57,7 @@ class Place:
     label: str = ""          # how a reply names it; set by resolve()
     private: bool = False    # favorites/home: coordinates rounded before they leave the house
     note: str = ""           # said before the answer ("I couldn't find a Target on 43rd...")
+    osm: str = ""            # "node/123" — the store-hours skill reads its opening_hours
 
 
 @dataclass
@@ -206,7 +207,12 @@ def _feature_to_place(f: dict) -> Place:
     return Place(p.get("name") or "", lat, lon, kind=kind, street=p.get("street") or "",
                  housenumber=p.get("housenumber") or "", district=district,
                  locality=p.get("locality") or "", city=p.get("city") or "",
-                 osm_value=p.get("osm_value") or "")
+                 osm_value=p.get("osm_value") or "",
+                 osm=(f"{_OSM_TYPES.get(p.get('osm_type'), '')}/{p['osm_id']}"
+                      if p.get("osm_type") in _OSM_TYPES and p.get("osm_id") else ""))
+
+
+_OSM_TYPES = {"N": "node", "W": "way", "R": "relation"}
 
 
 def _km(a: Place, b: Place) -> float:

@@ -272,6 +272,12 @@ def _strip_self_id(text):
 _EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\u200D\uFE0F]+")
 
 
+def _collapse_dots(text):
+    """"..." → "…", which Kokoro voices as a trailing hesitation; a stray
+    double period ("etc..") → one."""
+    return re.sub(r"\.\.+", ".", re.sub(r"\.{3,}", "…", text))
+
+
 def _strip_markdown(text):
     text = _EMOJI_RE.sub("", text)
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
@@ -370,7 +376,7 @@ def _clean_spanish(text):
                               + " ".join(_es_num(int(d)) for d in m.group(2)), text)
     text = _ES_FIRST_RE.sub("primero de ", text)
     text = _ES_ONE_NOUN_RE.sub(_es_one_noun, text)
-    return re.sub(r"\s{2,}", " ", re.sub(r"\.\.+", ".", text)).strip()
+    return re.sub(r"\s{2,}", " ", _collapse_dots(text)).strip()
 
 
 def clean_for_tts(text, lang="en"):
@@ -381,7 +387,7 @@ def clean_for_tts(text, lang="en"):
     if lang == "es":
         return _clean_spanish(text)
     if lang != "en":
-        return re.sub(r"\.\.+", ".", _strip_markdown(text)).strip()
+        return _collapse_dots(_strip_markdown(text)).strip()
     # Strip LLM filler openers
     text = _strip_filler(text)
     # Strip inline self-identification phrases
@@ -408,6 +414,5 @@ def clean_for_tts(text, lang="en"):
         return f"{dollars} dollars and {num2words(int(m.group(2)))} cents"
     text = _CURRENCY_CENTS_RE.sub(_cents_sub, text)
     text = _normalize_numbers(text)
-    # Collapse stray period runs ("etc.." etc.).
-    text = re.sub(r"\.\.+", ".", text)
+    text = _collapse_dots(text)
     return text.strip()

@@ -19,9 +19,9 @@ and plays it through the Pi speakers — confirmed working end to end
 audio stream silently going stale, mirroring the Pi's old MicStream watchdog.
 
 Follow-up/multi-turn mode: after a response, a short window opens where
-plain speech (no wake word needed) or the wake word continues the same
-conversation_id — mirrors antigua_satellite.py's pre-retirement follow-up
-logic. The tricky part is that this bridge doesn't play audio itself (the
+the wake word continues the same conversation_id. Plain speech opens a turn
+only when the reply asked a question, a recipe is open, or chat mode is on
+(see FOLLOW_UP_SPEECH_TRIGGER and expects_reply below). The tricky part is that this bridge doesn't play audio itself (the
 Pi does, over MQTT antigua/play), so it has no direct signal for when
 playback actually finishes. It subscribes to MQTT antigua/done — republished
 by antigua_satellite.py's play-queue worker once a response's audio has
@@ -86,7 +86,7 @@ WAKE_WORD_CONFIRM_FRAMES = 3
 # No energy gate (removed 2026-10-01): it skipped frames under RMS 150, so in
 # a quiet room openWakeWord saw "Alexa" with holes in it and every quiet frame
 # reset the confirm count — a replayed "Alexa" + pause at moderate volume
-# never fired. It was a Pi CPU saver; on noegpu01 a frame costs ~1.5ms.
+# never fired. It was a Pi CPU saver; on primary-server a frame costs ~1.5ms.
 # Near-misses (2026-10-01): a score burst that peaks at NEAR_MISS_SCORE or
 # more without waking is logged and its audio saved, so misses can be tuned
 # from data — before this a missed "Alexa" left no trace at all.
@@ -125,7 +125,10 @@ FALLBACK_LOUD_RMS = 300
 FALLBACK_MIN_LOUD_S = 0.6  # after the preroll; the ~0.6s wake cue decays well under this at the mic
 
 WATCHDOG_CHECK_S = 5     # how often to check for a stalled stream
-WATCHDOG_STALL_S = 30    # no audio at all for this long -> force reconnect
+# No audio at all for this long -> force reconnect. 15s (30 until 2026-10-15):
+# gaps that recovered on their own peaked at 8.4s over a week of logs, real
+# stalls ran 30s+, and every second here is a second the kitchen is deaf.
+WATCHDOG_STALL_S = 15
 # Mic stream gaps (2026-10-01): wakes sometimes feel 1-2s late though the
 # detector fires ~50ms after the word. A gap this long between audio packets
 # means the reSpeaker's stream stalled or bunched up on Wi-Fi.
@@ -133,6 +136,13 @@ AUDIO_GAP_WARN_S = 0.3
 AUDIO_GAP_LOG_EVERY_S = 10
 
 SERVER_URL = "http://localhost:9393/pipeline"
+# (connect, read). The connect timeout is what matters when a server is down:
+# the backup's wg0 address blackholes rather than refusing while that box is
+# off, and a bare timeout=60 (until 2026-10-15) left the mic muted and the LED
+# "thinking" for a full minute per turn. The read timeout must stay above the
+# server's own worst case (its LLM first-sentence deadline), or the server
+# speaks a reply after the bridge has given up on the turn.
+POST_TIMEOUT = (2, 60)
 
 # Standby mode (config standby_for_host): probe that host's sshd, not
 # antigua-server — a host that is up keeps its own bridge, which fails over
@@ -268,6 +278,11 @@ class KitchenBridge:
         # speech that wasn't for her), so it doesn't just quietly stop.
         self.chat_end_cue_url = cfg.get("chat_end_cue_url") or (
             self.wake_cue_url.replace("wake_cue.wav", "chat_end.wav") if self.wake_cue_url else "")
+        # "Sorry, I can't reach my server right now": a turn that failed
+        # outright (no server answered, or it errored). The satellite keeps
+        # cues on disk, so this still plays with antigua-server down.
+        self.trouble_cue_url = cfg.get("trouble_cue_url") or (
+            self.wake_cue_url.replace("wake_cue.wav", "trouble.wav") if self.wake_cue_url else "")
         self.server_url = cfg.get("server_url", SERVER_URL)
         self.fallback_server_url = cfg.get("fallback_server_url", "")
         self.standby_for_host = cfg.get("standby_for_host", "")
@@ -385,6 +400,11 @@ class KitchenBridge:
         how = ("chatting, no wake word needed" if self._chat
                else "answer, no wake word needed" if self._speech_window else "wake word")
         log.info(f"=== FOLLOW-UP WINDOW OPEN ({timeout}s, {how}) ===")
+        if not (self._chat or self._speech_window):
+            # Only the wake word can open the next turn, and it ducks again
+            # itself — so restore the music now, not 8s later ("Playing X"
+            # then a near-silent wait read as "it's not playing").
+            self._publish_listening(False)
         self._led(LED_CHAT if self._chat else LED_ANSWER if self._speech_window else LED_FOLLOWUP)
 
     def _end_conversation(self):
@@ -836,7 +856,7 @@ class KitchenBridge:
             audio = wav_path.read_bytes()
             try:
                 resp = await asyncio.to_thread(
-                    requests.post, self.server_url, data=audio, headers=headers, timeout=60,
+                    requests.post, self.server_url, data=audio, headers=headers, timeout=POST_TIMEOUT,
                 )
             except requests.ConnectionError:
                 # Refused/unreachable only — a read timeout may already have
@@ -845,7 +865,8 @@ class KitchenBridge:
                     raise
                 log.warning(f"{self.server_url} unreachable — sending turn to fallback")
                 resp = await asyncio.to_thread(
-                    requests.post, self.fallback_server_url, data=audio, headers=headers, timeout=60,
+                    requests.post, self.fallback_server_url, data=audio, headers=headers,
+                    timeout=POST_TIMEOUT,
                 )
             resp.raise_for_status()
             result = resp.json()
@@ -919,6 +940,8 @@ class KitchenBridge:
                 self._playing = False
             self._end_conversation()
             self._led(LED_ERROR)
+            # Silence read as "she ignored me"; say the turn was lost.
+            self._cue(self.trouble_cue_url)
 
     async def _start_va(self):
         start_va = self._services.get("start_va")

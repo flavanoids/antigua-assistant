@@ -204,7 +204,9 @@ fact. If you edit the persona, keep that section.
 
 ## SearXNG deployment
 
-Docker Compose at `searxng/docker-compose.yml`, bound to `127.0.0.1:8080`.
+Docker Compose at `searxng/docker-compose.yml`, bound to `127.0.0.1:8080`. The
+image is pinned to a dated build, not `latest`; see
+[deployment.md](../../docs/deployment.md) step 6 for bumping it.
 Config at `searxng/searxng/settings.yml` (git-ignored): copy `settings.yml.example` and set `server.secret_key` (`openssl rand -hex 32`).
 
 ```bash

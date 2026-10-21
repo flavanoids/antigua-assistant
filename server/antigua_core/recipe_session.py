@@ -207,7 +207,7 @@ class CookSession:
     def _line_name(self, i: int) -> str:
         return core_name(self.recipe.ingredients[i])
 
-    # ── scaling (§2 of docs/recipe_questions_and_scaling_plan.md) ────────
+    # ── scaling: pure arithmetic on the published amounts ────────────────
 
     def line(self, i: int) -> str:
         """Ingredient line i at the session's size."""
@@ -1004,7 +1004,7 @@ def clear() -> None:
     save(None)
 
 
-def start(dish: str, recipes: list, servings: int = 0) -> tuple:
+def start(dish: str, recipes: list, servings: int = 0, lead: str = "") -> tuple:
     """A new session on the best of `recipes`; returns (session, intro).
     `servings` is the "for 4 people" of the request, or the target carried
     over from the recipe before it (Decision 3)."""
@@ -1013,7 +1013,7 @@ def start(dish: str, recipes: list, servings: int = 0) -> tuple:
         servings = prev.target_servings
     s = CookSession(dish, recipes)
     note = s.set_servings(servings) if servings else ""
-    intro = s.intro() + (f" {note}" if note else "")
+    intro = s.intro(lead) + (f" {note}" if note else "")
     save(s)
     return s, intro
 

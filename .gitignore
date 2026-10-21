@@ -6,6 +6,7 @@ __pycache__/
 .venv/
 venv/
 venv-py312/
+venv-tts/
 
 # AI coding assistant files
 CLAUDE.md
@@ -47,6 +48,7 @@ server/config/system_prompt.txt
 config/satellite.yaml
 .env
 *.secret
+*.bak*
 server/config/mcp.env
 server/config/pyatv.conf
 # Home + favorite addresses for the commute skill (places.example.yaml is the template)
@@ -91,3 +93,5 @@ network/hosts.conf
 .githooks/private-patterns
 searxng/searxng/settings.yml
 server/config/places.yaml
+.stfolder/
+.stignore

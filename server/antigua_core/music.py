@@ -249,6 +249,10 @@ class MusicControl:
         self._sleep: Timer | None = None      # "stop the music in 30 minutes"
         self._sleep_at = 0.0
         self.play_in_background = True        # tests turn this off
+        # progress(dict) → the kitchen display's "loading" card (airplaypi/loading);
+        # the server wires it to MQTT. Only plays on the default speaker report.
+        self.progress = lambda p: None
+        self._loading_shown = False           # this request has told the display something
         self._played_path = settings.DATA_DIR / "music_played.json"
         try:
             self._played: set[str] = set(json.loads(self._played_path.read_text()))
@@ -755,20 +759,59 @@ class MusicControl:
         option = self._option
         if option != "replace":              # queued behind what's playing: no radio tail, no reshuffle
             radio = shuffle = False
-        args = dict(queue_id=pid, media=uris, option=option, radio_mode=radio, shuffle=shuffle)
+        # A song's radio tail is an Apple "Endless Mix" MA builds before it
+        # starts anything: 6s → 35s to first sound when Apple rate-limits. So
+        # start the song alone and append the mix once it's playing.
+        seed = media["uri"] if radio and isinstance(media, dict) else None
+        args = dict(queue_id=pid, media=uris, option=option, radio_mode=radio and not seed, shuffle=shuffle)
+        if option == "replace":
+            first = media[0] if isinstance(media, list) and media else media
+            self._loading("starting", player, title=first.get("name") or first.get("label") or "",
+                          artist=_artists(first))
         if self.play_in_background:
-            Thread(target=self._send_play, args=(args,), daemon=True, name="music-play").start()
+            Thread(target=self._send_play, args=(args, seed, player), daemon=True, name="music-play").start()
         else:
             self.ma.cmd("player_queues/play_media", **args)
+            if seed:
+                self._add_radio(pid, seed)
         self._active = player
         for m in media if isinstance(media, list) else [media]:
             self._learn(m.get("name"), *(a.get("name") for a in m.get("artists") or []))
 
-    def _send_play(self, args: dict):
+    def _send_play(self, args: dict, seed: str | None = None, player: str = ""):
         try:
             self.ma.cmd("player_queues/play_media", timeout=30, **args)
         except MusicError as e:
             log.warning("Music: play_media failed: %s", e)
+            self._loading("failed", player, text="Apple Music is being slow right now. "
+                          "It may still start in a moment; if not, ask me again.")
+            return
+        self._loading("done", player)
+        if seed:
+            self._add_radio(args["queue_id"], seed)
+
+    def _add_radio(self, pid: str, seed: str):
+        try:
+            self.ma.cmd("player_queues/play_media", queue_id=pid, option="add",
+                        media=f"radio_playlist://playlist/{seed}", timeout=90)
+        except MusicError as e:
+            log.warning("Music: radio tail failed: %s", e)
+
+    def _loading(self, stage: str, player: str | None = None, **info):
+        """Tell the kitchen display how a play on its speaker is going:
+        finding → starting → done | failed (see PinedaDisplay_Web's NOW_PLAYING.md)."""
+        if (player or self.default_player) != self.default_player and not self._everywhere_now:
+            return
+        if stage in ("done", "failed", "cancel"):
+            if not self._loading_shown:
+                return
+            self._loading_shown = False
+        else:
+            self._loading_shown = True
+        try:
+            self.progress({"stage": stage, "at": time.time(), **info})
+        except Exception as e:                # the display is nice-to-have
+            log.debug("Music: loading report failed: %s", e)
 
     def _play_artist(self, artist: dict, player: str, shuffle: bool) -> str:
         self._learn(artist["name"])
@@ -918,20 +961,29 @@ class MusicControl:
                     return self._control(intent)
                 if intent.kind == "info":
                     return self._info(intent)
-                return self._play_intent(self._reheard(intent))
+                self._loading_shown = False
+                if not intent.enqueue:
+                    what = intent.query or intent.artist or intent.genre or "that"
+                    self._loading("finding", None if intent.speaker == "*" else self._player_name(intent.speaker),
+                                  title=what)
+                reply = self._play_intent(self._reheard(intent))
+                if not reply.startswith("Playing "):  # "I couldn't find …" / a question
+                    self._loading("failed", None, text=reply)
+                return reply
             except MusicError as e:
                 log.warning("Music %s/%s failed: %s", intent.kind, intent.action, e)
+                self._loading("failed", None, text="I couldn't reach the music server.")
                 return "I couldn't reach the music server."
             finally:
                 self._rehear = None
                 self._everywhere_now = False
 
-    def play_url(self, url: str, speaker_key: str | None = None) -> str:
+    def play_url(self, url: str, speaker_key: str | None = None, title: str = "") -> str:
         """Play a bare audio URL (a podcast episode); return " on the X" for
         the reply. Not _learn()ed: an episode title isn't a name to re-hear."""
         with self._lock:
             player = self._player_name(speaker_key)
-            self._play(player, {"uri": url})
+            self._play(player, {"uri": url, "label": title})
             return self._where(player)
 
     # ── corrections ("no, the Adele one") ─────────────────────────────────

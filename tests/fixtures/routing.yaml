@@ -160,6 +160,16 @@ routes:
     - what's today's date
     - what day is it
     - what's the date today
+    - tell me the time
+    - what's tomorrow's date
+    - is it Friday
+    - how many days until Christmas
+    - when is Thanksgiving
+    - what day of the week is November 3rd
+    - what time is it in Tokyo
+    - how long until 5 pm
+    - when do the clocks change
+    - is today a holiday
 
   weather:
     - what's the weather
@@ -344,6 +354,8 @@ routes:
     - snooze 10 more minutes
     - snooze for half an hour
   timer_set:
+    # Steal-guard: "...in 8 hours" is a duration, not a store's hours.
+    - wake me up in 8 hours
     - set a timer for 5 minutes
     - set a pasta timer for 10 minutes
     - timer for 2 minutes
@@ -377,8 +389,40 @@ routes:
     - remind me to stretch every hour
     - remind me to take my pills at 9 every night
     # Steal-guards:
-    #   "remind me to bring an umbrella" -> llm  (no day and no time)
+    # No day and no time: she asks "when should I remind you?" (2026-10-15)
+    - remind me to bring an umbrella
+    - remind me to buy milk
+    - remind me to get gas when I leave work
     #   "wake me up at 7 am"             -> alarm_set
+    #   "remind me ... when I get home"  -> arrival_reminder
+
+  arrival_reminder:
+    - remind me to take out the trash when I get home
+    - when I get home remind me to call mom
+    - remind Katherine to feed the dog when she gets home
+    - tell Alex to check the mail when he gets home
+    - when Maria gets home remind her to take her pills
+    - tell Alex dinner is in the fridge when he gets home
+    - remind me to take my medicine when I get back
+
+  presence:
+    - who's home
+    - is anybody home
+    - is Alex home
+    - is Alex home yet?
+    - did Katherine get home yet
+    - is the house empty
+    #   "tell me about the bedroom"      -> knowledge
+
+  announce:
+    - announce dinner is ready in the bedroom
+    - tell the bedroom dinner is ready
+    - announce dinner is ready upstairs
+    - announce that dinner is ready
+    - tell everyone we're leaving in 5 minutes
+    - announce in the bedroom that the movie is starting
+    #   "tell me a joke"                 -> llm
+    #   "play music in the bedroom"      -> music
 
   alarm_set:
     - wake me up at 7 am
@@ -556,8 +600,11 @@ routes:
     # heard back by the kitchen mic (2026-09-23), and it switched them all on.
     - You're not going to the lights. What if I got the door open and the lights on?
     - I left the hallway lights on all day
-    # A reminder with no trigger time isn't one we can set — falls through.
-    - remind me to bring an umbrella
+    # Steal-guards for the 2026-10-15 skills: another city's air is search's,
+    # "call it" isn't a phone call, "the air conditioning" isn't air quality's.
+    - what's the air quality in Denver
+    - call it a night
+    - I'm going to call it a day
     # Sports steal-guard: a team name alone, with no sports verb, isn't sports.
     - I met a Texans fan yesterday
     # classify() never consults the LLM search router, so anything only the
@@ -574,6 +621,122 @@ routes:
 # Real divergences between documented behaviour and actual routing, found when
 # this harness was first run (2026-07-27). Not fixed here — Phase 0 builds the
 # net, it does not swing at what falls into it.
+
+  stopwatch:
+    - start a stopwatch
+    - start the stopwatch
+    - stop the stopwatch
+    - reset the stopwatch
+    - how long has the stopwatch been running
+    - what's the stopwatch at
+
+  spell:
+    - how do you spell necessary
+    - spell conscientious
+    - how do you spell the word rhythm
+    - can you spell broccoli for me
+
+  random:
+    - flip a coin
+    - heads or tails
+    - roll a die
+    - roll two dice
+    - roll a 20 sided die
+    - pick a number between 1 and 10
+
+  help:
+    - help
+    - what can you do
+    - what can I ask you
+    - what are your skills
+
+  repeat:
+    - repeat that
+    - say that again
+    - what did you say
+    - sorry, can you repeat that
+    - come again
+
+  mute:
+    - mute
+    - unmute
+    - mute it
+
+  volume_set:
+    - set the volume to 3
+    - lower the volume to 3
+    - volume to 40 percent
+    - turn the volume up to 6
+    - volume 5
+
+  sysinfo:
+    - is the internet down
+    - do you have an internet connection right now
+    - are we online
+    - is the wifi working
+    - why is the internet down
+    - what's wrong with the internet
+    - when did the internet go out
+    - how long was the internet down
+    - how's the server doing
+    - system status
+    - is everything running
+    - what's the cpu load
+    - how much disk space is left
+    - what's the gpu temperature
+    - how long has the server been up
+
+  climate:
+    - what's the temperature inside
+    - how warm is it in the house
+    - what's the temperature in the house
+    - is the AC running
+    - is the air conditioning on
+    - what is the thermostat set to
+    - what does the thermostat say
+    - how humid is it inside
+
+  air:
+    - what's the air quality
+    - how's the air quality today
+    - what's the AQI
+    - what's the pollen count
+    - how bad are allergies today
+
+  hours:
+    - what time does HEB close
+    - when does Costco open
+    - is Target open
+    - is Target open right now
+    - what time does Lowe's on Ella close tonight
+    - how late is Home Depot open
+    - what are the hours for Niko Niko's
+    - when does Kroger open tomorrow
+    - what time does Costco open on Sunday
+
+  market:
+    - what's the price of bitcoin
+    - how much is bitcoin
+    - what's ethereum at
+    - how's the stock market
+    - how's the stock market doing today
+    - how's the Dow
+    - how's Apple stock doing
+    - what's Tesla stock at
+    - what did Exxon stock close at
+
+  unsupported:
+    - what's on my calendar today
+    - do I have any meetings tomorrow
+    - read my email
+    - text Sam I'm on my way
+    - call mom
+    - send a message to the group
+    - set the thermostat to 72
+    - turn on the AC
+    - order more paper towels
+    - open the garage door
+    - book a table for two
 
 known_gaps:
 

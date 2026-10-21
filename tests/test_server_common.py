@@ -7,6 +7,7 @@ snoozed-alarm wording and the display-topic gate), so pin their behavior.
 Run: python3 tests/test_server_common.py
 """
 
+import io
 import os
 import sys
 import tempfile
@@ -66,6 +67,39 @@ def run():
         os.utime(d / name, (t, t))
     assert sc.prune_audio(d, ttl=60, cache_ttl=3600, cache_max_bytes=250) == 1
     assert sorted(p.name for p in d.iterdir()) == ["cache_mid.wav", "cache_new.wav"]
+
+    # /audio/<name>: a bare .wav from the first dir that has it, nothing else.
+    out, static = (Path(tempfile.mkdtemp(prefix="antigua_audio_test_")) for _ in range(2))
+    (out / "reply.wav").write_bytes(b"RIFF")
+    (static / "chat_end.wav").write_bytes(b"RIFF")
+    (static / "reply.wav").write_bytes(b"other")
+    (out.parent / "secret.wav").write_bytes(b"x")
+    assert sc.audio_file("reply.wav", out, static) == out / "reply.wav"
+    assert sc.audio_file("chat_end.wav", out, static) == static / "chat_end.wav"
+    for bad in ("../secret.wav", f"..{out.parent}/secret.wav", f"{out.parent}/secret.wav",
+                "/etc/hostname", "/etc/passwd", "../README.md", "sub/reply.wav", "..\\x.wav",
+                ".hidden.wav", "", "missing.wav", "%2e%2e/secret.wav"):
+        assert sc.audio_file(bad, out, static) is None, bad
+
+    # Request bodies: read up to the cap; a garbled, negative or oversized
+    # Content-Length gets a 413 and nothing is read (read(-1) would block).
+    class Handler:
+        def __init__(self, length, body=b""):
+            self.headers = {} if length is None else {"Content-Length": length}
+            self.rfile = io.BytesIO(body)
+            self.sent = None
+
+        def _json(self, code, data):
+            self.sent = code
+
+    h = Handler("5", b"hello")
+    assert sc.read_body(h, 10) == b"hello" and h.sent is None
+    h = Handler(None)
+    assert sc.read_body(h, 10) == b"" and h.sent is None
+    for bad in ("11", "-1", "lots", "1e9"):
+        h = Handler(bad, b"x" * 20)
+        assert sc.read_body(h, 10) is None and h.sent == 413, bad
+        assert h.rfile.tell() == 0, bad
 
     print("All server_common checks passed")
 

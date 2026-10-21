@@ -15,6 +15,10 @@ whisper:
   # Spanish (docs/spanish_support_plan.md): the GPU server auto-detects, and
   # Antigua answers in Spanish only on clear evidence. Tested: "Pause" over
   # music scored en 0.72; spoken Spanish sentences scored es 0.90-1.00.
+  # Language detection costs a second Whisper pass (~0.3s) on every turn.
+  # false = always English (a reply_language preference still answers in
+  # Spanish); true = detect Spanish speech as described above.
+  detect_language: true
   spanish_min_prob: 0.85
   spanish_min_words: 3
   beam_size: 1                 # greedy: same transcripts as beam 5 here, faster
@@ -37,6 +41,9 @@ ollama:
                                # idle VRAM cost; a warmup unit also loads it
                                # at boot / ollama restart before any request
 tts:
+  # Speak a first LLM sentence longer than this in two parts, split at a comma:
+  # audio starts ~0.5-0.9s sooner, at the cost of a seam. 0 = off.
+  split_first_over_chars: 0
   output_dir: audio_out       # relative to the repo root
   remote_url: http://127.0.0.1:5500/tts       # antigua-tts.service on this box
   fallback_url: http://10.77.0.3:5500/tts     # backup TTS box, same voice blend ("" = none)
@@ -49,6 +56,26 @@ persona:
   sass: 2          # 0 warm, 1 dry, 2 sassy, 3 sharp — edge in casual chat and jokes
 display:
   enabled: false   # PinedaDisplay MQTT integration — off by default
+# Inside the house (antigua_core/climate.py): the AC controller's read-only
+# data server (Honeywell_SmartAC ac-data-server). Remove to turn it off.
+climate:
+  url: http://127.0.0.1:8321
+
+sysinfo:                # "is everything running?" also checks these boxes answer (antigua_core/sysinfo.py)
+  peers: []
+  #  - {name: Home Assistant, host: 192.168.1.10, port: 8123}
+  #  - {name: the kitchen speaker Pi, host: 192.168.1.20, port: 1883}
+
+# Weekday "good morning" (antigua_core/morning.py): the first trip out the
+# back door in `window` (letting the dogs out), then the trip back in; she
+# speaks delay_seconds after the door shuts. Needs security: (the HA link).
+morning:
+  door: binary_sensor.back_door_sensor_open
+  name: Sam
+  window: "05:00-09:00"
+  delay_seconds: 12
+  back_within_minutes: 20
+
 security:              # Eufy cameras + front door lock via Home Assistant (antigua_core/security.py)
   ha_url: http://homeassistant.local:8123
   token_file: /etc/antigua/ha.env      # HA_TOKEN=..., root-only
@@ -56,6 +83,12 @@ security:              # Eufy cameras + front door lock via Home Assistant (anti
   live_seconds: 60                     # "show me the front door" stays up this long
   snapshots_dir: /var/lib/antigua-cams # photos for the display's traffic-cam card
   low_battery: 20
+  eufy_addon: 402f1039_eufy_security_ws  # restarted when a camera finishes charging (fresh battery %)
+  # With a non-admin HA user (recommended), press an input_button instead; an
+  # HA automation restarts the add-on (ANTIGUA_SKILLS/security/README.md).
+  # eufy_restart_button: input_button.antigua_restart_eufy_bridge
+  motion_cooldown_seconds: 60          # minimum time between spoken motion announcements
+  motion_hours: "07:00-23:00"          # hours when motion is announced unprompted
   cameras:
     front_door:
       entity: camera.doorbell
@@ -65,7 +98,14 @@ security:              # Eufy cameras + front door lock via Home Assistant (anti
       motion: binary_sensor.doorbell_motion_detected
       person: binary_sensor.doorbell_person_detected
       ring: binary_sensor.doorbell_ringing
+      charging: sensor.doorbell_charging_status
       snapshot_minutes: 30             # battery camera: wake it rarely
+      announce_motion: true            # speak unprompted when a person is detected
+      announce_on: [person]            # add motion to also speak on plain motion (wind, cars set it off)
+      # person_name: sensor.doorbell_person_name  # optional HA entity for recognized face/identity (Eufy/Frigate)
+      # motion_announcement: "Somebody is at the front door."  # optional custom fallback phrase when identity unknown
+      # show_on_motion: 30               # live video full screen 30 s on motion (motion_hours only)
+      # pip_camera: garage               # Picture-in-Picture secondary camera
     garage:
       entity: camera.garage
       title: Garage
@@ -80,6 +120,7 @@ security:              # Eufy cameras + front door lock via Home Assistant (anti
     battery: sensor.front_door_battery_percentage
 pineda:                # PinedaDisplay Web — the airplaypi kiosk screen (ANTIGUA_SKILLS/pineda_display)
   # url: http://127.0.0.1:8090   # unset = no display skill
+  # standby_url: http://10.77.0.3:8090   # a standby pineda-web over wg0: alarms are mirrored there too
   profile: default     # the kiosk's profile; its theme is the one on screen
   # device: <id>       # the kiosk's device id for "this photo"; unset = latest screen to report
   reboot_delay_seconds: 10   # airplaypi plays the "rebooting" reply before it goes down
@@ -97,12 +138,44 @@ household:                             # who memories are kept for
   - name: Alex
   - name: Katherine
     nicknames: [kat]                   # also accepted as this person
-  # - name: Sean
-  #   misheard_as: [Shawn]             # STT outputs rewritten to the name (case-sensitive)
-  #   say_as: Shaun                    # respelling for TTS if Kokoro mispronounces it
+  - name: Alex
+    say_as: Al-ex                      # phonetic respelling for Kokoro TTS if needed
+    devices: []                        # phone MACs for presence: ["aa:bb:cc:dd:ee:ff"]
+  - name: Jordan
+  - name: Maria
+  - name: Vivicca
+# Who's home: each household member's phones, by MAC, under `devices:` above
+# (iPhone: Settings > Wi-Fi > (i) next to this network > Private Wi-Fi Address,
+# with "Rotate Wi-Fi Address" off). antigua_core/presence.py ARP-scans for them;
+# "who's home?" and "remind me to X when I get home" use it.
+presence:
+  interface: eno1                  # the LAN interface to scan on
+  scan_seconds: 30
+  away_after_minutes: 15           # unseen this long = left (a phone can miss scans)
+  arrival_delay_seconds: 60        # a phone joins the Wi-Fi in the driveway
+# Ask Antigua: the iOS Shortcut's own LAN port (antigua_core/phone_http.py,
+# docs/ios_shortcut.md). Answers only LAN/wg0 addresses that send the key.
+phone:
+  port: 9395
+  key_file: /etc/antigua/phone.key   # one line, 16+ characters; absent = off
+# Announcements on other rooms' speakers ("tell the bedroom dinner's ready"),
+# through Music Assistant. kitchen = the satellite.
+announce:
+  rooms:                           # spoken room -> Music Assistant player
+    bedroom: Bedroom (2)
+    upstairs: Bedroom (2)
+    kitchen: kitchen
+  default: [bedroom]               # "announce X" with no room, said in the kitchen
+  everywhere: [kitchen, bedroom]   # "tell everyone ..."; also a phone's default
+  volume: 45                       # the speaker's level for it; music comes back after
+  chime: true
 memory:
   ttl_days: 14                         # entries older than this are auto-deleted
   storage_path: data/memories.json     # relative to the repo root
+  # Household memory (data/household_memory.yaml): "local" asks the Ollama
+  # model (one word) to sort a "remember ..." the rules can't place; "rules"
+  # never asks, and anything unplaced goes to the notepad.
+  classifier: local
 weather:
   location: "10001"          # legacy wttr.in key (LLM-prompt fallback only)
   ttl_seconds: 900           # forecast cache: 15 min
@@ -180,10 +253,11 @@ living_room_tv:
 
 # Music: Apple Music via Music Assistant (server/music/docker-compose.yml on
 # the primary). MUSIC_ASSISTANT_TOKEN (a long-lived MA token) goes in the mcp
-# env_file. url uses the LAN IP so the fallback box reaches it too.
+# env_file. url uses the primary's wg0 address (network/README.md), so the
+# fallback box reaches it too and the bearer token stays off the LAN.
 music:
   enabled: true
-  url: http://192.168.1.10:8095
+  url: http://10.77.0.1:8095
   timeout_seconds: 10
   # Search the MA library too: items already in your Apple Music library come
   # back as library items and are missing from the apple_music results.
@@ -368,6 +442,7 @@ search:
   max_tokens_search_long: 220  # how-to / install answers need room for steps
   router_enabled: true       # ask the LLM when no pattern matches (~0.5s)
   router_timeout_seconds: 3
+  router_parallel: false     # true: run it alongside the wake check (needs OLLAMA_NUM_PARALLEL >= 2)
   timeout_seconds: 4         # fail fast rather than stall TTS
   # google (web) returns 0 results on this instance — blocked upstream — so it
   # is left out; google news still works and stays. Verify with:
@@ -379,3 +454,8 @@ search:
   # parallel_keyless: true    # without a key, Parallel's free public MCP endpoint instead
   # parallel_mode: "fast"     # turbo | fast | basic | advanced
   cache_ttl_seconds: 900     # identical queries skip the network for 15 min
+
+# Weekly drift check (server/scripts/security_check.py): whose CI on main
+# it watches. Default: this repo's origin.
+# security_check:
+#   repos: [you/antigua, you/another-repo]

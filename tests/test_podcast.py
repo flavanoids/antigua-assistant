@@ -167,7 +167,7 @@ def main():
         def __init__(self):
             self.played = []
 
-        def play_url(self, url, speaker_key=None):
+        def play_url(self, url, speaker_key=None, title=""):
             self.played.append((url, speaker_key))
             return " on the soundbar" if speaker_key else ""
 

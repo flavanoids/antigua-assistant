@@ -1,7 +1,15 @@
 # Antigua's ports answer only over the wg0 tunnel and localhost — never the LAN.
 # Installed to /etc/antigua/guard.nft by network/wg-mesh.sh, which fills in
-# @PORTS@ (this host's Antigua ports) and @VERDICT@ (drop, or accept while
-# observing). Its own table, so reloading it never touches Docker's rules.
+# @PORTS@ (this host's Antigua ports), @VERDICT@ (drop, or accept while
+# observing), @BROKER@ (the MQTT broker's wg0 address) and @MQTT_USERS@ (the
+# accounts on this host allowed to talk to it). Its own table, so reloading it
+# never touches Docker's rules.
+#
+# output: MQTT has no passwords. Every Antigua host is trusted, so the broker
+# relies on the tunnel; this keeps the rest of each host out. Only the listed
+# accounts may connect to the broker. A process running as any other user
+# (ollama, a web app, a login account) can't publish antigua/play or a fake
+# alarm, even with the network to itself.
 table inet antigua_guard
 delete table inet antigua_guard
 
@@ -11,5 +19,11 @@ table inet antigua_guard {
 		iifname { "lo", "wg0" } accept
 		tcp dport { @PORTS@ } limit rate 10/minute log prefix "antigua-guard: " level info
 		tcp dport { @PORTS@ } counter @VERDICT@
+	}
+
+	chain output {
+		type filter hook output priority filter; policy accept;
+		ip daddr { 127.0.0.1, @BROKER@ } tcp dport 1883 meta skuid != { @MQTT_USERS@ } limit rate 10/minute log prefix "antigua-guard-mqtt: " level info
+		ip daddr { 127.0.0.1, @BROKER@ } tcp dport 1883 meta skuid != { @MQTT_USERS@ } counter reject with tcp reset
 	}
 }

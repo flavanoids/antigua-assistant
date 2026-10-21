@@ -24,7 +24,8 @@ settings.TIMER_STORE_PATH = Path(tempfile.mkdtemp()) / "timers.json"
 
 from antigua_core import classify as C  # noqa: E402
 from antigua_core import pipeline  # noqa: E402
-from antigua_core.stores import TimerManager, TimerSpec  # noqa: E402
+from antigua_core import server_common  # noqa: E402
+from antigua_core.stores import TimerManager, TimerSpec, phone_spec  # noqa: E402
 
 FAILS = []
 
@@ -120,7 +121,9 @@ eq("missing time: 'on friday'",
    ("email the landlord", "on friday"))
 eq("not missing: has a time", C.reminder_missing_time("remind me to stretch at 6 tomorrow"), None)
 eq("not missing: has a daypart", C.reminder_missing_time("remind me to stretch tomorrow morning"), None)
-eq("not missing: no day at all", C.reminder_missing_time("remind me to bring an umbrella"), None)
+eq("missing: no day or time at all", C.reminder_missing_time("remind me to bring an umbrella"),
+   ("bring an umbrella", ""))
+eq("not missing: nothing to remind", C.reminder_missing_time("remind me in 10 minutes"), None)
 
 
 # ── phrasing (needs a Backend stub for B.timers) ────────────────────────────
@@ -529,6 +532,128 @@ row = tm7.reschedule(aid, (datetime.combine(first + timedelta(days=1), datetime.
 eq("reschedule relabels", row["label"], "alarm for 6:30 AM, every day")
 eq("reschedule clears skips", row["skip"], [])
 tm7.cancel_all()
+
+# ── switched off from the phone ─────────────────────────────────────────────
+rung.clear()
+soon = TimerSpec(0.4, "alarm for 6:00 AM", "alarm", hour=6, minute=0)
+aid = tm7.set(soon)
+row = tm7.set_enabled(aid, False)
+eq("switched off: listed, not running", (row["enabled"], tm7.list_active()), (False, []))
+time.sleep(1.0)
+eq("switched off: doesn't ring", rung, [])
+row = tm7.set_enabled(aid, True)
+eq("back on: a passed one-time alarm moves to its next clock time",
+   (row["enabled"], datetime.fromtimestamp(row["fires_at"]).strftime("%H:%M")), (True, "06:00"))
+eq("back on: ahead of now", row["fires_at"] > time.time(), True)
+tm7.cancel_all()
+
+rid = tm7.set(TimerSpec(0.3, "call mom", "reminder", message="call mom", hour=18))
+tm7.set_enabled(rid, False)
+time.sleep(0.6)
+eq("a one-time reminder that passed while off disappears", tm7.list_all(), [])
+eq("...and can't be switched back on", tm7.set_enabled(rid, True), None)
+
+# Switched off and straight back on, the old thread must not ring it too.
+rung.clear()
+did = tm7.set(TimerSpec(0.5, "gym alarm", "alarm"))
+tm7.set_enabled(did, False)
+tm7.set_enabled(did, True)
+time.sleep(1.0)
+eq("off and on again rings once", rung, ["gym alarm"])
+
+quiet = tm7.set(TimerSpec(0.2, "screen only", "reminder", message="screen only", speak=False))
+time.sleep(0.6)
+eq("speak=False: Antigua stays quiet", rung, ["gym alarm"])
+
+oid = tm7.set(TimerSpec(3600, "alarm for 7:00 AM", "alarm", hour=7, name="gym"))
+tm7.set_enabled(oid, False)
+saved = json.loads(settings.TIMER_STORE_PATH.read_text())
+eq("switched-off entries persist, marked off", [d.get("off") for d in saved], [True])
+eq("...and offered to the fallback, still off", [d.get("off") for d in tm7.snapshot()], [True])
+tm8 = TimerManager()
+tm8._load()
+eq("...and come back switched off", [(r["name"], r["enabled"]) for r in tm8.list_all()],
+   [("gym", False)])
+tm7.cancel_all("alarm")
+eq("cancel all alarms takes the switched-off ones", tm7.list_all(), [])
+
+eq("a named alarm says its name",
+   server_common.timer_fire_text("gym alarm for 6:00 AM", "alarm"), "Your gym alarm is going off.")
+eq("a wake-up alarm doesn't",
+   server_common.timer_fire_text("wake-up alarm for 6:00 AM", "alarm"),
+   "Good morning, your alarm is going off.")
+
+# ── failover: the fallback copies, adopts and hands back ────────────────────
+prim = TimerManager()
+on_id = prim.set(TimerSpec(3600, "gym alarm", "alarm", hour=7, name="gym"))
+off_id = prim.set(TimerSpec(7200, "alarm for 9:00 AM", "alarm", hour=9))
+prim.set_enabled(off_id, False)
+snap = prim.snapshot()
+eq("the snapshot carries switched-off ones, marked", sorted(bool(d.get("off")) for d in snap),
+   [False, True])
+fb = TimerManager()
+fb.adopt(snap, primary_alive_until=time.time())
+eq("adopted: on stays on, off stays off",
+   sorted((r["hour"], r["enabled"]) for r in fb.list_all()), [(7, True), (9, False)])
+rev = fb.revision
+eq("adopting isn't a change to hand back", fb.revision, rev)
+fb.set(TimerSpec(5400, "call mom", "reminder", message="call mom", hour=18))
+gym = next(r for r in fb.list_all() if r["name"] == "gym")
+fb.cancel_ids([gym["id"]])
+eq("changes during the outage count", fb.revision != rev, True)
+back = fb.export_all()
+eq("hand-back has everything there", sorted(d["label"] for d in back),
+   ["alarm for 9:00 AM", "call mom"])
+running = prim.take_handoff(back)
+eq("the primary takes the fallback's list",
+   sorted((r["label"], r["enabled"]) for r in prim.list_all()),
+   [("alarm for 9:00 AM", False), ("call mom", True)])
+eq("...and runs the on ones", running, 1)
+eq("a one-time one that came due on the fallback isn't brought back",
+   prim.take_handoff([{"label": "rang", "kind": "alarm", "fires_at": time.time() - 60}]), 0)
+fb.drop_adopted()
+eq("drop_adopted takes adopted off ones too", [r["label"] for r in fb.list_all()], ["call mom"])
+prim.cancel_all()
+fb.cancel_all()
+
+# ── set from the phone (pineda-web's menu) ──────────────────────────────────
+ps = phone_spec({"kind": "alarm", "time": "06:30", "repeat": "weekdays", "name": "gym"})
+eq("phone alarm: label", ps.label, "gym alarm for 6:30 AM, every weekday")
+eq("phone alarm: on a weekday",
+   datetime.fromtimestamp(time.time() + ps.seconds).weekday() < 5, True)
+ps = phone_spec({"kind": "reminder", "time": "18:00", "date": "2030-01-02",
+                 "message": " call mom ", "speak": False})
+eq("phone reminder", (ps.label, ps.message, ps.speak, ps.hour), ("call mom", "call mom", False, 18))
+for bad, why in [({"kind": "reminder", "time": "18:00", "date": "2020-01-02", "message": "x"},
+                  "that time has already passed"),
+                 ({"kind": "alarm", "time": "25:00"}, "time must be HH:MM"),
+                 ({"kind": "alarm", "time": "07:00", "repeat": "fortnightly"}, "bad repeat"),
+                 ({"kind": "reminder", "time": "10:00"},
+                  "a reminder needs something to remind you of")]:
+    try:
+        phone_spec(bad)
+        eq(f"rejects {bad}", "accepted", why)
+    except ValueError as e:
+        eq(f"rejects {bad}", str(e), why)
+
+# ── satellite offline schedule sync ─────────────────────────────────────────
+published_schedules = []
+orig_pub = settings.mqtt_publish
+settings.mqtt_publish = lambda topic, payload: published_schedules.append((topic, payload))
+try:
+    tm_sync = TimerManager()
+    tm_sync.set(TimerSpec(seconds=600, label="satellite test timer", kind="timer"))
+    schedules = [p for t, p in published_schedules if t == "antigua/alarm_schedule"]
+    eq("publish_schedule published on set", len(schedules) > 0, True)
+    last_sched = schedules[-1]
+    eq("publish_schedule has alarms list", "alarms" in last_sched, True)
+    active_labels = [a["label"] for a in last_sched["alarms"]]
+    eq("publish_schedule contains active timer", "satellite test timer" in active_labels, True)
+    tm_sync.cancel_all()
+    schedules_after_cancel = [p for t, p in published_schedules if t == "antigua/alarm_schedule"]
+    eq("publish_schedule empty after cancel", len(schedules_after_cancel[-1]["alarms"]), 0)
+finally:
+    settings.mqtt_publish = orig_pub
 
 
 if FAILS:

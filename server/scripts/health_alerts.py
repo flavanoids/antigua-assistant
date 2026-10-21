@@ -9,6 +9,13 @@ Checks:
           did for 13 hours and nothing looked wrong).
   disk  — /tmp and / below DISK_PCT. A full /tmp broke TTS, apt, logrotate
           and Hermes at once.
+  server, whisper, ollama — antigua-server answers /health, whisper.cpp
+          answers (else STT silently drops to CPU small.en), and the voice
+          model is loaded in Ollama.
+  mic   — the kitchen bridge isn't stuck reconnecting (device off or off Wi-Fi).
+  satellite — antigua-satellite is running on the Pi (all speech plays there).
+  backup — the backup's fallback server and TTS answer; without them a
+          primary outage is a total outage (it was off ~32 h unnoticed, 10-14/15).
 
 Alerts once when a check starts failing, reminds every REMIND_S while it
 stays failing, and says when it recovers. Sends via `hermes send` (bot token,
@@ -18,6 +25,7 @@ no gateway or LLM needed). State lives on /home so this still works when
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -28,7 +36,13 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 STATE_FILE = REPO / "data" / "health_alerts_state.json"
 SERVER_LOG = REPO / "logs" / "server.log"
+BRIDGE_LOG = REPO / "logs" / "kitchen-bridge.log"
 TTS_URL = "http://127.0.0.1:5500/tts"
+SERVER_HEALTH_URL = "http://127.0.0.1:9393/health"
+WHISPER_URL = "http://127.0.0.1:8178/"
+OLLAMA_PS_URL = "http://127.0.0.1:11434/api/ps"
+SATELLITE_SSH = "airplaypi"
+BRIDGE_CRASHES_MAX = 3    # reconnects in FALLBACK_WINDOW_MIN before alerting
 DISKS = ["/tmp", "/"]
 DISK_PCT = 80
 FALLBACK_WINDOW_MIN = 10
@@ -52,19 +66,19 @@ def check_tts_probe():
         return f"local TTS synth failed: {exc}"
 
 
-def check_tts_fallbacks(now):
-    """Count 'TTS failed, falling back' lines in the last FALLBACK_WINDOW_MIN."""
+def _recent_lines(log_path, needle, now, minutes=FALLBACK_WINDOW_MIN):
+    """How many lines containing `needle` the log got in the last `minutes`."""
     try:
-        with SERVER_LOG.open("rb") as f:
+        with log_path.open("rb") as f:
             f.seek(0, os.SEEK_END)
             f.seek(max(0, f.tell() - 512_000))
             lines = f.read().decode(errors="replace").splitlines()
     except OSError:
         return None
-    since = now - timedelta(minutes=FALLBACK_WINDOW_MIN)
+    since = now - timedelta(minutes=minutes)
     n = 0
     for line in lines:
-        if "TTS failed, falling back" not in line:
+        if needle not in line:
             continue
         try:
             t = datetime.combine(now.date(), datetime.strptime(line[:8], "%H:%M:%S").time())
@@ -74,9 +88,108 @@ def check_tts_fallbacks(now):
             t -= timedelta(days=1)
         if t >= since:
             n += 1
+    return n
+
+
+def check_tts_fallbacks(now):
+    """Count 'TTS failed, falling back' lines in the last FALLBACK_WINDOW_MIN."""
+    n = _recent_lines(SERVER_LOG, "TTS failed, falling back", now) or 0
     if n > FALLBACK_MAX:
         return f"{n} TTS requests fell back to the backup TTS in the last {FALLBACK_WINDOW_MIN} min"
     return None
+
+
+def _get(url, timeout=5):
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return resp.status, resp.read()
+
+
+def check_server():
+    try:
+        status, _ = _get(SERVER_HEALTH_URL)
+        return None if status == 200 else f"/health returned HTTP {status}"
+    except Exception as exc:
+        return f"antigua-server not answering: {exc}"
+
+
+def check_whisper():
+    try:
+        _get(WHISPER_URL)
+        return None
+    except Exception as exc:
+        return f"whisper.cpp (GPU STT) not answering — turns use CPU STT: {exc}"
+
+
+def check_ollama(model):
+    try:
+        _, body = _get(OLLAMA_PS_URL)
+        loaded = [m.get("name") for m in json.loads(body).get("models", [])]
+    except Exception as exc:
+        return f"Ollama not answering: {exc}"
+    if model and model not in loaded:
+        return f"voice model not loaded in Ollama (loaded: {', '.join(loaded) or 'nothing'})"
+    return None
+
+
+def check_mic(now):
+    n = _recent_lines(BRIDGE_LOG, "Bridge crashed", now)
+    if n is not None and n >= BRIDGE_CRASHES_MAX:
+        return f"kitchen bridge reconnected {n} times in {FALLBACK_WINDOW_MIN} min — is the reSpeaker on?"
+    return None
+
+
+def check_satellite():
+    try:
+        r = subprocess.run(["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", SATELLITE_SSH,
+                            "systemctl", "is-active", "antigua-satellite"],
+                           capture_output=True, text=True, timeout=20)
+    except Exception as exc:
+        return f"can't reach the Pi: {exc}"
+    state = r.stdout.strip()
+    if state == "active":
+        return None
+    return f"antigua-satellite is {state or 'unreachable'} (ssh: {r.stderr.strip()[:120]})"
+
+
+def _backup_endpoints():
+    """(name, host, port) of the backup's fallback server and TTS, from the
+    bridge's fallback_server_url and server.yaml's tts.fallback_url."""
+    import yaml
+    from urllib.parse import urlsplit
+    urls = []
+    try:
+        bridge = yaml.safe_load((REPO / "kitchen-mic" / "bridge" / "config.yaml").read_text())
+        urls.append(("fallback server", bridge.get("fallback_server_url")))
+    except Exception:
+        pass
+    try:
+        cfg = yaml.safe_load((REPO / "server" / "config" / "server.yaml").read_text())
+        urls.append(("backup TTS", (cfg.get("tts") or {}).get("fallback_url")))
+    except Exception:
+        pass
+    return [(name, u.hostname, u.port) for name, url in urls if url
+            for u in [urlsplit(url)] if u.hostname and u.port]
+
+
+def check_backup():
+    down = []
+    for name, host, port in _backup_endpoints():
+        try:
+            socket.create_connection((host, port), timeout=3).close()
+        except OSError as exc:
+            down.append(f"{name} {host}:{port} ({exc})")
+    if down:
+        return "no failover — " + "; ".join(down)
+    return None
+
+
+def _voice_model():
+    try:
+        import yaml
+        cfg = yaml.safe_load((REPO / "server" / "config" / "server.yaml").read_text())
+        return cfg["ollama"]["model"]
+    except Exception:
+        return None
 
 
 def check_disks():
@@ -109,6 +222,11 @@ def main():
         problems["tts"] = "; ".join(tts)
     if disk := check_disks():
         problems["disk"] = disk
+    for key, msg in (("server", check_server()), ("whisper", check_whisper()),
+                     ("ollama", check_ollama(_voice_model())), ("mic", check_mic(now)),
+                     ("satellite", check_satellite()), ("backup", check_backup())):
+        if msg:
+            problems[key] = msg
 
     try:
         state = json.loads(STATE_FILE.read_text())

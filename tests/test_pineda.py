@@ -16,7 +16,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "server"))
 
 from antigua_core import pineda, pipeline, settings  # noqa: E402
 from antigua_core import recipe_session  # noqa: E402
-from antigua_core.intents.pineda import parse_pineda_request, parse_recipe_display  # noqa: E402
+from antigua_core.intents.pineda import (  # noqa: E402
+    parse_clock_mode, parse_pineda_request, parse_recipe_display)  # noqa: E402
 from antigua_core.recipe import Recipe  # noqa: E402
 from antigua_core.recipe_subs import step_ingredients  # noqa: E402
 from antigua_core.stores import ListStore, MemoryStore, TimerManager, TimerSpec  # noqa: E402
@@ -57,10 +58,35 @@ def test_parser():
         "when was this photo taken": "photo_when",
         "when was this taken": "photo_when",
         "what year is this picture from": "photo_when",
+        "show me pictures of strawberries": "image_search",
+        "search for photos of vintage cars": "image_search",
+        "pictures of red pandas": "image_search",
+        "can you show me photos of cats": "image_search",
+        "pictures of puppies please": "image_search",
+        "tell me more about picture B": "image_detail",
+        "tell me more about picture B please": "image_detail",
+        "can you tell me more about picture B?": "image_detail",
+        "what is in picture B": "image_detail",
+        "what is photo C": "image_detail",
+        "tell me about picture 2": "image_detail",
+        "tell me more about picture two": "image_detail",
+        "what is the second picture": "image_detail",
+        "what is picture A": "image_detail",
+        "tell me about image C": "image_detail",
+        "describe picture D": "image_detail",
+        "what is B": "image_detail",
+        "tell me more about B": "image_detail",
+        "first picture please": "image_detail",
+        "show me tile 3": "image_detail",
     }
     for text, action in cases.items():
         got = parse_pineda_request(text)
         assert got and got[0] == action, (text, got)
+
+    assert parse_pineda_request("tell me more about picture two") == ("image_detail", "B")
+    assert parse_pineda_request("what is the second picture") == ("image_detail", "B")
+    assert parse_pineda_request("first picture please") == ("image_detail", "A")
+    assert parse_pineda_request("show me tile 3") == ("image_detail", "C")
 
     for text in [
         "give me a quote", "give me an inspirational quote",
@@ -88,8 +114,6 @@ def test_themes():
     for _ in range(20):   # never the current one, never a night twin
         pick = pineda.pick_random_theme(THEMES, "ocean")["name"]
         assert pick in ("quiet_canvas", "cocoa_ember", "groovy"), pick
-    assert pineda.theme_label(THEMES, "ocean_night") == "Ocean Night"
-    assert pineda.theme_label(THEMES, "missing_theme") == "missing theme"
     assert pineda.spoken_list(["A", "B", "C"]) == "A, B, and C"
 
 
@@ -119,10 +143,19 @@ def test_timers_payload_and_hook():
         {"id": "a1", "label": "pasta timer", "name": "pasta", "kind": "timer", "fires_at": 0.0},
         {"id": "b2", "label": "Timer", "name": None, "kind": "timer", "fires_at": 60.0},
         {"id": "c3", "label": "Alarm", "name": None, "kind": "alarm", "fires_at": 90.0},
+        {"id": "d4", "label": "gym alarm", "name": "gym", "kind": "alarm", "fires_at": 120.0},
+        {"id": "e5", "label": "call mom", "name": None, "kind": "reminder",
+         "message": "call mom", "fires_at": 150.0},
+        {"id": "f6", "label": "Timer", "name": None, "kind": "timer", "fires_at": 9.0,
+         "paused": True},
     ]
     assert pineda.timers_payload(active) == [
-        {"id": "a1", "label": "pasta", "fires_at": "1970-01-01T00:00:00+00:00"},
-        {"id": "b2", "label": "Timer", "fires_at": "1970-01-01T00:01:00+00:00"},
+        {"id": "a1", "label": "pasta", "kind": "timer", "fires_at": "1970-01-01T00:00:00+00:00"},
+        {"id": "b2", "label": "Timer", "kind": "timer", "fires_at": "1970-01-01T00:01:00+00:00"},
+        {"id": "c3", "label": "Alarm", "kind": "alarm", "fires_at": "1970-01-01T00:01:30+00:00"},
+        {"id": "d4", "label": "gym", "kind": "alarm", "fires_at": "1970-01-01T00:02:00+00:00"},
+        {"id": "e5", "label": "call mom", "kind": "reminder",
+         "fires_at": "1970-01-01T00:02:30+00:00"},
     ]
 
     changes = []
@@ -154,28 +187,50 @@ def test_concat_wavs():
     assert not pineda.concat_wavs([a, str(tmp / "missing.wav")], tmp / "no.wav")
 
 
-def test_client_uses_the_profile_for_themes():
-    calls = []
+class _FakeMcp:
+    """An HttpMcpServer that answers from a table: tool -> structured value."""
 
-    class _Resp:
-        content = b""
+    urls = ["http://pineda:8090/mcp/"]
 
-        def raise_for_status(self):
-            pass
+    def __init__(self, answers):
+        self.answers, self.calls = answers, []
 
-    orig = pineda.requests.request
-    pineda.requests.request = lambda method, url, **kw: calls.append((method, url, kw)) or _Resp()
+    def call(self, tool, arguments=None, timeout=None):
+        from antigua_core.mcp_client import McpResult
+        self.calls.append((tool, arguments))
+        value = self.answers.get(tool)
+        if isinstance(value, Exception):
+            return McpResult(ok=False, text=str(value), data={"error": "x"})
+        return McpResult(ok=True, data=value if isinstance(value, dict) else {"result": value})
+
+
+def test_client_calls_the_display_tools():
+    mcp = _FakeMcp({"theme_set": {"theme": "ocean"}, "now_showing": {"photo": None},
+                    "timers_sync": {"count": 0}, "clock_mode": {"changed": 2},
+                    "display_status": {"theme": "ocean", "takeover": None},
+                    "takeover_get": None, "camera_show": {"camera": "front_door"},
+                    "display_reboot": {"accepted": True}})
+    c = pineda.PinedaClient(mcp, device="kiosk1")
+    c.set_theme("ocean")
+    assert c.now_showing() == {"photo": None}
+    c.sync_timers([])
+    assert c.hold_clock(True) == 2
+    assert c.status()["theme"] == "ocean" and not c.takeover_up() and c.takeover() is None
+    c.show_camera("front_door", 30)
+    c.reboot()
+    assert mcp.calls == [
+        ("theme_set", {"name": "ocean"}), ("now_showing", {"device_id": "kiosk1"}),
+        ("timers_sync", {"source": "antigua", "timers": []}), ("clock_mode", {"on": True}),
+        ("display_status", {}), ("display_status", {}), ("takeover_get", {}),
+        ("camera_show", {"camera": "front_door", "seconds": 30}),
+        ("display_reboot", {"confirm": True}),
+    ]
+    down = pineda.PinedaClient(_FakeMcp({"clock_mode": RuntimeError("No screen")}))
     try:
-        c = pineda.PinedaClient("http://pineda:8090/", profile="default", device="kiosk1")
-        c.set_theme("ocean")
-        c.now_showing()
-        c.sync_timers([])
-    finally:
-        pineda.requests.request = orig
-    assert calls[0][:2] == ("PATCH", "http://pineda:8090/api/profiles/default")
-    assert calls[0][2]["json"] == {"theme": "ocean"}
-    assert calls[1][2]["params"] == {"device_id": "kiosk1"}
-    assert calls[2][:2] == ("PUT", "http://pineda:8090/api/timers/sync/antigua")
+        down.hold_clock(True)
+        raise AssertionError("a failed tool should raise")
+    except pineda.PinedaError as e:
+        assert "No screen" in str(e)
 
 
 # ── the route end to end ─────────────────────────────────────────────────────
@@ -199,6 +254,10 @@ class FakePineda:
     def current_theme(self):
         return self.theme
 
+    def status(self):
+        label = next((t["label"] for t in THEMES if t["name"] == self.theme), self.theme)
+        return {"theme": self.theme, "theme_label": label, "takeover": None}
+
     def set_theme(self, name):
         self.calls.append(("theme", name))
         self.theme = name
@@ -215,8 +274,14 @@ class FakePineda:
     takeover = None
 
     def show_takeover(self, card, seconds):
-        self.calls.append(("show", card["title"], seconds))
+        self.calls.append(("show", card.get("title") or card.get("query"), seconds))
         self.takeover = card
+
+    def show_image_collage(self, query, images, seconds=120):
+        self.show_takeover({"kind": "image_search", "query": query, "images": images, "highlight": None}, seconds)
+
+    def highlight_image(self, identifier):
+        self.update_takeover({"highlight": identifier.upper()})
 
     def update_takeover(self, change):
         self.calls.append(("update", change))
@@ -229,6 +294,13 @@ class FakePineda:
     def clear_takeover(self):
         self.calls.append(("clear",))
         self.takeover = None
+
+    held = False
+
+    def hold_clock(self, on):
+        self.calls.append(("hold", on))
+        changed, self.held = int(self.held != on), on
+        return changed
 
 
 class DownPineda(FakePineda):
@@ -252,6 +324,12 @@ def make_backend(fake, llm_seen):
         def search_best(self, query, **kw):
             llm_seen.append({"query": query})
             return None, [], query
+
+        def search_images(self, query, count=6):
+            return [
+                {"id": "A", "url": "https://example.com/a.jpg", "title": "Ripe Strawberry", "source": "wikimedia.org", "snippet": "Fresh red berries."},
+                {"id": "B", "url": "https://example.com/b.jpg", "title": "Strawberry Tart", "source": "unsplash.com", "snippet": "Baked dessert."},
+            ]
 
     return pipeline.Backend(
         transcribe=lambda p: {"text": "", "time_s": 0.0, "confidence": 1.0},
@@ -508,6 +586,168 @@ def test_recipe_route():
     recipe_session.clear()
 
 
+def test_clock_mode_parser():
+    cases = {
+        "clock mode": "clock",
+        "Alexa, clock mode.": "clock",
+        "switch to clock mode": "clock",
+        "switch the display to the clock": "clock",
+        "put the screen on clock only": "clock",
+        "show me the clock": "clock",
+        "go back to the clock": "clock",
+        "turn on clock mode": "clock",
+        "just the clock please": "clock",
+        "home": "home",
+        "go home": "home",
+        "go back home": "home",
+        "home screen": "home",
+        "switch to home": "home",
+        "go back to the dashboard": "home",
+        "switch the display back to the home screen": "home",
+        "show me the dashboard": "home",
+        "exit clock mode": "home",
+        "turn off the clock": "home",
+        "clock mode off": "home",
+        "have the display go back home": "home",
+        "what time is it": None,
+        "set an alarm clock for 7": None,
+        "set the alarm for 7": None,
+        "i'm going home": None,
+        "when do you get home": None,
+        "who is home": None,
+        "clockwork orange": None,
+        "turn on the home lights": None,
+        "set the clock forward an hour": None,
+        "stop the display": None,
+    }
+    for text, want in cases.items():
+        assert parse_clock_mode(text) == want, (text, parse_clock_mode(text))
+
+
+def test_clock_mode_route():
+    fake = FakePineda()
+    pipeline.init(make_backend(fake, []))
+
+    def say(text):
+        return pipeline.dispatch_text(text, conversation_id="clock", quiet=True)["response"]
+
+    assert say("clock mode") == "Okay, clock mode." and fake.calls[-1] == ("hold", True)
+    assert say("show me the clock") == "The clock's already up."
+    assert say("go back to the dashboard") == "Okay, back to the dashboard."
+    assert fake.calls[-1] == ("hold", False)
+    assert say("home") == "The display's already on the dashboard."
+    fake.takeover = {"title": "Tacos"}
+    assert say("switch to clock mode") == "Okay, clock mode."
+    assert fake.calls[-2:] == [("clear",), ("hold", True)] and fake.takeover is None
+    pipeline.init(make_backend(DownPineda(), []))
+    pipeline.B.pineda.hold_clock = lambda on: (_ for _ in ()).throw(pineda.PinedaError("down"))
+    assert say("home") == "I can't reach the display right now."
+    pipeline.init(make_backend(None, []))
+    assert say("clock mode") == "I can't control the display from here."
+
+
+def test_timer_mirror_backs_off_a_dead_display():
+    class Client:
+        def __init__(self, url, up=True):
+            self.url, self.up, self.calls = url, up, 0
+
+        def sync_timers(self, body):
+            self.calls += 1
+            if not self.up:
+                raise pineda.PinedaError("timed out")
+
+    now = [1000.0]
+    primary, standby = Client("primary"), Client("standby", up=False)
+    m = pineda.TimerMirror([primary, standby], lambda: [], clock=lambda: now[0])
+    m._push()                                # a timer change: both tried
+    for _ in range(120):                     # ten minutes of keep_fresh ticks
+        now[0] += 5
+        m._push(force=False)
+    # standby: 1 + retries after 5 s, 30 s, then every 300 s (at 335 s);
+    # primary: the empty list again only every RESEND_EMPTY_S
+    assert standby.calls == 4 and primary.calls == 3, (primary.calls, standby.calls)
+    standby.up = True
+    now[0] += 300
+    m._push(force=False)
+    m._push()
+    assert standby.calls == 6 and primary.calls == 5     # back: every forced push lands
+
+
+def test_timer_mirror_rides_out_a_restart():
+    class Client:
+        url, up, calls = "primary", True, 0
+
+        def sync_timers(self, body):
+            self.calls += 1
+            if not self.up:
+                raise pineda.PinedaError("Connection refused")
+
+    now = [1000.0]
+    running = [[]]
+    c = Client()
+    m = pineda.TimerMirror([c], lambda: running[0], clock=lambda: now[0])
+    m._push()
+    c.up = False
+    m._push()                                # mid-restart
+    c.up = True
+    now[0] += 5
+    running[0] = [{"id": "t1", "label": "Pasta", "fires_at": now[0] + 600}]
+    m._push(force=False)                     # first tick after the backoff
+    assert c.calls == 3
+    for _ in range(12):                      # a running timer: re-sent every RESEND_S
+        now[0] += 5
+        m._push(force=False)
+    assert c.calls == 4, c.calls
+
+
+def test_image_search_and_detail_route():
+    settings.SEARCH_ENABLED = True
+    fake, llm_seen = FakePineda(), []
+    pipeline.init(make_backend(fake, llm_seen))
+
+    def say(text, conv="img_test"):
+        return pipeline.dispatch_text(text, conversation_id=conv, quiet=True)
+
+    # 1. Search for pictures
+    r1 = say("show me pictures of strawberries")
+    assert "Here are some pictures of strawberries" in r1["response"], r1
+    assert fake.calls[-1] == ("show", "strawberries", 120)
+    assert fake.takeover["kind"] == "image_search"
+    assert fake.takeover["highlight"] is None
+
+    # 2. Ask about picture B (letter)
+    r2 = say("tell me more about picture B")
+    assert "Picture B is Strawberry Tart from unsplash.com. Baked dessert." == r2["response"]
+    assert fake.calls[-1] == ("update", {"highlight": "B"})
+    assert fake.takeover["highlight"] == "B"
+
+    # 3. Ask about picture 1 (digit/number word)
+    r3 = say("what is the first picture")
+    assert "Picture A is Ripe Strawberry from wikimedia.org. Fresh red berries." == r3["response"]
+    assert fake.calls[-1] == ("update", {"highlight": "A"})
+    assert fake.takeover["highlight"] == "A"
+
+    # 4. Ask about an invalid picture (not in this search's results)
+    r4 = say("what is picture C")
+    assert "I don't see picture C. You can ask about A, B." in r4["response"]
+
+    # 5. Screen times out / takeover cleared, but user asks follow up within session window
+    fake.takeover = None
+    r5 = say("tell me about picture two")
+    assert "Picture B is Strawberry Tart" in r5["response"]
+    assert fake.calls[-1] == ("show", "strawberries", 120)
+    assert fake.takeover["highlight"] == "B"
+
+    # 6. Stop the display dismisses takeover and clears session
+    r6 = say("stop the display")
+    assert r6["response"] == "Okay."
+    assert fake.takeover is None
+
+    # 7. Asking now returns no active image search
+    r7 = say("tell me about picture A")
+    assert "I don't have an active image search on the screen right now." in r7["response"]
+
+
 def main():
     settings.configure({})
     test_parser()
@@ -515,13 +755,18 @@ def main():
     test_replies()
     test_timers_payload_and_hook()
     test_concat_wavs()
-    test_client_uses_the_profile_for_themes()
+    test_client_calls_the_display_tools()
     test_route()
     test_recipe_parser()
     test_recipe_card()
     test_recipe_card_highlights()
     test_step_ingredients()
     test_recipe_route()
+    test_clock_mode_parser()
+    test_clock_mode_route()
+    test_image_search_and_detail_route()
+    test_timer_mirror_backs_off_a_dead_display()
+    test_timer_mirror_rides_out_a_restart()
     print("PASS — pineda display suite")
 
 

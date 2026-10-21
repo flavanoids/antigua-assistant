@@ -7,7 +7,7 @@ from .. import settings
 from ..caches import pin_year
 from .memory import is_memory_query
 from .news import _NEWS_LOCATION_RE, _NEWS_PLACE_RE, extract_news_category, extract_news_topic, is_news_request
-from .time_date import _DATE_QUERY_RE, _TIME_QUERY_RE
+from .time_date import is_time_date_query
 from .timers import parse_timer_request
 from .weather import _WEATHER_SIMPLE_RE
 
@@ -112,8 +112,7 @@ def is_search_request(transcript: str) -> bool:
     if (
         (is_news_request(transcript) and not is_local_news_query(transcript))
         or bool(_WEATHER_SIMPLE_RE.search(transcript))
-        or bool(_TIME_QUERY_RE.search(transcript))
-        or bool(_DATE_QUERY_RE.search(transcript))
+        or is_time_date_query(transcript)
         or parse_timer_request(transcript) is not None
         or is_memory_query(transcript)
     ):

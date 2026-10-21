@@ -314,6 +314,17 @@ class NewsCache:
         self._max = max_items
         self._cache = {}  # source_name -> (items, fetched_at)
         self._lock = Lock()
+        # Stale sources with a background refresh already running. One news
+        # turn reads the cache twice (top_items, then format_for_prompt), and
+        # each read used to start its own refresh: every feed fetched twice.
+        self._refreshing = set()
+
+    def _background_refresh(self, name):
+        try:
+            self._refresh(name)
+        finally:
+            with self._lock:
+                self._refreshing.discard(name)
 
     def _fetch(self, name, url):
         feed = feedparser.parse(url)
@@ -461,8 +472,9 @@ class NewsCache:
             with self._lock:
                 if name in self._cache:
                     items, fetched_at = self._cache[name]
-                    if now - fetched_at >= self._ttl:
-                        Thread(target=self._refresh, args=(name,), daemon=True).start()
+                    if now - fetched_at >= self._ttl and name not in self._refreshing:
+                        self._refreshing.add(name)
+                        Thread(target=self._background_refresh, args=(name,), daemon=True).start()
                     per_source.append(items)
                     continue
             # No cache yet — fetch synchronously (first call only)
@@ -720,6 +732,67 @@ class SearXNGSkill:
         with self._cache_lock:
             self._cache[cache_key] = (result, now)
         return result
+
+    def search_images(self, query: str, count: int = 6) -> list[dict]:
+        """Search for images across SearXNG image engines without an API key.
+
+        Returns a list of dicts:
+        [{'id': 'A', 'url': str, 'thumb_url': str, 'title': str, 'source': str, 'snippet': str}]
+        """
+        from urllib.parse import urlsplit
+
+        base = {"format": "json", "language": "en-US", "categories": "images"}
+        try:
+            r = requests.get(
+                f"{settings.SEARCH_URL}/search",
+                params={"q": query, **base},
+                timeout=settings.SEARCH_TIMEOUT + 3,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except requests.RequestException as e:
+            log.warning("SearXNG image search failed for %r: %s", query, e)
+            return []
+
+        letters = ["A", "B", "C", "D", "E", "F", "G", "H"]
+        items = []
+        raw_results = data.get("results", [])
+        seen_urls: set[str] = set()
+
+        for r in raw_results:
+            img_url = r.get("img_src") or r.get("thumbnail_src")
+            if not img_url or img_url in seen_urls:
+                continue
+            if "spacer.gif" in img_url or "blank.gif" in img_url:
+                continue
+            seen_urls.add(img_url)
+
+            source_url = r.get("url") or ""
+            source_host = ""
+            if source_url:
+                try:
+                    source_host = urlsplit(source_url).netloc.removeprefix("www.")
+                except Exception:
+                    source_host = ""
+            if not source_host and r.get("source"):
+                source_host = str(r["source"])
+
+            title = (r.get("title") or query).strip()
+            snippet = (r.get("content") or "").strip()
+            letter = letters[len(items)]
+            items.append({
+                "id": letter,
+                "url": img_url,
+                "thumb_url": r.get("thumbnail_src") or img_url,
+                "title": title,
+                "source": source_host,
+                "snippet": snippet,
+                "aspect_ratio": 1.0,
+            })
+            if len(items) >= count:
+                break
+
+        return items
 
     @staticmethod
     def _parallel_on() -> bool:

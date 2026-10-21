@@ -16,8 +16,8 @@ import uuid
 import wave
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from threading import Lock, Thread
-from urllib.parse import urlparse
+from threading import Lock, Thread, Timer
+from urllib.parse import parse_qs, urlparse
 
 import paho.mqtt.client as mqtt
 import requests
@@ -27,7 +27,8 @@ from antigua_core import server_common
 from antigua_core import settings as core_settings
 from antigua_core.caches import NewsCache, NWSAlertsCache, SearXNGSkill, WeatherCache
 from antigua_core.commute import CommuteProvider
-from antigua_core import calc_currency, chat
+from antigua_core import calc_currency, chat, household_memory, netstatus, sysinfo
+from antigua_core.security import in_hours
 from antigua_core.knowledge import WikiKnowledge
 from antigua_core.recipe import RecipeFinder
 from antigua_core import sports as sports_skill
@@ -39,9 +40,11 @@ from antigua_core.classify import (
 )
 from antigua_core import pipeline
 from antigua_core.home_control import HomeControl
-from antigua_core.mcp_client import McpHub, read_env_file
+from antigua_core.mcp_client import TOOL_LOG, McpHub, read_env_file
 from antigua_core.music import MusicControl
-from antigua_core.pineda import PinedaClient, TimerMirror
+from antigua_core.pineda import TimerMirror
+from antigua_core.pineda import connect as pineda_connect
+from antigua_core import morning
 from antigua_core import security as security_skill
 from antigua_core.grounding import recipe_claims_ok, unsupported_claims, weather_claim_allowed
 from antigua_core.pipeline import (
@@ -50,6 +53,12 @@ from antigua_core.pipeline import (
 from antigua_core.music_router import llm_route_music
 from antigua_core.router import llm_route_search
 from antigua_core.speaker_id import SpeakerProfiles
+from antigua_core.alarm_http import AlarmRoutes
+from antigua_core import announce as announce_mod
+from antigua_core import phone_http
+from antigua_core import presence as presence_mod
+from antigua_core.announce import Announcer
+from antigua_core.presence import ArrivalReminders, Presence
 from antigua_core.stores import ConversationStore, ListStore, MemoryStore, TimerManager
 from antigua_core.tts_text import clean_for_tts
 
@@ -64,7 +73,8 @@ CONFIG_PATH = core_settings.local_or_example(
 )
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    # Milliseconds, like the kitchen bridge's log, so a turn's stages line up.
+    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("antigua")
@@ -97,6 +107,10 @@ WHISPER_GPU_URL = cfg["whisper"].get("gpu_url", "")
 # Spanish-leaning turn.
 SPANISH_MIN_PROB = float(cfg["whisper"].get("spanish_min_prob", 0.85))
 SPANISH_MIN_WORDS = int(cfg["whisper"].get("spanish_min_words", 3))
+# Whisper's language detection is a second encoder pass: 0.59s vs 0.30s, on
+# every turn. Off, every turn is transcribed as English; a household
+# reply_language preference still answers in Spanish.
+WHISPER_DETECT_LANGUAGE = bool(cfg["whisper"].get("detect_language", True))
 _fwhisper_careful = None
 _fwhisper_model = None
 _fwhisper_lock = Lock()
@@ -197,9 +211,11 @@ recipes = (RecipeFinder(core_settings.RECIPE_CACHE_DAYS)
 
 
 # PinedaDisplay Web — the airplaypi kiosk screen (antigua_core/pineda.py).
+# Over MCP; the standby's when this box's pineda-web is down (the kiosk's
+# nginx fails over to it too).
 pineda = (
-    PinedaClient(core_settings.PINEDA_URL, profile=core_settings.PINEDA_PROFILE,
-                 device=core_settings.PINEDA_DEVICE)
+    pineda_connect(core_settings.PINEDA_URL, core_settings.PINEDA_STANDBY_URL,
+                   token_file=core_settings.PINEDA_TOKEN_FILE, device=core_settings.PINEDA_DEVICE)
     if core_settings.PINEDA_URL else None
 )
 
@@ -215,16 +231,75 @@ if _sec_cfg.get("ha_url"):
             security_skill.Config.from_dict(_sec_cfg),
             security_skill.EventLog(core_settings.DATA_DIR / "security_events.db"),
             pineda=pineda,
+            announce=lambda text: _on_security_announce(text),
         )
+        # Weekday "good morning" when the first trip out the back door comes
+        # back in (antigua_core/morning.py); rides the same HA connection.
+        if (cfg.get("morning") or {}).get("door"):
+            _morning = morning.MorningGreeting(morning.Config.from_dict(cfg["morning"]),
+                                               announce=lambda text: _on_security_announce(text))
+            security.listen(_morning.cfg.door, _morning.on_state)
         security.start()
 
-# Lambdas for late binding — _on_timer_fire and timer_mirror are defined below.
+# Lambdas for late binding — _on_timer_fire, _on_security_announce and
+# timer_mirror are defined below.
 timers = TimerManager(
     on_fire=lambda label, kind="timer", message=None: _on_timer_fire(label, kind, message),
     on_change=lambda: timer_mirror and timer_mirror.push(),
 )
 # Running timers show in the display's moon-climate mini card.
-timer_mirror = TimerMirror(pineda, timers.list_active) if pineda else None
+# Both pineda-webs get them, so the standby's screen has them if the kiosk
+# fails over to it.
+timer_mirror = (TimerMirror(
+    [pineda_connect(u, token_file=core_settings.PINEDA_TOKEN_FILE)
+     for u in (core_settings.PINEDA_URL, core_settings.PINEDA_STANDBY_URL) if u],
+    timers.list_active) if pineda else None)
+
+
+def _speak_unprompted(text: str) -> bool:
+    wav_path = synthesize(clean_for_tts(text))
+    if wav_path:
+        audio_url = (
+            f"http://{get_local_ip()}:{cfg['server']['port']}"
+            f"/audio/{Path(wav_path).name}"
+        )
+        mqtt_publish("antigua/play", {"audio_url": audio_url})
+    return bool(wav_path)
+
+
+def _on_security_announce(text: str) -> None:
+    if _speak_unprompted(text):
+        log.info("Security: announced %r", text)
+
+
+# The internet going out is said once it has been out a while (a blip isn't
+# news), and its return only if the outage was said. Not overnight.
+_NET_SAY_AFTER = 120
+_NET_SAY_HOURS = "07:00-23:00"
+
+
+def _on_net_change(state, cause, outage):
+    mqtt_client.publish("antigua/net", json.dumps(netstatus.monitor.snapshot()), qos=1, retain=True)
+    if state == "offline":
+        Timer(_NET_SAY_AFTER, _say_net_down, args=(outage,)).start()
+    elif outage and outage.get("said") and in_hours(_NET_SAY_HOURS):
+        text = (f"The internet's back. It was out for "
+                f"{sysinfo.duration_words(outage['end'] - outage['start'])}.")
+        if _speak_unprompted(text):
+            log.info("Net: said %r", text)
+
+
+def _say_net_down(outage):
+    mon = netstatus.monitor
+    if mon.state != "offline" or not mon.outages or mon.outages[-1] is not outage:
+        return                                # back already, or a newer outage
+    if not in_hours(_NET_SAY_HOURS):
+        return
+    text = (f"Heads up, the internet's out. It looks like {netstatus.CAUSES[mon.cause]}. "
+            "Timers, alarms, the TV and most lights still work.")
+    if _speak_unprompted(text):
+        outage["said"] = True
+        log.info("Net: said %r", text)
 
 
 def _on_timer_fire(label: str, kind: str = "timer", message: str | None = None):
@@ -307,16 +382,27 @@ def write_json(prompt: str) -> str:
 conversations = ConversationStore()
 
 
-def check_addressed(heard: str, last: str) -> bool:
-    """Conversation mode's guard: is this plain speech meant for Antigua?"""
+def check_addressed(heard: str, last: str, after_wake: bool = False) -> bool:
+    """Is this speech meant for Antigua? Conversation mode's guard, and the
+    check after a fresh wake word on turns no skill claimed."""
     return chat.is_addressed(
-        heard, last,
+        heard, last, after_wake=after_wake,
         ollama_host=OLLAMA_HOST,
         model=OLLAMA_MODEL,
         timeout=core_settings.CHAT_ADDRESSEE_TIMEOUT,
         keep_alive=OLLAMA_INTERACTION_KEEP_ALIVE,
         num_ctx=OLLAMA_NUM_CTX,
     )
+
+
+def classify_memory(text: str):
+    """Sorts a "remember ..." the guard's rules couldn't place; one word out."""
+    if core_settings.MEMORY_CLASSIFIER != "local":
+        return None
+    return household_memory.ask_ollama(
+        text, ollama_host=OLLAMA_HOST, model=OLLAMA_MODEL,
+        timeout=core_settings.CHAT_ADDRESSEE_TIMEOUT,
+        keep_alive=OLLAMA_INTERACTION_KEEP_ALIVE, num_ctx=OLLAMA_NUM_CTX)
 
 
 # ── MQTT Client ─────────────────────────────────────────────────────────────
@@ -326,7 +412,68 @@ mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="antigua-s
 
 def _on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
     # Resubscribe on every (re)connect — paho doesn't restore subscriptions.
-    client.subscribe([("antigua/listening", 1), ("antigua/stop", 1), ("antigua/alarm_ack", 1)])
+    topics = [
+        ("antigua/listening", 1),
+        ("antigua/stop", 1),
+        ("antigua/alarm_ack", 1),
+        ("antigua/alarm_sync_request", 1),
+    ]
+    if security is not None:
+        topics.extend([
+            ("antigua/security/visitor", 1),
+            ("double-take/matches", 1),
+            ("frigate/events", 1),
+        ])
+    client.subscribe(topics)
+
+
+def _handle_security_mqtt(topic: str, raw_payload: bytes | str) -> None:
+    if security is None:
+        return
+    try:
+        payload = json.loads(raw_payload) if isinstance(raw_payload, (bytes, str)) else raw_payload
+    except (ValueError, TypeError):
+        log.debug("Security MQTT: non-JSON payload on %s", topic)
+        return
+    if not isinstance(payload, dict):
+        return
+
+    try:
+        if topic == "antigua/security/visitor":
+            cam = payload.get("camera", "front_door")
+            people = payload.get("people")
+            if isinstance(people, str):
+                people = [people]
+            has_unknown = bool(payload.get("has_unknown", False))
+            security.announce_visitor(cam, people=people, has_unknown=has_unknown, source="mqtt:antigua")
+
+        elif topic == "double-take/matches":
+            cam = payload.get("camera", "front_door")
+            name = payload.get("name")
+            is_match = payload.get("match", True)
+            if is_match and name:
+                security.announce_visitor(cam, people=[name], source="mqtt:double-take")
+            elif not is_match or not name:
+                security.announce_visitor(cam, people=[], has_unknown=True, source="mqtt:double-take")
+
+        elif topic == "frigate/events":
+            after = payload.get("after") or {}
+            if after.get("label") == "person":
+                cam = after.get("camera", "front_door")
+                sub_label = after.get("sub_label")
+                sub_labels = after.get("sub_labels") or []
+                people = []
+                if sub_label:
+                    people.append(sub_label)
+                if isinstance(sub_labels, list):
+                    for sl in sub_labels:
+                        if isinstance(sl, dict) and "label" in sl:
+                            people.append(sl["label"])
+                        elif isinstance(sl, str):
+                            people.append(sl)
+                security.announce_visitor(cam, people=people, source="mqtt:frigate")
+    except Exception:
+        log.exception("Security MQTT: failed processing %s", topic)
 
 
 def _on_mqtt_message(client, userdata, msg):
@@ -341,6 +488,19 @@ def _on_mqtt_message(client, userdata, msg):
             pipeline.note_alarm_ack(json.loads(msg.payload).get("id", ""))
         except (ValueError, AttributeError):
             pass
+        return
+    if msg.topic == "antigua/alarm_sync_request":
+        try:
+            timers.publish_schedule()
+        except Exception:
+            log.exception("Failed to publish alarm schedule on request")
+        return
+    if security is not None and msg.topic in (
+        "antigua/security/visitor",
+        "double-take/matches",
+        "frigate/events",
+    ):
+        _handle_security_mqtt(msg.topic, msg.payload)
         return
     if music is None or msg.topic != "antigua/listening":
         return
@@ -395,6 +555,10 @@ def _transcribe_gpu(audio_path, prefer=None):
     would risk a Turkish transcript of a garbled clip, and "auto" plus the
     probabilities costs a third pass (0.88s)."""
     t0 = time.time()
+    if not WHISPER_DETECT_LANGUAGE:
+        text, _ = _whisper_gpu(audio_path, "en", probs=False)
+        return {"text": text, "language": "en", "confidence": 0.9 if text else 0.0,
+                "time_s": round(time.time() - t0, 2)}
     text, probs = _whisper_gpu(audio_path, "en")
     lang = pipeline.pick_language(probs, text, prefer, SPANISH_MIN_PROB, SPANISH_MIN_WORDS)
     if lang == "es":
@@ -503,6 +667,17 @@ def _get_speaker_model():
         return _speaker_model
 
 
+def _warm_speaker_model():
+    global _speaker_deps_missing
+    try:
+        _get_speaker_model()
+    except ImportError as e:
+        _speaker_deps_missing = True
+        log.warning("Speaker ID disabled until restart — %s (needs torch, torchaudio, speechbrain)", e)
+    except Exception:
+        log.warning("Speaker ID model failed to preload; the first turn will retry", exc_info=True)
+
+
 def _wav_duration_s(audio_path: str) -> float:
     try:
         with wave.open(audio_path, "rb") as wf:
@@ -560,139 +735,13 @@ def identify_speaker(audio_path: str) -> str | None:
 # ── LLM (Ollama) ────────────────────────────────────────────────────────────
 
 
-def ask_llm(
-    transcript, conversation_id="", extra_context=None, max_tokens_override=None,
-    temperature_override=None, grounding_context=None,
-):
-    t0 = time.time()
-
-    # Build messages with conversation history
-    messages = []
-    if conversation_id:
-        messages = conversations.get_messages(conversation_id)
-
-    log.info(
-        "LLM context: conv=%s history=%d msgs",
-        conversation_id or "new",
-        len(messages),
-    )
-
-    # Ensure system prompt is first (with live time/date + context)
-    now_str = server_common.llm_now_str()
-
-    weather_injected = False
-    if extra_context is not None:
-        # Caller-supplied context (e.g. news headlines) overrides weather/timers
-        system_with_context = (
-            SYSTEM_PROMT + f"\nCurrent date and time: {now_str}." + f"\n{extra_context}"
-        )
-    elif wants_weather_context(transcript, messages):
-        weather_injected = True
-        weather_str = weather_skill.context_for_prompt(weather_provider, transcript)
-        system_with_context = (
-            SYSTEM_PROMT
-            + f"\nCurrent date and time: {now_str}."
-            + f"\n{weather_str}"
-            + "\nAnswer weather questions only from the data above; if it is not"
-            + " there, say you don't have it."
-            + f"\n{format_active_timers()}"
-        )
-    else:
-        system_with_context = (
-            SYSTEM_PROMT
-            + f"\nCurrent date and time: {now_str}."
-            + f"\n{format_active_timers()}"
-        )
-    # Append active NWS alerts to every request (empty string = no-op)
-    alerts_str = nws_alerts_cache.format_for_prompt()
-    if alerts_str:
-        system_with_context += f"\n{alerts_str}"
-
-    if not messages or messages[0]["role"] != "system":
-        messages.insert(0, {"role": "system", "content": system_with_context})
-    else:
-        messages[0]["content"] = system_with_context
-
-    # Add user message
-    user_msg = f"{transcript} /no_think"
-    messages.append({"role": "user", "content": user_msg})
-
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": messages,
-        "stream": False,
-        "options": {
-            "num_predict": max_tokens_override
-            if max_tokens_override
-            else OLLAMA_MAX_TOKENS,
-            "temperature": OLLAMA_TEMP if temperature_override is None else temperature_override,
-            "num_ctx": OLLAMA_NUM_CTX,
-        },
-        "think": False,
-        "keep_alive": OLLAMA_INTERACTION_KEEP_ALIVE,
-    }
-    try:
-        resp = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=90)
-        resp.raise_for_status()
-    except requests.Timeout:
-        log.warning("LLM timeout after 90s")
-        fallback = "Hmm, let me think about that and get back to you."
-        if conversation_id:
-            conversations.add_message(conversation_id, "user", transcript)
-            conversations.add_message(conversation_id, "assistant", fallback)
-        return {
-            "text": fallback,
-            "time_s": 30,
-            "model": OLLAMA_MODEL,
-        }
-    except requests.ConnectionError:
-        log.exception("LLM connection failed")
-        fallback = "Sorry, I'm having a little trouble right now."
-        return {"text": fallback, "time_s": 0, "model": OLLAMA_MODEL}
-    data = resp.json()
-    elapsed = time.time() - t0
-
-    content = data.get("message", {}).get("content", "").strip()
-    # Strip thinking tokens if they appear
-    if content.startswith("<think>"):
-        content = re.sub(
-            r"<think>.*?</think>",
-            "",
-            content,
-            flags=re.DOTALL,
-        ).strip()
-
-    if content and not weather_claim_allowed(content, weather_injected):
-        kept = [s for s in re.split(r"(?<=[.!?])\s+", content)
-                if weather_claim_allowed(s, weather_injected)]
-        dropped = len(re.split(r"(?<=[.!?])\s+", content)) - len(kept)
-        if kept:  # never blank the whole answer over this
-            log.info("Dropped %d invented weather sentence(s)", dropped)
-            content = " ".join(kept).strip()
-
-    if content and grounding_context:
-        kept, dropped = [], []
-        for s in re.split(r"(?<=[.!?])\s+", content):
-            (dropped if unsupported_claims(s, grounding_context) else kept).append(s)
-        if dropped:
-            log.info("Dropped %d ungrounded sentence(s): %r", len(dropped), dropped)
-            content = " ".join(kept).strip() or "I couldn't find a clear answer for that."
-
-    # Cut off by num_predict mid-sentence? Drop the fragment rather than have
-    # TTS read it aloud — but only if something complete remains.
-    if content and not re.search(r"[.!?][\"')\]]*$", content):
-        parts = re.split(r"(?<=[.!?])\s+", content)
-        if len(parts) > 1:
-            log.info("Dropped truncated trailing fragment: %r", parts[-1])
-            content = " ".join(parts[:-1]).strip()
-
-    # Save to conversation memory
-    if conversation_id:
-        conversations.add_message(conversation_id, "user", transcript)
-        conversations.add_message(conversation_id, "assistant", content)
-
-    return {"text": content, "time_s": round(elapsed, 2), "model": OLLAMA_MODEL}
-
+# A hung or reloading model must not hold the turn past the kitchen bridge's
+# 60s read timeout: past that the bridge has given up, and a late reply is
+# spoken out of nowhere. LLM_READ_TIMEOUT_S bounds the wait for the first
+# token (and any stall after it); LLM_TURN_DEADLINE_S bounds the whole stream.
+LLM_STREAM_TIMEOUT = (2, 12)
+LLM_TURN_DEADLINE_S = 40
+_LLM_TROUBLE = "Sorry, I'm having a little trouble right now."
 
 # "7 p.m. tonight" is not a sentence end; "7 p.m. Then" is.
 _SENTENCE_END_RE = re.compile(
@@ -742,6 +791,8 @@ def ask_llm_stream(transcript, conversation_id="", extra_context=None, max_token
     alerts_str = nws_alerts_cache.format_for_prompt()
     if alerts_str:
         system_with_context += f"\n{alerts_str}"
+    # Rules the family approved by hand in data/household_memory.yaml.
+    system_with_context += household_memory.store().rules_block()
 
     if not messages or messages[0]["role"] != "system":
         messages.insert(0, {"role": "system", "content": system_with_context})
@@ -754,7 +805,10 @@ def ask_llm_stream(transcript, conversation_id="", extra_context=None, max_token
     # is untouched, so Ollama's prefix cache still hits.
     hint = "\n(They spoke Spanish. Reply in Spanish.)" if language == "es" else ""
     if turn_hint:  # persona.py's stage direction — same slot, same reasons
-        hint += f"\n({turn_hint})"
+        # One line per hint (household notes and preferences ride here too).
+        hint += "".join(f"\n({h})" for h in turn_hint.split("\n") if h)
+    if not netstatus.online():  # so "is the internet down?" style chat doesn't make things up
+        hint += f"\n({sysinfo.offline_hint()})"
     messages.append({"role": "user", "content": f"{transcript}{hint} /no_think"})
 
     payload = {
@@ -776,15 +830,12 @@ def ask_llm_stream(transcript, conversation_id="", extra_context=None, max_token
     dropped_ungrounded = False
 
     try:
-        resp = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=90, stream=True)
+        resp = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=LLM_STREAM_TIMEOUT,
+                             stream=True)
         resp.raise_for_status()
-    except requests.Timeout:
-        log.warning("LLM stream timeout")
-        yield "Hmm, let me think about that and get back to you."
-        return
-    except requests.ConnectionError:
-        log.exception("LLM stream connection failed")
-        yield "Sorry, I'm having a little trouble right now."
+    except requests.RequestException as e:
+        log.warning("LLM stream failed to start: %s", e)
+        yield _LLM_TROUBLE
         return
 
     try:
@@ -798,6 +849,9 @@ def ask_llm_stream(transcript, conversation_id="", extra_context=None, max_token
             chunk = data.get("message", {}).get("content", "")
             buf += chunk
             full_text += chunk
+            if time.time() - t0 > LLM_TURN_DEADLINE_S:
+                log.warning("LLM stream passed its %ds deadline — cutting it off", LLM_TURN_DEADLINE_S)
+                break
 
             while True:
                 m = _SENTENCE_END_RE.search(buf)
@@ -824,8 +878,11 @@ def ask_llm_stream(transcript, conversation_id="", extra_context=None, max_token
 
             if data.get("done"):
                 break
-    except Exception:
-        log.exception("LLM stream read error")
+    except Exception as e:
+        log.warning("LLM stream read error: %s", e)
+        if not spoke_any:
+            yield _LLM_TROUBLE
+            return
 
     # Whatever is left in the buffer never hit a sentence end, so the model was
     # cut off by num_predict mid-thought. Speaking it means TTS reads out
@@ -934,6 +991,7 @@ def synthesize(text, lang="en"):
 # Backend: whisper.cpp STT, qwen3.5:4b via Ollama, local Kokoro TTS, and the
 # Roku/Govee MCP servers (the fallback on the backup runs its own copies).
 
+TOOL_LOG.open(core_settings.DATA_DIR / "tool_calls.db")
 mcp_hub = McpHub.from_config(cfg.get("mcp"), core_settings.BASE_DIR)
 home = HomeControl(mcp_hub, cfg)
 
@@ -942,6 +1000,11 @@ home = HomeControl(mcp_hub, cfg)
 _ma_token = read_env_file(core_settings.BASE_DIR / cfg.get("mcp", {}).get(
     "env_file", "server/config/mcp.env")).get("MUSIC_ASSISTANT_TOKEN")
 music = MusicControl(cfg, _ma_token) if _ma_token and cfg.get("music", {}).get("enabled", True) else None
+if music:
+    # The web display's Now Playing card shows this while a play starts up.
+    # Under airplaypi/ (not a gated antigua/ display topic): it's the feed
+    # PinedaDisplay Web already reads for the kitchen speaker.
+    music.progress = lambda p: mqtt_client.publish("airplaypi/loading", json.dumps(p), qos=1)
 
 # Drive times from home: places.yaml (home + favorites), Photon for places,
 # TomTom (TOMTOM_API_KEY in the mcp env file) or else OSRM for routes, and
@@ -949,6 +1012,37 @@ music = MusicControl(cfg, _ma_token) if _ma_token and cfg.get("music", {}).get("
 commute = (CommuteProvider(read_env_file(core_settings.BASE_DIR / cfg.get("mcp", {}).get(
     "env_file", "server/config/mcp.env")).get("TOMTOM_API_KEY"))
            if core_settings.COMMUTE_ENABLED else None)
+
+
+# Who's home (their phones on the Wi-Fi) and reminders for when they get there.
+arrivals = ArrivalReminders()
+
+
+def _on_arrive(person: str) -> None:
+    """Their phone just came back: say what was waiting for them, once
+    they've had time to get from the driveway to the kitchen."""
+    delay = float((cfg.get("presence") or {}).get("arrival_delay_seconds", 60))
+
+    def speak():
+        rows = arrivals.take(person)
+        if not rows:
+            return
+        text = presence_mod.arrival_text(person, rows)
+        wav_path = synthesize(clean_for_tts(text))
+        if wav_path:
+            mqtt_publish("antigua/play", {"audio_url": (
+                f"http://{get_local_ip()}:{cfg['server']['port']}/audio/{Path(wav_path).name}")})
+            log.info("Arrival: told %s %d reminder(s)", person, len(rows))
+
+    if arrivals.pending(person):
+        Timer(delay, speak).start()
+
+
+presence = Presence(cfg, on_arrive=_on_arrive)
+
+# Other rooms' speakers through Music Assistant ("tell the bedroom ...").
+announcer = Announcer(cfg, music.ma if music else None) if (cfg.get("announce") or {}).get("rooms") else None
+announce_mod.install(announcer)
 
 
 def remember_exchange(conversation_id, transcript, reply):
@@ -986,7 +1080,13 @@ pipeline.init(pipeline.Backend(
     recipes=recipes,
     remember_exchange=remember_exchange,
     check_addressed=check_addressed,
+    classify_memory=classify_memory,
+    last_reply=lambda cid: next((m["content"] for m in reversed(conversations.get_messages(cid))
+                                 if m.get("role") == "assistant"), ""),
     set_history_limit=conversations.set_max_history,
+    presence=presence if presence.enabled else None,
+    arrivals=arrivals,
+    announcer=announcer,
 ))
 
 run_pipeline = pipeline.run_pipeline
@@ -1012,7 +1112,9 @@ def cleanup_loop():
 # ── HTTP Server ──────────────────────────────────────────────────────────────
 
 
-class AntiguaHandler(BaseHTTPRequestHandler):
+class AntiguaHandler(AlarmRoutes, BaseHTTPRequestHandler):
+    alarm_timers = timers
+
     def log_message(self, fmt, *args):
         log.debug("HTTP: %s", fmt % args)
 
@@ -1021,11 +1123,9 @@ class AntiguaHandler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             self._json(200, {"status": "ok", "model": OLLAMA_MODEL, "mcp": mcp_hub.status()})
         elif parsed.path.startswith("/audio/"):
-            filename = parsed.path[len("/audio/") :]
-            filepath = AUDIO_OUT_DIR / filename
-            if not filepath.exists():
-                filepath = STATIC_AUDIO_DIR / filename
-            if filepath.exists():
+            filepath = server_common.audio_file(parsed.path[len("/audio/"):],
+                                                AUDIO_OUT_DIR, STATIC_AUDIO_DIR)
+            if filepath is not None:
                 data = filepath.read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "audio/wav")
@@ -1038,10 +1138,20 @@ class AntiguaHandler(BaseHTTPRequestHandler):
             self._handle_memories()
         elif parsed.path == "/lists":
             self._handle_lists()
+        elif parsed.path == "/tool_calls":
+            # Every MCP tool call, newest first, with the turn that made it.
+            q = parse_qs(parsed.query)
+            self._json(200, {"calls": TOOL_LOG.recent(
+                since=float(q.get("since", ["0"])[0]), limit=min(int(q.get("limit", ["50"])[0]), 500),
+                conversation=q.get("conversation", [None])[0])})
+        elif parsed.path == "/presence":
+            self._json(200, {"people": presence.snapshot()})
         elif parsed.path == "/timers":
             # Mirrored by the fallback on the backup, which rings these if this
             # box is down when they're due.
             self._json(200, {"timers": timers.snapshot()})
+        elif self.route_alarms("GET"):
+            pass
         else:
             self._json(404, {"error": "not found"})
 
@@ -1049,14 +1159,40 @@ class AntiguaHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/stt":
             self._handle_stt()
-        elif parsed.path == "/ask":
-            self._handle_ask()
         elif parsed.path == "/pipeline":
             self._handle_pipeline()
         elif parsed.path == "/pipeline_text":
             self._handle_pipeline_text()
+        elif parsed.path == "/handoff":
+            self._handle_handoff()
+        elif self.route_alarms("POST"):
+            pass
         else:
             self._json(404, {"error": "not found"})
+
+    def do_PATCH(self):
+        if not self.route_alarms("PATCH"):
+            self._json(404, {"error": "not found"})
+
+    def do_DELETE(self):
+        if not self.route_alarms("DELETE"):
+            self._json(404, {"error": "not found"})
+
+    def _handle_handoff(self):
+        """The fallback, handing back what it owned while this box was down:
+        alarms (replace ours), and memories/lists when it changed them."""
+        data = self.read_json()
+        if data is None:
+            return
+        if isinstance(data.get("timers"), list):
+            timers.take_handoff(data["timers"])
+        if isinstance(data.get("memories"), list):
+            memory_store.replace(data["memories"])
+        if isinstance(data.get("lists"), dict):
+            list_store.replace(data["lists"])
+        log.warning("Took back from the fallback: %s", ", ".join(
+            k for k in ("timers", "memories", "lists") if k in data) or "nothing")
+        self._json(200, {"ok": True})
 
     def _handle_memories(self):
         """Return active (non-expired) memories as JSON for the display."""
@@ -1072,54 +1208,19 @@ class AntiguaHandler(BaseHTTPRequestHandler):
         return self.headers.get("X-Conversation-ID", "")
 
     def _handle_stt(self):
-        length = int(self.headers.get("Content-Length", 0))
-        audio = self.rfile.read(length)
+        audio = server_common.read_body(self, server_common.MAX_AUDIO_BYTES)
+        if audio is None:
+            return
         tmp = AUDIO_OUT_DIR / f"_in_{uuid.uuid4().hex[:8]}.wav"
         tmp.write_bytes(audio)
         result = transcribe(str(tmp))
         tmp.unlink(missing_ok=True)
         self._json(200, result)
 
-    def _handle_ask(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length)
-        try:
-            data = json.loads(body)
-            transcript = data.get("text", "")
-        except json.JSONDecodeError:
-            self._json(400, {"error": "invalid JSON"})
-            return
-
-        if not transcript:
-            self._json(400, {"error": "empty transcript"})
-            return
-
-        conv_id = self._conv_id() or os.urandom(8).hex()
-        llm_result = ask_llm(transcript, conversation_id=conv_id)
-        response = llm_result["text"]
-        wav_path = synthesize(response) if response else ""
-        audio_url = ""
-        if wav_path:
-            audio_url = (
-                f"http://{get_local_ip()}:{cfg['server']['port']}"
-                f"/audio/{Path(wav_path).name}"
-            )
-
-        mqtt_publish("antigua/response", {"text": response, "audio_url": audio_url})
-        self._json(
-            200,
-            {
-                "transcript": transcript,
-                "response": response,
-                "audio_url": audio_url,
-                "llm_time": llm_result["time_s"],
-                "conversation_id": conv_id,
-            },
-        )
-
     def _handle_pipeline(self):
-        length = int(self.headers.get("Content-Length", 0))
-        audio = self.rfile.read(length)
+        audio = server_common.read_body(self, server_common.MAX_AUDIO_BYTES)
+        if audio is None:
+            return
         tmp = AUDIO_OUT_DIR / f"_in_{uuid.uuid4().hex[:8]}.wav"
         tmp.write_bytes(audio)
 
@@ -1138,9 +1239,11 @@ class AntiguaHandler(BaseHTTPRequestHandler):
     def _handle_pipeline_text(self):
         """Debug/QA seam: run the full classify + dispatch on a text string,
         skipping STT. Same code path spoken turns take after transcription."""
-        length = int(self.headers.get("Content-Length", 0))
+        body = server_common.read_body(self, server_common.MAX_JSON_BYTES)
+        if body is None:
+            return
         try:
-            data = json.loads(self.rfile.read(length))
+            data = json.loads(body)
         except json.JSONDecodeError:
             self._json(400, {"error": "invalid JSON"})
             return
@@ -1192,7 +1295,6 @@ class AntiguaHandler(BaseHTTPRequestHandler):
     def _json(self, code, data):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
@@ -1280,11 +1382,15 @@ def main():
     timers._load()
     if timer_mirror:
         timer_mirror.push()   # the reloaded timers, or clear a list left from before a crash
+        timer_mirror.keep_fresh()
 
     # Pre-warm caches so first request is instant
     mcp_hub.warm()
     home.warm()
     Thread(target=_get_fwhisper, daemon=True).start()   # first request pays ~3s otherwise
+    if speaker_profiles.enrolled_people():
+        # The first turn after a restart paid ~1.1s for this, mid-turn.
+        Thread(target=_warm_speaker_model, daemon=True).start()
     if WHISPER_CAREFUL_MODEL:
         Thread(target=_get_fwhisper_careful, daemon=True).start()
     if music is not None:
@@ -1299,11 +1405,25 @@ def main():
     # Speak newly-issued severe weather alerts for home, unprompted
     Thread(target=_severe_alert_watch, daemon=True).start()
 
+    # Is the internet up, and if not why (antigua_core/netstatus.py). Retained
+    # on antigua/net so the display and the satellite can show it.
+    netstatus.monitor = netstatus.NetStatus()
+    netstatus.monitor.listeners.append(_on_net_change)
+    netstatus.monitor.start()
+
+    presence.start()
+    # The Ask Antigua shortcut on the household's phones (LAN port + key).
+    phone_http.start(cfg, lambda text, conv, person: pipeline.dispatch_text(
+        text, conversation_id=conv, follow_up=True, quiet=True, speaker=person,
+        source="phone"), presence if presence.enabled else None)
+
     host = cfg["server"]["host"]
     port = cfg["server"]["port"]
     server = ThreadingHTTPServer((host, port), AntiguaHandler)
     log.info("HTTP on %s:%d", host, port)
-    log.info("Whisper: faster-whisper base (CPU, int8)")
+    log.info("Whisper: %s (CPU fallback: faster-whisper %s)%s",
+             WHISPER_GPU_URL or "no GPU server", WHISPER_FW_MODEL,
+             "" if WHISPER_DETECT_LANGUAGE else ", language detection off")
     log.info("Ollama:  %s", OLLAMA_MODEL)
     log.info("TTS:     %s (fallback: %s)", REMOTE_TTS_URL, FALLBACK_TTS_URL or "none")
     log.info(

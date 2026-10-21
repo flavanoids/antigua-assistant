@@ -3,3 +3,4 @@
 paho-mqtt~=2.1.0
 PyYAML~=6.0.3
 requests~=2.34.2
+urllib3>=2.8.0          # security floor: CVE-2026-97687/97688/97689

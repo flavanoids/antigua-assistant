@@ -18,10 +18,12 @@ Each subfolder documents one skill: what it does, how it's triggered, where the 
 | [`music/`](music/) | `music` | No |
 | [`living_room_tv/`](living_room_tv/) | `tv` | No (Apple TV + Roku via MCP) |
 | [`govee_lights/`](govee_lights/) | `govee` | No (via MCP) |
+| [`security/`](security/) | `security` | No: Home Assistant + the local event log |
 | [`pineda_display/`](pineda_display/) | `pineda` | Only for "tell me more about this quote" |
 | [`volume/`](volume/) | `volume` | No |
 | [`funny_sound/`](funny_sound/) | `funny_sound` | No: a random downloaded clip |
 | [`news/`](news/) | `news` | Yes: reads the fetched headlines |
+| [`podcast/`](podcast/) | `podcast` | No: the day's episode is picked in code |
 | [`knowledge/`](knowledge/) | `knowledge`, plus follow-ups on `llm`/`search`/`memory_query` | Yes: answers from the Wikipedia article + Wikidata facts |
 | [`recipes/`](recipes/) | `recipe`, plus a cooking session that claims turns before routing | No: real recipes from the web, read as published |
 | [`search/`](search/) | `search`, plus the router on `llm` | Yes: answers from SearXNG results |

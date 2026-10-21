@@ -141,7 +141,7 @@ SPOKEN = [
     ("Hay 1,500 personas y 2.5 kilómetros.", "Hay 1500 personas y dos punto cinco kilómetros."),
     ("Poniendo DeBÍ TiRAR MáS FOToS, de Bad Bunny.", "Poniendo debí tirar más fotos, de Bad Bunny."),
     ("La NASA y la TV.", "La NASA y la TV."),
-    ("**Hola**, soy Antigua...", "Hola, soy Antigua."),
+    ("**Hola**, soy Antigua...", "Hola, soy Antigua…"),
 ]
 
 

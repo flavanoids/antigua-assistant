@@ -200,7 +200,7 @@ COMMAND_CASES = [
     ("stop the recipe", ("end", None)),
     ("I'm done cooking", ("end", None)),
     ("what can I use instead of sour cream", ("sub_q", "sour cream")),
-    # Scaling (docs/recipe_questions_and_scaling_plan.md §2.1).
+    # Scaling.
     ("make it for 4", ("scale", {"servings": 4})),
     ("make the recipe for six people", ("scale", {"servings": 6})),
     ("we're cooking for eight", ("scale", {"servings": 8})),
@@ -217,7 +217,7 @@ COMMAND_CASES = [
     ("normal amount", ("scale", {"factor": 1.0})),
     ("how many does it serve", ("scale", {"ask": True})),
     ("how many servings does it make", ("scale", {"ask": True})),
-    # Free-form questions (docs/recipe_questions_and_scaling_plan.md §1.3).
+    # Free-form questions.
     ("can I skip the vanilla extract", ("skip_q", "vanilla extract")),
     ("can I leave the sour cream out", ("skip_q", "sour cream")),
     ("can I make this without the sour cream", ("skip_q", "sour cream")),

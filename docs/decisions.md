@@ -7,13 +7,30 @@ decision was made or last revisited.
 
 ## Voice input
 
-**Wake word: openWakeWord's built-in `alexa` model, threshold 0.75.**
-It's reliable and needs no training. A custom "Hey Antigua" model is wanted
-but deferred: openWakeWord trains on synthetic TTS speech, and that needs a
-PyTorch training setup the primary doesn't have. In an analysis of 95 turns
-(Sep 24–27, 2026), raising the threshold from 0.6 to 0.75 removed most false
-wakes without losing any real command. Recordings that hit the 15-second cap
-are dropped, because those are almost always TV or conversation.
+**Wake word: openWakeWord's built-in `alexa` model, threshold 0.75, 3
+confirming frames.** It's reliable and needs no training. In an analysis of
+95 turns (Sep 24–27, 2026), raising the threshold from 0.6 to 0.75 removed
+most false wakes without losing any real command. Recordings that hit the
+15-second cap are dropped, because those are almost always TV or
+conversation. A 2026-10-08 clip session (7 clips from table, close, 20 ft
+facing/turned away, and over Netflix) re-validated the pair: every take woke
+except turned away at 20 ft — and that take's score profile (0.86 peak, 1
+frame over) is indistinguishable from the TV near-misses, so no threshold or
+gain change can recover it; only a model trained on the exact phrase
+promises to. A custom "hey antigua" model is now being trained on the
+primary (2026-10-08): the old blocker — no PyTorch training setup — is gone
+(uv-managed CPU-only venv under `kitchen-mic/wake-word-training/`, local
+only). The first run (20k synthetic samples, the documented minimum) came
+out too weak — 0.48 recall, bimodal on its own training data, the user's
+real voice scored 0.00 — so don't train on the minimum; a 100k-sample run
+follows. Swap the model in only after it validates against real voice.
+
+**The reSpeaker's noise floor is hot, so gain is not the pickup lever.** In
+a dead-silent house the mic reads ~1500 RMS (vnr 0-4), so a
+`volume_multiplier` boost would lift the floor along with the far-field
+speech and eat headroom. Speech at 20 ft already peaks near full scale;
+what's missing at distance is SNR and orientation, not level. Clean the
+floor (XMOS noise suppression) or aim the mic, don't amplify.
 
 **Wake word detection runs on the server, not on the mic** (2026-09-21). The
 reSpeaker could run its own `micro_wake_word` model, but the bridge instead
@@ -130,6 +147,13 @@ LAN control where the device allows it. Intent parsing stays in `classify.py`;
 MCP is just the execution layer, reached through a small stdio client
 (`mcp_client.py`) with no SDK dependency.
 
+**Voice can lock the front door, never unlock it** (security skill). The
+cameras and lock go through Home Assistant, not MCP, and "unlock" is
+deliberately not an action: a mishearing or the TV saying her name must never
+open the door. "Unlock the door" gets an explanation; everything else
+(locking, lock state, when, activity, battery) is answered from Home
+Assistant and a local event log that survives HA's recorder purge.
+
 **Music: Apple Music via Music Assistant**, using MA's native API rather than
 its MCP plugin, whose album data lacks `album_type`. "Newest album" needs that
 field to skip singles.
@@ -159,7 +183,7 @@ no model and starts no MCP servers until `/activate`, which keeps a
 small-memory box responsive. Timers aren't synced to it, because both servers
 would fire them.
 
-**The backup keeps the 2B model** (2026-10-03, during a noegpu01 PSU
+**The backup keeps the 2B model** (2026-10-03, during a primary-server PSU
 outage). The backup's GPU, a 4 GB Radeon Vega M, holds `qwen3.5:2b` entirely.
 The test used the stock `qwen3.5:4b` with the same quant and size as the
 primary's uncensored 4B; it spilled 31% to CPU. The test used the fallback's
@@ -188,6 +212,54 @@ continuously, and false wakes capture private conversation. Captures are
 pruned hourly and logs rotated daily. Nothing under `data/`, `logs/` or
 captures is ever committed, and the pre-commit hook enforces it.
 
+**Recordings and transcripts are private on disk** (2026-10-16 security
+review). The SQLite logs follow the 7-day rule too: `tool_calls.db` keeps
+every turn's transcript, so it now keeps 7 days instead of 30. Camera and
+lock events keep 30, which outlasts HA's recorder purge so "when was the
+door last locked" still works. Both prune while the server runs, not only at
+startup. Data directories are 700 and the services' umask is 077. The disks
+aren't encrypted, by decision (2026-10-16). Converting live disks is risky,
+TPM auto-unlock still opens a stolen box, and the network-bound alternative
+(clevis + Tang) wasn't worth it for a home with 7-day retention. Accepted
+risk: someone who takes a box can read its recent recordings, transcripts,
+tokens and keys. Revisit if a box is ever rebuilt anyway.
+
+**Services stay root, inside a sandbox** (2026-10-16). Running as root is
+the household's choice for working on the code and the boxes. Instead of
+service users, each unit gets `server/30-hardening.conf`, which takes away
+only what none of them use: private files, read-only `/usr` `/boot` `/etc`,
+a private `/tmp`, no setuid, no kernel or cgroup changes. That brought
+`systemd-analyze security` from about 9.6 to 6.6.
+
+**MQTT is protected by a per-account egress rule, not passwords**
+(2026-10-16). Mosquitto stays anonymous behind the tunnel. Passwords would
+live in files that the same root processes read, and would mean credential
+support in every client (Antigua, pineda-web, its AirPlay bridge,
+shairport-sync). The real gap was a non-root process on a peer, such as a
+compromised `ollama`, publishing `antigua/play` or a fake alarm. The guard's
+output chain closes exactly that: on each host only the listed accounts can
+open a connection to the broker ([network/README.md](../network/README.md)).
+
+**Nothing on the LAN in cleartext that the tunnel can carry** (2026-10-16).
+The TTS fallback, the standby dashboard and Music Assistant are reached at
+their wg0 addresses. Ollama listens on localhost only, since nothing off-box
+uses it. Home Assistant is the remaining plain-HTTP link. Instead of HTTPS
+(certificates, and it would break the remote-access tunnel), Antigua got its
+own non-admin HA user, limited to the entities it uses. That bounds what a
+sniffed token can do, which was the actual risk.
+
+**A weekly drift check, quiet unless something changed** (2026-10-16). The
+review's findings weren't exotic bugs but drift: a forgotten tunnel hostname,
+CI red for a week, Ollama eight minor versions behind.
+`server/scripts/security_check.py` watches exactly those, plus dependency
+CVEs, loaded guards and new open ports. It reports only new, changed or
+cleared findings, so a message always means something.
+
 **Real config is git-ignored** (2026-09-28). Household names, location, LAN
 addresses and device IDs live in local files; the tracked `*.example.*`
-templates carry generic values, and a fresh clone falls back to them.
+templates carry generic values, and a fresh clone falls back to them. A git
+operation can still destroy those ignored local files: on 2026-09-28 a
+branch switch plus fast-forward merge overwrote and deleted the live
+`server.yaml`, `system_prompt.txt`, `satellite.yaml` and the local `PLAN*.md`
+— restored from the backup's deployed copy and git history. Back the local
+config up before git surgery, not after.

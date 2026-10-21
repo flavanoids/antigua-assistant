@@ -3,6 +3,7 @@
 # deploy_fallback.sh installs a copy with the path rewritten for the backup.
 @ANTIGUA_DIR@/logs/*.log {
     daily
+    maxsize 50M
     rotate 6
     maxage 7
     compress

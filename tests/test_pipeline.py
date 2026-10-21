@@ -296,7 +296,9 @@ def main():
     # a question while "which one?" is pending is answered, not taken as the answer
     cturn("set an alarm for 9 am", cid=T)
     cturn("cancel the alarm", cid=T)
-    assert cturn("what time is my alarm", cid=T)["response"].startswith("You've got an alarm for 6 AM")
+    # (both alarms still set; listed in firing order, which depends on the day)
+    r = cturn("what time is my alarm", cid=T)["response"]
+    assert r.startswith("You've got an alarm for ") and "6 AM every weekday" in r and "9 AM" in r, r
     pipeline.B.timers.cancel_all()
 
     # Skip one day of a repeating alarm; change and move alarms
@@ -349,9 +351,41 @@ def main():
     r = run("")
     assert r["end_conversation"] is True and r["response"] == "", r
 
-    # Garbage on a normal turn speaks a retry prompt
+    # Garbage after a fresh wake word is a false wake too: no words, just the
+    # chat-end cue (when the server has one)
     r = run("uh")
-    assert r["response"] and "end_conversation" not in r, r
+    assert r["end_conversation"] is True and r["response"] == "", r
+    cue_dir = Path(tempfile.mkdtemp(prefix="antigua_cue_"))
+    (cue_dir / "chat_end.wav").write_bytes(b"RIFF")
+    be = make_backend("uh")
+    be.static_audio_dir = cue_dir
+    pipeline.init(be)
+    assert pipeline.run_pipeline("/x.wav")["audio_file"].endswith("chat_end.wav")
+    assert pipeline.run_pipeline("/x.wav", follow_up=True)["audio_file"] == ""
+
+    # After a fresh wake, speech no skill claims must be meant for her
+    asked = []
+    def addressed(answer):
+        def check(heard, last, after_wake=False):
+            asked.append((heard, after_wake))
+            return answer
+        return check
+    be = make_backend("And then I want to do Yoda.")
+    be.check_addressed = addressed(False)
+    pipeline.init(be)
+    r = pipeline.run_pipeline("/x.wav")
+    assert r["end_conversation"] is True and r["response"] == "", r
+    assert asked == [("And then I want to do Yoda.", True)], asked
+    be.check_addressed = addressed(True)
+    assert pipeline.run_pipeline("/x.wav")["response"] == "Okay.", "addressed: the model answers"
+    asked.clear()
+    pipeline.run_pipeline("/x.wav", follow_up=True)   # answering her question: not re-checked
+    be = make_backend("set a pasta timer for 10 minutes")   # a skill: never checked
+    be.check_addressed = addressed(False)
+    pipeline.init(be)
+    assert pipeline.run_pipeline("/x.wav")["response"].startswith("Pasta timer"), "skill runs"
+    assert asked == [], asked
+    pipeline.B.timers.cancel_all()
 
     # Roku without the capability: spoken refusal, no crash (fallback path)
     r = run("mute the tv")
@@ -774,27 +808,7 @@ def main():
     assert r["audio_file"] == str(sounds / "funny_vine-boom.wav"), r
     assert r["response"] == "vine boom" and r["action"] == "funny_sound", r
 
-    # Time queries say "noon"/"midnight" instead of "12:00 PM"/"12:00 AM".
-    class _FixedDatetime(datetime):
-        _fixed = None
-
-        @classmethod
-        def now(cls, tz=None):
-            return cls._fixed
-
-    orig_datetime = pipeline.datetime
-    pipeline.datetime = _FixedDatetime
-    try:
-        _FixedDatetime._fixed = datetime(2026, 9, 13, 12, 0)
-        assert pipeline.format_time_date_response("what time is it") == "It's noon."
-        _FixedDatetime._fixed = datetime(2026, 9, 13, 0, 0)
-        assert pipeline.format_time_date_response("what time is it") == "It's midnight."
-        _FixedDatetime._fixed = datetime(2026, 9, 13, 13, 5)
-        assert pipeline.format_time_date_response("what time is it") == "It's 1:05 PM."
-        _FixedDatetime._fixed = datetime(2026, 9, 13, 12, 30)
-        assert pipeline.format_time_date_response("what time is it") == "It's 12:30 PM."
-    finally:
-        pipeline.datetime = orig_datetime
+    # Time/date answers (noon, midnight, ...) are covered by tests/test_time_date.py.
 
     print("PASS — pipeline stub suite")
 

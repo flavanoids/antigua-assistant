@@ -5,6 +5,7 @@ snoozed-alarm wording, the display-topic gate and the MQTT connect retries.
 """
 
 import logging
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -69,11 +70,51 @@ def timer_fire_text(label: str, kind: str, message: str | None = None) -> str:
     if kind == "alarm":
         if "snooze" in label:
             return "Time to get up."
+        # A named alarm ("gym alarm for 6:00 AM", see alarm_label) says its name.
+        named = re.match(r"(.+?) alarm for ", label)
+        if named and named.group(1) != "wake-up":
+            return f"Your {named.group(1)} alarm is going off."
         return "Good morning, your alarm is going off." if "wake" in label \
             else "Your alarm is going off."
     if kind == "reminder":
         return f"Reminder: {message}." if message else "Here's your reminder."
     return f"Your {label} is done."
+
+
+def audio_file(name: str, *dirs: Path) -> Path | None:
+    """The WAV a GET /audio/<name> asks for, from the first dir that has it.
+
+    Only a bare "<name>.wav" in one of `dirs` is ever served: "../x",
+    "a/b.wav" and "/etc/x" (pathlib's `dir / "/etc/x"` IS "/etc/x") are
+    refused, since the servers run as root."""
+    if not name or "/" in name or "\\" in name or name.startswith(".") or not name.endswith(".wav"):
+        return None
+    for d in dirs:
+        p = d / name
+        if p.is_file():
+            return p
+    return None
+
+
+# Request body caps. A spoken command is a few seconds of 16 kHz mono WAV
+# (~32 KB/s), so 32 MB is minutes of headroom; JSON bodies are tiny.
+MAX_AUDIO_BYTES = 32 * 1024 * 1024
+MAX_JSON_BYTES = 1024 * 1024
+
+
+def read_body(handler, limit: int) -> bytes | None:
+    """A request's body, or None after answering 413 to a Content-Length
+    that's garbled, negative or over `limit`. rfile.read(-1) would block until
+    the client hangs up, and an unchecked length lets any caller make the
+    server buffer as much as it likes. No header means an empty body."""
+    try:
+        length = int(handler.headers.get("Content-Length") or 0)
+    except ValueError:
+        length = -1
+    if not 0 <= length <= limit:
+        handler._json(413, {"error": f"body must be 0-{limit} bytes"})
+        return None
+    return handler.rfile.read(length)
 
 
 def prune_audio(audio_dir: Path, ttl: float, cache_ttl: float = 0,

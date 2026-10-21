@@ -4,6 +4,122 @@ Highlights by month. Git history has the details. New entries go at the top.
 
 ## Unreleased
 
+- **Offline awareness** (2026-10-16), after a DNS/internet outage that
+  afternoon:
+  - **Is the internet down, and why**: `netstatus.py` checks every 30 s, one
+    layer at a time (network port, router, provider, DNS, web), and keeps an
+    outage log. "Is the internet down?", "why?", "when did it go out?"
+    get real answers instead of the model guessing.
+  - **Offline mode**: news, podcasts, scores, prices, traffic, store hours and
+    Apple Music playback answer at once ("I can't ... right now, the
+    internet's been down since 4:02") instead of timing out; weather uses
+    the last forecast; search and Wikipedia questions go to the model, told
+    it can't look things up. She says when it's been out two minutes and
+    when it's back (not overnight). State is retained on `antigua/net`.
+  - **System stats**, read-only (`sysinfo.py`): load, memory, disks,
+    CPU/GPU temperature, GPU use, uptime, and whether the services and the
+    other boxes answer. No restarts, reboots or deletes.
+  - `server/scripts/offline_drill.sh` blocks this box's internet (auto-restore
+    cap) and runs a set of questions to check it all.
+
+- **Doorbell announces people, not motion** (2026-10-16): wind and cars set
+  off the doorbell's motion sensor 300 times a week, and every one said
+  "somebody's at the front door". Cameras now speak only on `announce_on`
+  (default `[person]`); motion is still logged and can still show the video.
+  The doorbell is set to Humans only in the Eufy app so it reports people.
+
+- **iPhones and the HomePod** (2026-10-16), set up in `docs/ios_shortcut.md`:
+  - **Ask Antigua** is an iOS Shortcut that works from Siri, the Watch or a
+    tap. It goes through a separate LAN-only port (9395) that needs a
+    household key, so Antigua's own port stays wg0-only.
+  - **Who's home** comes from the household's phones on the Wi-Fi (ARP
+    scans). Arrival reminders ("remind me to ... when I get home") are spoken
+    in the kitchen when that phone comes back.
+  - **Announcements** play on the bedroom HomePod through Music Assistant
+    ("tell the bedroom dinner's ready"), with a chime, and any music resumes
+    afterwards.
+
+- **Dashboard is LAN-only, enforced** (2026-10-16): a security review found
+  a leftover Cloudflare Tunnel hostname publishing PinedaDisplay (photos,
+  calendar, config backup, and the alarm and control endpoints that reach
+  Antigua) to the internet with no login. The hostname is gone, and
+  `pineda-web-guard` on the primary and backup now keeps `:8090` answering
+  only the LAN, wg0 and localhost, and blocks cloudflared from reaching it
+  even if an ingress rule comes back.
+
+- **Security review fixes** (2026-10-16):
+  - **Ollama** went from 0.32.14 to 0.40.5 on both servers, past the
+    pull-API CVEs (CVE-2026-103663, -85180, -108836). On the primary it now
+    listens on localhost only.
+  - **urllib3 and Werkzeug** got security floors (2.8.0, 3.1.9) in the
+    requirements and on all three boxes.
+  - **Transcripts** in `tool_calls.db` keep 7 days instead of 30, and camera
+    and lock events now expire after 30. Both prune while running.
+  - **Request bodies** to both servers are capped (32 MB audio, 1 MB JSON).
+    A bad `Content-Length` gets a 413 instead of hanging a thread.
+  - **The TTS fallback, standby dashboard and Music Assistant** are reached
+    over wg0, not cleartext LAN.
+  - **Every service is sandboxed** by `server/30-hardening.conf` while still
+    running as root: umask 077, read-only system dirs, private `/tmp`, no
+    setuid. Data, logs and captures are private on disk.
+  - **Only listed accounts on each host can reach MQTT** (an egress rule in
+    the Antigua guard).
+  - **SearXNG** is pinned to a dated image.
+  - **CI is green again:** two lint errors, plus a pipeline test that failed
+    on Fridays and Saturdays because it assumed which alarm fires first.
+
+  Later the same day:
+  - Password and root SSH logins are off on the Pi.
+  - The reSpeaker's Noise key is rotated on the device and both bridges (the
+    procedure is in deployment.md).
+  - The raw speaker enrollment clips are deleted.
+  - A weekly security drift check (`server/scripts/security_check.py`) is
+    in place.
+  - Disk encryption was considered and declined (decisions.md).
+
+  - Antigua uses a non-admin Home Assistant user, limited to its own
+    entities. Push updates moved to `state_changed` events (HA refuses
+    `subscribe_trigger` to non-admin users), and the Eufy bridge restart now
+    presses an `input_button` that an HA automation acts on
+    (`security.eufy_restart_button`).
+
+  Still open: Cloudflare Access on the remaining SSH tunnel (deferred).
+
+- **Everyday basics, and no more pretending** (2026-10-15): a stopwatch,
+  spelling, coin/dice/random numbers, "repeat that", "what can you do", bare
+  "mute", "volume to 3"; indoor temperature, humidity and AC state from the
+  AC controller; store hours from OpenStreetMap; stock, index and crypto
+  prices; air quality and pollen; "show me a recipe for X". A reminder
+  without a time asks when instead of the model saying "Got it". A command
+  no skill can do gets "I can't do that yet", and the system prompt no
+  longer tells the model it sets timers (it had been confirming things it
+  never did). A weekday "good morning" plus an affirmation plays when the
+  back door says you're back in from letting the dogs out.
+
+- **Cameras and the front door** (2026-10-07): "show me the front door" puts
+  the Eufy doorbell or garage camera's livestream on PinedaDisplay (HA
+  pushes it into go2rtc) and closes it when the card goes away, so a battery
+  camera isn't left streaming. A doorbell ring puts the camera up on its own;
+  motion and person detections are only logged. "Lock the door" locks, and
+  lock state, when, activity and battery questions are answered from
+  Home Assistant plus a local SQLite event log that survives HA's recorder
+  purge. Voice can never unlock: a mishearing or the TV saying her name
+  must not open the door. Primary only. Details in
+  `ANTIGUA_SKILLS/security/README.md`.
+
+- **Mic pickup measured, clip by clip** (2026-10-08): two bridge tools for
+  tuning from real data. `clip_test.py` captures one clip at a time from
+  anywhere in the room and scores it through the exact live wake pipeline
+  (peak, consecutive-frame runs over a threshold grid, RMS, transcript), so
+  threshold changes can be read off the table instead of guessed;
+  `capture_samples.py` batch-captures real utterances for wake-word
+  training/validation, auto-split on speech and always keeping the raw
+  session. First findings: the 0.75/3 confirm-frame pair is well calibrated
+  (every position wakes except turned away at 20 ft, whose score profile is
+  identical to TV noise); the reSpeaker's noise floor is hot (~1500 RMS in a
+  dead-silent house), so gain isn't the lever for far-field pickup. A
+  "hey antigua" custom model is now training on the primary.
+
 - **Conversation mode** (2026-10-04): "Alexa, let's chat" starts a
   back-and-forth with no wake word between turns (20s window, soft green
   LED, no beeps). Every plain-speech turn must pass an addressee check (echo
@@ -14,7 +130,7 @@ Highlights by month. Git history has the details. New entries go at the top.
   threshold). Ends on "that's all"/"bye", silence, or speech not for her.
   Details in `ANTIGUA_SKILLS/conversation/README.md`.
 
-- **Less speculative work on noegpu01, faster long replies** (2026-10-01):
+- **Less speculative work on primary-server, faster long replies** (2026-10-01):
   the clock TTS pre-warm (three Kokoro syntheses a minute, ~2,950 a day
   against 0–35 real turns and 17 time questions in two weeks) is gone;
   "what time is it" synthesizes on demand in ~0.3s. The TTS cache now keeps

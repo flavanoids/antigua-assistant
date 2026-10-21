@@ -18,7 +18,9 @@ import re
 _COOK_RE = re.compile(
     r"^(?:(?:can|could|will)\s+you\s+)?(?:please\s+)?(?:"
     r"(?:give|find|get|read|tell)\s+(?:me|us)\s+(?:an?\s+|the\s+|your\s+)?(?:good\s+|easy\s+|simple\s+)?recipe\s+(?:for|to\s+make)|"
-    r"(?:find|look\s+up|search\s+for|pull\s+up)\s+(?:me\s+)?(?:an?\s+|the\s+)?(?:good\s+|easy\s+)?recipe\s+(?:for|to\s+make)|"
+    r"(?:find|look\s+up|search\s+for|pull\s+up|bring\s+up|put\s+up|show|send)\s+(?:me\s+|us\s+)?(?:an?\s+|the\s+)?(?:good\s+|easy\s+)?recipe\s+(?:for|to\s+make)|"
+    r"(?:can|could|may)\s+(?:i|we)\s+(?:get|have|see)\s+(?:an?\s+|the\s+)?(?:good\s+|easy\s+)?recipe\s+(?:for|to\s+make)|"
+    r"(?:i|we)\s+(?:want|need|would\s+like)\s+(?:an?\s+|the\s+)?(?:good\s+|easy\s+)?recipe\s+(?:for|to\s+make)|"
     r"(?:what(?:'s|\s+is)\s+)?(?:an?\s+|the\s+)?(?:good\s+|easy\s+|simple\s+)?recipe\s+for|"
     r"how\s+(?:do|would|should|can|could)\s+(?:i|you|we|one)\s+(?:cook|bake|roast)|"
     r"how\s+to\s+(?:cook|bake|roast)|"
@@ -29,7 +31,8 @@ _COOK_RE = re.compile(
 )
 # "X recipe" / "a recipe" at the end: "cheesecake recipe please".
 _TRAILING_RECIPE_RE = re.compile(
-    r"^(?:(?:give\s+me|find\s+me|read\s+me|i\s+(?:want|need)|i'?d\s+like|get\s+me)\s+)?"
+    r"^(?:(?:can|could)\s+you\s+)?(?:please\s+)?(?:(?:give\s+me|find\s+me|read\s+me|i\s+(?:want|need)|i'?d\s+like|get\s+me|"
+    r"show\s+me|pull\s+up|bring\s+up|look\s+up|find|send\s+me)\s+)?"
     r"(?:an?\s+|the\s+|your\s+)?(?P<dish>.+?)\s+recipe$",
     re.IGNORECASE,
 )
@@ -126,7 +129,8 @@ def parse_recipe_request(transcript: str) -> str | None:
     if m:
         dish = _clean_dish(m.group("dish"))
         if dish and len(dish.split()) <= 6 and not re.search(
-                r"\b(?:another|different|other|new|next|simpler|easier|this|that)\b", dish, re.I):
+                r"\b(?:another|different|other|new|next|simpler|easier|this|that)\b|^(?:an?|the|some)$",
+                dish, re.I):
             return dish
     return None
 
@@ -372,7 +376,7 @@ _LOOKS_Q_RE = re.compile(
     r"|\bwhat\s+(?:should|does)\s+(?:it|this|that)\s+(?:look|be|feel)\s+like\b"
     r"|\b(?:is|are)\s+(?:it|this|that|they)\s+supposed\s+to\s+(?:look|be|feel|jiggle|wobble)\b",
     re.IGNORECASE)
-# Scaling servings (docs/recipe_questions_and_scaling_plan.md §2.1).
+# Scaling servings.
 _NW = r"\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fifteen|twenty|thirty"
 _SCALE_SERVE_RE = re.compile(
     r"^(?:(?:can|could)\s+you\s+)?(?:please\s+)?(?:make|do|scale|adjust|set|size)\s+"

@@ -78,6 +78,31 @@ _PHOTO_WHEN_RE = re.compile(
     re.IGNORECASE,
 )
 
+_IMAGE_SEARCH_RE = re.compile(
+    r"^(?:(?:alexa|antigua|hey)[\s,]+)*(?:(?:can|could)\s+you\s+)?(?:please\s+)?"
+    r"(?:show(?:\s+me|\s+us)?|look\s+up|search\s+for|display|find)?\s*"
+    r"(?:some\s+|a\s+few\s+)?(?:pictures|photos|images|pics)\s+of\s+(.+?)(?:\s+please)?\s*[.?!]*$",
+    re.IGNORECASE,
+)
+_NUM_WORDS = {
+    "1": "A", "2": "B", "3": "C", "4": "D", "5": "E", "6": "F", "7": "G", "8": "H",
+    "one": "A", "two": "B", "three": "C", "four": "D", "five": "E", "six": "F", "seven": "G", "eight": "H",
+    "first": "A", "second": "B", "third": "C", "fourth": "D", "fifth": "E", "sixth": "F", "seventh": "G", "eighth": "H",
+}
+_IMAGE_DETAIL_RE = re.compile(
+    r"^(?:(?:alexa|antigua|hey)[\s,]+)*(?:(?:can|could)\s+you\s+)?(?:please\s+)?"
+    r"(?:tell\s+me\s+(?:more\s+)?about|what\s+(?:is|was)(?:\s+in)?|what's(?:\s+in)?|describe|explain|show\s+me|who\s+is)?\s*"
+    r"(?:(?:picture|photo|image|pic|tile|block|item|letter|number)\s+([a-hA-H]|[1-8]|one|two|three|four|five|six|seven|eight)"
+    r"|(?:the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth)\s+(?:picture|photo|image|pic|tile|block|item))"
+    r"(?:\s+please)?\s*[.?!]*$",
+    re.IGNORECASE,
+)
+_IMAGE_DETAIL_SHORT_RE = re.compile(
+    r"^(?:(?:alexa|antigua|hey)[\s,]+)*(?:(?:can|could)\s+you\s+)?(?:please\s+)?"
+    r"(?:tell\s+me\s+(?:more\s+)?about|what\s+is|what's)\s+([a-hA-H])(?:\s+please)?\s*[.?!]*$",
+    re.IGNORECASE,
+)
+
 
 def parse_pineda_request(transcript: str):
     """(action, arg) for a display request, or None.
@@ -123,6 +148,21 @@ def parse_pineda_request(transcript: str):
     if _PHOTO_WHEN_RE.search(t):
         return "photo_when", None
 
+    m = _IMAGE_SEARCH_RE.search(t)
+    if m:
+        query = m.group(1).strip()
+        if query and not query.lower().startswith("the recipe"):
+            return "image_search", query
+
+    m = _IMAGE_DETAIL_RE.search(t)
+    if m:
+        token = (m.group(1) or m.group(2)).lower()
+        return "image_detail", _NUM_WORDS.get(token, token.upper())
+
+    m = _IMAGE_DETAIL_SHORT_RE.search(t)
+    if m:
+        return "image_detail", m.group(1).upper()
+
     return None
 
 
@@ -147,6 +187,52 @@ _RECIPE_HIDE_RE = re.compile(
     r"|\bgo\s+back\s+to\s+(?:the\s+)?(?:dashboard|normal|home\s+screen|photos?|clock)\b",
     re.IGNORECASE,
 )
+
+
+# ── Clock only / the dashboard ───────────────────────────────────────────────
+
+# "Clock mode", "switch the display to the clock", "show the clock", "go
+# back to the clock". Not "alarm clock", "set the clock", "what time is it".
+# A whole request on its own may still carry the wake word: "Alexa, home".
+_LEAD = r"^(?:(?:alexa|antigua|hey)[\s,]+)*(?:please\s+)?"
+_CLOCK = r"(?<!alarm\s)clock(?:\s+(?:mode|only|face|screen|view))?"
+_CLOCK_ON_RE = re.compile(
+    rf"{_LEAD}(?:the\s+)?{_CLOCK}(?:\s+on)?(?:\s+please)?\s*[.!?]*$"
+    rf"|\b(?:switch|change|go|flip|put|turn|set)\s+(?:back\s+)?(?:the\s+)?(?:{_SCREEN}\s+|it\s+)?"
+    rf"(?:back\s+)?(?:to|into|on)\s+(?:the\s+)?(?:a\s+)?{_CLOCK}\b"
+    rf"|\b(?:show|give)\s+(?:me\s+|us\s+)?(?:just\s+)?(?:the\s+)?(?:big\s+)?{_CLOCK}\b"
+    rf"(?!\s+(?:settings|options))"
+    rf"|\b(?:turn\s+on|start|enter)\s+(?:the\s+)?clock\s+(?:mode|only)\b"
+    rf"|\bjust\s+(?:the\s+|a\s+)?clock\b",
+    re.IGNORECASE,
+)
+# "Home", "go home", "back to the dashboard", "home screen", "exit clock mode".
+_CLOCK_OFF_RE = re.compile(
+    rf"{_LEAD}(?:go\s+)?(?:back\s+)?(?:to\s+)?(?:the\s+)?(?:home|dashboard)(?:\s+screen)?"
+    r"(?:\s+please)?\s*[.!?]*$"
+    rf"|\b(?:switch|change|go|flip|put|turn|set|take)\s+(?:back\s+)?(?:the\s+)?(?:{_SCREEN}\s+|it\s+)?"
+    r"(?:back\s+)?(?:to|on)\s+(?:the\s+)?(?:home(?:\s+screen)?|dashboard)\b"
+    # "turn on the home lights", "switch to the home theater" aren't the screen.
+    r"(?!\s+(?!please|now|again|instead)\w)"
+    r"|\bshow\s+(?:me\s+|us\s+)?the\s+(?:dashboard|home\s+screen)\b"
+    r"|\b(?:exit|leave|close|stop|end|quit|turn\s+off|switch\s+off|cancel)\s+(?:the\s+)?clock"
+    r"(?:\s+(?:mode|only|face|screen|view))?\b"
+    r"|\bclock\s+(?:mode|only)\s+off\b"
+    rf"|\b{_SCREEN}\s+(?:to\s+)?go\s+(?:back\s+)?home\b",
+    re.IGNORECASE,
+)
+
+
+def parse_clock_mode(transcript: str):
+    """"clock" (Clock only on the kiosk) / "home" (the dashboard), or None."""
+    if not transcript:
+        return None
+    t = transcript.strip()
+    if _CLOCK_OFF_RE.search(t):
+        return "home"
+    if _CLOCK_ON_RE.search(t):
+        return "clock"
+    return None
 
 
 def parse_recipe_display(transcript: str):

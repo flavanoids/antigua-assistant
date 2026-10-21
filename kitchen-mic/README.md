@@ -56,7 +56,7 @@ time, so the two copies never listen together.
 | `bridge/kitchen-bridge.service`, `bridge/kitchen-bridge-standby.service` | Units for the primary and the backup (render with `server/scripts/render_unit.py`) |
 | `bridge/captures-prune.{service,timer}` | Deletes captures older than 7 days |
 | `bridge/receiver.py` | Bare diagnostic client: logs device info and writes each utterance to `captures/`, with no Antigua wiring |
-| `bridge/tools/` | `dryrun.py` (end-to-end check with recorded clips, no speaker output), `wakeword_test.py`, `startva_test.py` |
+| `bridge/tools/` | `dryrun.py` (end-to-end check with recorded clips, no speaker output), `wakeword_test.py`, `startva_test.py`, `clip_test.py` (capture/score one clip at a time against the wake model — measures pickup per room position), `capture_samples.py` (batch-capture real utterances for wake-word training/validation) |
 
 ## Setup
 

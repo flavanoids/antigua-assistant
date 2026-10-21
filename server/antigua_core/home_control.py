@@ -79,7 +79,7 @@ _INPUT_NAMES = {"InputTuner": "Live TV", "InputAV1": "AV"}
 # TV action → the function name providers are configured under
 TV_FUNCTIONS = {
     "tv_power_on": "power", "tv_power_off": "power",
-    "tv_volume_up": "volume", "tv_volume_down": "volume",
+    "tv_volume_up": "volume", "tv_volume_down": "volume", "tv_volume_set": "volume",
     "tv_mute": "mute", "tv_unmute": "mute",
     "tv_home": "navigation", "tv_back": "navigation",
     "tv_app": "apps", "tv_input": "inputs",
@@ -249,6 +249,8 @@ class HomeControl:
             res = self.hub.call("roku", "launch_app", {"app_name": roku_name})
         elif action == "tv_input":
             res = self.hub.call("roku", "press_key", {"key_name": arg})
+        elif action not in _ROKU_KEYS:
+            return None             # no Roku key for it (an exact volume level)
         else:
             res = self.hub.call("roku", "press_key", {"key_name": _ROKU_KEYS[action]})
         # The server reports ECP failures as isError=False "Failed to …" text.
@@ -274,6 +276,8 @@ class HomeControl:
             return self._appletv_launch(arg)
         if action in ("tv_mute", "tv_unmute"):
             ok, res = self._appletv_mute(action == "tv_mute")
+        elif action == "tv_volume_set":
+            ok, res = self._atv("set_volume", {"level": int(arg)})
         else:
             tool, args = _APPLETV_CALLS[action]
             ok, res = self._atv(tool, args)

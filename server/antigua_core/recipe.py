@@ -6,7 +6,7 @@ module searches SearXNG for "<dish> recipe", fetches the top pages in
 parallel, keeps the ones that carry that data, ranks them and turns them into
 text that reads well aloud. Nothing here is generated; if no page has a
 recipe, find() returns [] and Antigua says so (hard rule, see
-docs/recipe_skill_plan.md).
+ANTIGUA_SKILLS/recipes/README.md).
 """
 
 import html as _html
@@ -238,8 +238,8 @@ def listed(line: str) -> str:
 
 
 # ── Scaling servings ──────────────────────────────────────────────────────────
-# Pure arithmetic on the published amounts (docs/recipe_questions_and_scaling_
-# plan.md §2). Times, temperatures and pan sizes are never scaled.
+# Pure arithmetic on the published amounts. Times, temperatures and pan sizes
+# are never scaled.
 
 
 _AMT_NUM = r"\d+(?:\s+(?:and\s+)?\d+/\d+)?|\d+/\d+|\d+\.\d+"

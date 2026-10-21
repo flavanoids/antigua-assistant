@@ -17,7 +17,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 
-from . import settings
+from . import household_memory, settings
 
 # ── Reading the turn ─────────────────────────────────────────────────────────
 
@@ -215,7 +215,8 @@ def direct(transcript: str, conversation_id: str = "", now: datetime | None = No
     if kind is None:
         return None
 
-    edge = settings.PERSONA_SASS
+    # The household's "less sass" (household_memory.py) beats server.yaml.
+    edge = household_memory.store().pref("sass", settings.PERSONA_SASS)
     if now.hour < 6 or now.hour >= 23:
         edge -= 1   # late night: quieter, shorter
     if kind in ("jab", "heckle", "roast"):

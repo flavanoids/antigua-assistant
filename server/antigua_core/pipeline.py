@@ -22,19 +22,17 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Thread
 from typing import Callable, Iterator, Optional
 
-from . import chat, household, jokes, persona, settings
+from . import chat, household, household_memory, jokes, persona, settings, turn_timing
 from .caches import pin_year
 from .classify import (
-    _DATE_QUERY_RE,
-    _DIDNT_CATCH,
     _EVENT_WHEN_RE,
     _FOLLOWUP_RE,
     _HOWTO_RE,
     _SEARCH_TEMPORAL_RE,
-    _TIME_QUERY_RE,
     _WEATHER_SIMPLE_RE,
     _WEATHER_TOPIC_RE,
     _extract_memory_keywords,
@@ -96,18 +94,30 @@ from .classify import (
 from .music import MusicError
 from .music_intents import MusicIntent, parse_correction, parse_music
 from .recipe import _EQUIPMENT_RE as _RECIPE_EQUIPMENT_RE
-from .intents.pineda import parse_recipe_display
+from .intents.pineda import parse_clock_mode, parse_recipe_display
 from .intents.recipe import parse_swap_question
 from .recipe_subs import core_name as _recipe_core_name, step_ingredients, table_swap
 from .spanish import reply_in_spanish, to_english_command
 from .stores import _MEMORY_TAGS, TimerSpec as _TimerSpec, _interval_s, _repeat_matches, _repeat_phrase
 from . import calc as calc_skill
 from .intents.commute import parse_commute_request
-from . import howto, podcast
+from . import howto, mcp_client, podcast
 from . import pineda as pineda_skill
 from . import security as security_skill
+from . import climate as climate_skill
+from . import hours as hours_skill
+from . import live as live_skill
+from .intents import utility
+from .intents.climate import parse_climate_request
+from .intents.sysinfo import parse_sysinfo_request
+from . import sysinfo as sysinfo_skill
+from . import netstatus
+from .intents.live import parse_air_request, parse_hours_request, parse_market_request
 from . import recipe_session
+from . import announce as announce_skill
+from . import presence as presence_skill
 from . import sports as sports_skill
+from . import time_date as time_skill
 from . import weather as weather_skill
 
 log = logging.getLogger("antigua_core")
@@ -177,11 +187,25 @@ class Backend:
     # the LLM's conversation history, so "I don't get it" after a joke from
     # the bank knows what the joke was. None = skill replies stay out of it.
     remember_exchange: Optional[Callable[[str, str, str], None]] = None
+    # A "remember ..." the rules can't place -> "event" | "fact" |
+    # "instruction" | None (household_memory.classify_remember). One word
+    # out, so the model only sorts; it never writes what's kept.
+    classify_memory: Optional[Callable[[str], Optional[str]]] = None
     # (heard, her last line) -> is it meant for her? Conversation mode's guard
     # on plain-speech turns (chat.py). None = no conversation mode here.
-    check_addressed: Optional[Callable[[str, str], bool]] = None
+    check_addressed: Optional[Callable[..., bool]] = None
+    # conversation_id -> her last reply in it ("" if none). The fresh-wake
+    # addressee check reads it so "the second one" after a question passes.
+    last_reply: Optional[Callable[[str], str]] = None
     # (conversation_id, max messages) -> None: a longer history for a chat.
     set_history_limit: Optional[Callable[[str, int], None]] = None
+    # Whose phones are on the Wi-Fi (presence.Presence) and the reminders
+    # waiting for someone to get home (presence.ArrivalReminders); None = no
+    # presence here.
+    presence: object = None
+    arrivals: object = None
+    # Speaking on other rooms' speakers (announce.Announcer); None = none set up.
+    announcer: object = None
 
 
 B: Backend = None  # set by init()
@@ -344,6 +368,36 @@ def _resp(t, reply, wav_path, action=None, llm_time=0, **extra):
     return d
 
 
+def _dismiss(t, cue=True):
+    """End the turn without a word. The chat-end cue tells someone who did
+    mean it that she gave up; a VAD follow-up ends with no sound at all."""
+    wav = B.static_audio_dir / "chat_end.wav" if cue and B.static_audio_dir else None
+    return _resp(t, "", str(wav) if wav and wav.exists() else "", end_conversation=True)
+
+
+_gate_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gate")
+
+
+def _start_search_router(t):
+    """Ask the search router now, while the addressee check runs, instead of
+    after it (settings.SEARCH_ROUTER_PARALLEL). _llm_tail uses the answer if
+    the turn gets there; a dismissed turn just drops it."""
+    if (settings.SEARCH_ROUTER_PARALLEL and settings.SEARCH_ENABLED
+            and B.route_search_with_llm is not None):
+        t.search_route = _gate_pool.submit(B.route_search_with_llm, t.transcript)
+
+
+def _wake_addressed(t) -> bool:
+    if B.check_addressed is None:
+        return True
+    last = B.last_reply(t.conversation_id) if B.last_reply is not None else ""
+    t0 = time.time()
+    with turn_timing.timed("addressee"):
+        ok = B.check_addressed(t.transcript, last, after_wake=True)
+    log.info("Wake addressee [%.2fs]: %s", time.time() - t0, "yes" if ok else "no — dismissed")
+    return ok
+
+
 def _speak(t, reply, action=None, static_name=None, **extra):
     """Synthesize (or reuse a pre-generated static WAV) and build the response.
     On a Spanish turn the skill's English reply is spoken in Spanish."""
@@ -363,7 +417,8 @@ def _speak(t, reply, action=None, static_name=None, **extra):
         if not t.quiet and len(_speech_chunks(reply)) > 1:
             _publish_audio(t, reply, lang)
             return _resp(t, reply, None, action=action, streaming=True, **extra)
-        wav_path = B.synthesize(reply, lang=lang)
+        with turn_timing.timed("tts"):
+            wav_path = B.synthesize(reply, lang=lang)
     return _resp(t, reply, wav_path, action=action, **extra)
 
 
@@ -425,6 +480,8 @@ class _Turn:
                                       # (the kitchen bridge plays them on the reSpeaker)
     audio_path: str = None  # the recording, so a skill can re-run STT with hints
     language: str = "en"    # "en" or "es", from STT; picks the LLM hint and TTS voice
+    search_route: Future = None  # the search router, started early (_start_search_router)
+    source: str = "voice"   # "phone": the Ask Antigua shortcut (phone_http.py)
 
 
 # ── Formatters (deterministic replies) ───────────────────────────────────────
@@ -709,27 +766,6 @@ def format_timer_status_reply(ref: TimerRef | None = None, conv_id: str = ""):
     return f"You've got {joined}."
 
 
-def format_time_date_response(transcript: str):
-    """Return a direct time/date answer string, or None if not a time/date query."""
-    is_time = bool(_TIME_QUERY_RE.search(transcript))
-    is_date = bool(_DATE_QUERY_RE.search(transcript))
-    if not (is_time or is_date):
-        return None
-    now = datetime.now()
-    if now.hour == 12 and now.minute == 0:
-        time_str = "noon"
-    elif now.hour == 0 and now.minute == 0:
-        time_str = "midnight"
-    else:
-        time_str = now.strftime("%-I:%M %p")
-    date_str = now.strftime("%A, %B %-d")
-    if is_time and is_date:
-        return f"It's {time_str} on {date_str}."
-    if is_time:
-        return f"It's {time_str}."
-    return f"Today is {date_str}."
-
-
 _WEATHER_FUTURE_RE = re.compile(
     r"\b(tomorrow|tonight|this\s+(?:evening|afternoon|morning|weekend)|"
     r"later|next\s+week|weekend|monday|tuesday|wednesday|thursday|friday|"
@@ -836,7 +872,8 @@ def _handle_music(t, intent=None):
 def _handle_music_fallback(t):
     if B.music is None or B.route_music_with_llm is None:
         return None
-    command = B.route_music_with_llm(t.transcript)
+    with turn_timing.timed("music_router"):
+        command = B.route_music_with_llm(t.transcript)
     intent = parse_music(command) if command else None
     log.info("Music router: %r -> %r (%s)", t.transcript, command,
              f"{intent.kind}/{intent.action}" if intent else "not music")
@@ -884,7 +921,7 @@ def _handle_podcast(t):
 
 def _play_podcast(t, ep, speaker, now, lead=""):
     try:
-        where = B.music.play_url(ep.url, speaker)
+        where = B.music.play_url(ep.url, speaker, title=ep.show or ep.title)
     except MusicError as e:
         log.warning("Podcast: play failed: %s", e)
         return _speak(t, "I couldn't reach the music server.")
@@ -986,8 +1023,11 @@ def _handle_tv(t):
 
 
 def _handle_time_date(t):
-    reply = format_time_date_response(t.transcript)
-    log.info("Time/date shortcut: %s", reply)
+    geocode = getattr(getattr(B, "weather_provider", None), "geocode", None)
+    reply = time_skill.answer(t.transcript, geocode=geocode)
+    if not reply:
+        return None  # world clock with no geocoder — fall through to the LLM tail
+    log.info("Time/date: %s", reply)
     return _speak(t, reply)
 
 
@@ -1124,6 +1164,34 @@ def _session_card():
         lit=lit, checked=checked, skipped=session.skipped, swaps=session.swaps)
 
 
+def _handle_clock_mode(t):
+    """"Clock mode" / "go back home": the kiosk's Clock only, held, or the
+    dashboard. Either way a recipe card that's up comes down. Ahead of the
+    recipe display, which would take "go back to the dashboard" as only
+    hiding the recipe."""
+    action = parse_clock_mode(t.transcript)
+    if action is None:
+        return None
+    P = B.pineda
+    if P is None:
+        return _speak(t, "I can't control the display from here.")
+    log.info("Pineda: %s", action)
+    try:
+        hid = P.takeover_up()
+        if hid:
+            P.clear_takeover()
+        changed = P.hold_clock(action == "clock")
+    except pineda_skill.PinedaError as e:
+        log.warning("Pineda: %s failed: %s", action, e)
+        return _speak(t, _PINEDA_DOWN)
+    if action == "clock":
+        reply = "Okay, clock mode." if changed or hid else "The clock's already up."
+    else:
+        reply = "Okay, back to the dashboard." if changed or hid else \
+            "The display's already on the dashboard."
+    return _speak(t, reply, action=f"pineda_{action}")
+
+
 def _handle_recipe_display(t):
     """"Can you show the recipe again" / "stop the display" — before the
     recipe session, whose "go back" is the previous step."""
@@ -1135,6 +1203,7 @@ def _handle_recipe_display(t):
         return _speak(t, "I can't control the display from here.")
     try:
         if action == "hide":
+            _active_image_searches.clear()
             if not D.hide():
                 return _speak(t, "The display's already back to normal.")
             return _speak(t, "Okay.", action="pineda_recipe_hide")
@@ -1266,6 +1335,10 @@ def _handle_pineda(t):
                              "a minute. Say yes to reboot.")
         if action.startswith("theme"):
             return _pineda_theme(t, P, action, arg)
+        if action == "image_search":
+            return _pineda_image_search(t, P, arg)
+        if action == "image_detail":
+            return _pineda_image_detail(t, P, arg)
         if action == "photo_when":
             return _speak(t, pineda_skill.photo_taken_reply(P.now_showing()["photo"]))
         if action == "phrase":
@@ -1290,14 +1363,136 @@ def _handle_pineda(t):
     return None
 
 
+_active_image_searches: dict[str, dict] = {}
+
+
+def _current_pineda_takeover(P):
+    if P is None:
+        return None
+    try:
+        t = getattr(P, "takeover", None)
+        if callable(t):
+            return t()
+        elif isinstance(t, dict):
+            return t if "card" in t else {"card": t}
+    except Exception as e:
+        log.warning("Pineda takeover lookup failed: %s", e)
+    return None
+
+
+def _pineda_image_search(t, P, query: str):
+    if B.searxng is None:
+        return _speak(t, "Search is currently unavailable.")
+    try:
+        images = B.searxng.search_images(query, count=6)
+    except Exception as e:
+        log.warning("Image search failed: %s", e)
+        return _speak(t, f"I couldn't find pictures of {query}.")
+
+    if not images:
+        return _speak(t, f"I couldn't find any pictures of {query}.")
+
+    entry = {
+        "query": query,
+        "images": {img["id"].upper(): img for img in images},
+        "expires": time.time() + 300,
+    }
+    _active_image_searches["latest"] = entry
+    if t.conversation_id:
+        _active_image_searches[t.conversation_id] = entry
+
+    try:
+        P.show_image_collage(query, images, seconds=120)
+    except pineda_skill.PinedaError as e:
+        log.warning("Pineda: image collage failed: %s", e)
+        return _speak(t, f"Here's what I found for {query}, but I couldn't reach the display.")
+
+    letters = ", ".join(img["id"] for img in images[:min(4, len(images))])
+    return _speak(t, f"Here are some pictures of {query}. Ask about {letters}, or any of them.", action="pineda_image_search")
+
+
+def _pineda_image_detail(t, P, letter: str):
+    letter = letter.upper()
+    images = {}
+    query = ""
+    is_live = False
+
+    # 1. First check if Pineda currently has an active image_search takeover on screen
+    current = _current_pineda_takeover(P)
+    if current and isinstance(current, dict):
+        card = current.get("card")
+        if isinstance(card, dict) and card.get("kind") == "image_search":
+            is_live = True
+            query = card.get("query", "")
+            for img in card.get("images", []):
+                if isinstance(img, dict) and "id" in img:
+                    images[img["id"].upper()] = img
+
+    # 2. If not live on screen, fall back to in-memory session
+    sess = _active_image_searches.get(t.conversation_id) or _active_image_searches.get("latest")
+    now = time.time()
+    if not images:
+        if sess and sess.get("expires", 0) > now:
+            images = sess.get("images", {})
+            query = sess.get("query", "")
+
+    if not images:
+        return _speak(t, "I don't have an active image search on the screen right now.")
+
+    if letter not in images:
+        valid = ", ".join(sorted(images.keys()))
+        return _speak(t, f"I don't see picture {letter}. You can ask about {valid}.")
+
+    img = images[letter]
+
+    # 3. Highlight on screen (or re-show if it had timed out)
+    if P is not None:
+        try:
+            if is_live:
+                P.highlight_image(letter)
+            else:
+                card = {
+                    "kind": "image_search",
+                    "query": query,
+                    "images": list(images.values()),
+                    "highlight": letter,
+                }
+                P.show_takeover(card, seconds=120)
+        except pineda_skill.PinedaError as e:
+            log.warning("Pineda highlight/show failed: %s", e)
+
+    # 4. Refresh session expiration
+    if sess:
+        sess["expires"] = now + 300
+
+    title = img.get("title") or ""
+    snippet = img.get("snippet") or ""
+    source = img.get("source") or ""
+
+    parts = []
+    if title:
+        parts.append(f"Picture {letter} is {title}")
+    if source:
+        parts.append(f"from {source}")
+    intro = " ".join(parts) + "." if parts else f"Here is picture {letter}."
+
+    if snippet:
+        reply = f"{intro} {snippet}"
+    else:
+        reply = intro
+
+    return _speak(t, reply, action="pineda_image_detail")
+
+
 def _pineda_theme(t, P, action, arg):
     themes = P.themes()
     names = [x["label"] for x in pineda_skill.base_themes(themes)]
     if action == "theme_list":
         return _speak(t, f"The display has {pineda_skill.spoken_list(names)}.")
-    current = P.current_theme()
+    status = P.status()
+    current = status["theme"]
     if action == "theme_current":
-        return _speak(t, f"The display is on {pineda_skill.theme_label(themes, current)}.")
+        return _speak(t, f"The display is on {status['theme_label']}.")
     chosen = None
     if action in ("theme", "theme_named"):
         chosen = pineda_skill.match_theme(arg, themes)
@@ -1382,8 +1577,34 @@ def _save_memory(t, person, fact):
     return f"Got it. I'll remember {person} {fact} at {ts}."
 
 
+def _save_fact(t, person, fact, decision):
+    """A lasting household fact, in the speaker's words but third person:
+    the file is shared, so "I" would mean nobody."""
+    text = household_memory.third_person(fact, person) if person else fact
+    return household_memory.store().add_fact(text, person, t.transcript, decision)
+
+
 def _handle_memory_save(t):
     fact = parse_remember_request(t.transcript)
+    # The guard first: a fact, a preference, a behavior request (pending
+    # review, never applied) or the notepad (household_memory.py).
+    decision = household_memory.classify_remember(fact, t.speaker, B.classify_memory)
+    log.info("Remember: %r -> %s (%s)", fact, decision.kind, decision.reason)
+    hm = household_memory.store()
+    if decision.kind in ("proposal", "refused"):
+        return _speak(t, hm.propose(fact, t.speaker, decision))
+    if decision.kind == "pref":
+        return _speak(t, hm.apply_pref(decision, t.transcript, t.speaker))
+    if decision.kind == "fact":
+        named = extract_remember_person(t.transcript)
+        if household_memory.first_person(fact) and not (t.speaker or named):
+            _pending_memories[t.conversation_id] = {
+                "fact": "__fact__", "text": fact, "decision": decision,
+                "expires": time.time() + 60,
+            }
+            reply = f"Who's that about{household.choice()}?"
+            return _speak(t, reply, expects_reply=True)
+        return _speak(t, _save_fact(t, t.speaker or named, fact, decision))
     # An explicit "for <name>" always wins; speaker ID only fills in when the
     # transcript itself doesn't say who this is for.
     person = extract_remember_person(t.transcript) or t.speaker
@@ -1399,8 +1620,28 @@ def _handle_memory_save(t):
     return _speak(t, reply, expects_reply=_asks(reply))
 
 
+def _handle_memory_household(t):
+    """"What do you remember about us?" — the household file, read out."""
+    return _speak(t, household_memory.store().summary())
+
+
+def _handle_memory_pref(t):
+    """"Speak English again", "stop calling me boss": an allowlisted
+    preference said without "remember"."""
+    decision = household_memory.parse_pref(t.transcript, t.speaker, lasting_only=True)
+    if decision is None:
+        return None
+    if decision.kind == "refused":
+        return _speak(t, household_memory.store().propose(t.transcript, t.speaker, decision))
+    return _speak(t, household_memory.store().apply_pref(decision, t.transcript, t.speaker))
+
+
 def _handle_memory_forget_content(t):
     keyword, delete_all = parse_forget_content(t.transcript)
+    # Household facts and learned recipes are shared, so nobody needs naming.
+    shared = household_memory.store().forget(keyword, t.transcript, t.speaker)
+    if shared:
+        return _speak(t, shared)
     person = extract_query_person(t.transcript) or t.speaker
     if not person:
         _pending_memories[t.conversation_id] = {
@@ -1792,18 +2033,77 @@ def _handle_reminder_set(t):
         log.info("Reminder set: %s", reply)
         return _speak(t, reply)
 
-    # Under-specified: a day but no time. Ask, and stash the partial parse.
+    # Under-specified: no time (maybe a day). Ask, and stash the partial parse.
     partial = reminder_missing_time(t.transcript)
     if partial:
         message, day_phrase = partial
+        place = _REMINDER_PLACE_RE.search(message)
+        if place:
+            message = message[:place.start()].strip(" ,")
         _pending_reminders[t.conversation_id] = {
             "message": message, "day_phrase": day_phrase,
             "expires": time.time() + 60,
         }
         log.info("Reminder time pending for conv %s: %r %s",
                  t.conversation_id, message, day_phrase)
+        if place:
+            return _ask(t, "I can only remind you at a time, not when you get somewhere. "
+                           "What time should I remind you?")
+        if not day_phrase:
+            return _ask(t, "When should I remind you?")
         return _ask(t, f"What time {day_phrase} would you like to be reminded?")
     return None
+
+
+# "...when I get home" / "when I leave work": a place, not a time.
+_REMINDER_PLACE_RE = re.compile(
+    r"\b(?:when|once|as\s+soon\s+as)\s+(?:i|we)(?:'m|\s+am|\s+get|\s+come|\s+arrive|\s+leave|\s+go)\b",
+    re.IGNORECASE)
+
+
+def _handle_presence(t):
+    who = presence_skill.parse_presence_query(t.transcript)
+    return _speak(t, presence_skill.query_reply(who, B.presence))
+
+
+def _handle_arrival_reminder(t):
+    parsed = presence_skill.parse_arrival_reminder(t.transcript, t.speaker)
+    if parsed is None:
+        return None
+    if B.arrivals is None:
+        return _speak(t, "Reminders for when someone gets home need the main server.")
+    person, message, kind = parsed
+    if person is None:
+        name = (household.names() or ["Sam"])[0]
+        return _speak(t, "I don't know who's asking, so tell me who it's for. "
+                         f"Say, remind {name} to check the mail when they get home.")
+    B.arrivals.add(person, message, by=t.speaker, kind=kind)
+    log.info("Arrival reminder for %s (from %s): %s %s", person, t.speaker, kind, message)
+    return _speak(t, presence_skill.set_reply(person, t.speaker, B.presence))
+
+
+def _handle_announce(t):
+    A = B.announcer
+    parsed = announce_skill.parse(t.transcript)
+    if parsed is None:
+        return None
+    if A is None:
+        return _speak(t, "I can't make announcements from here.")
+    rooms, message = parsed
+    if rooms is None:
+        # From the phone, everywhere; said in the kitchen, the other rooms.
+        rooms = A.everywhere if t.source == "phone" else A.default
+    if t.source != "phone":
+        rooms = [r for r in rooms if A.rooms.get(r) != announce_skill.KITCHEN] or rooms
+    if t.quiet and t.source != "phone":
+        return _speak(t, announce_skill.reply(rooms, []))   # a QA dry run stays silent
+    wav = B.synthesize(announce_skill.spoken_message(message, t.speaker))
+    if not wav:
+        return _speak(t, "Sorry, I couldn't make the announcement.")
+    url = f"{B.audio_url_base()}/audio/{Path(wav).name}"
+    done, failed = A.announce(
+        rooms, url, kitchen_play=lambda u: settings.mqtt_publish("antigua/play", {"audio_url": u}))
+    return _speak(t, announce_skill.reply(done, failed))
 
 
 def _cap(text: str) -> str:
@@ -2001,6 +2301,9 @@ _REMINDER_ABORT_RE = re.compile(
 )
 _DAYPART_WORD_RE = re.compile(
     r"\b(morning|afternoon|evening|night|noon|midnight)\b", re.IGNORECASE)
+_REMINDER_WHEN_RE = re.compile(
+    r"^(?:in|after)\s|\b(?:tonight|tomorrow|today|monday|tuesday|wednesday|thursday|friday|"
+    r"saturday|sunday|minutes?|hours?)\b", re.IGNORECASE)
 
 
 def _handle_pending_reminder(t):
@@ -2019,10 +2322,12 @@ def _handle_pending_reminder(t):
     # "at 9" / "around 6" / "for 7:30" -> strip the preposition; we re-add "at".
     reply = re.sub(r"^(?:at|on|for|by|around|about|maybe)\s+", "", reply, flags=re.IGNORECASE)
 
-    if _DAYPART_WORD_RE.search(reply):
-        combined = f"remind me to {msg} {reply} {day}"
+    if _DAYPART_WORD_RE.search(reply) or _REMINDER_WHEN_RE.search(reply):
+        # "tonight", "in 20 minutes", "tomorrow at 9": a whole time phrase.
+        # A leading number is a clock time: "7 tonight" -> "at 7 tonight".
+        combined = f"remind me to {msg} {'at ' if reply[:1].isdigit() else ''}{reply} {day}".strip()
     elif re.search(r"\d", reply):
-        combined = f"remind me to {msg} at {reply} {day}"
+        combined = f"remind me to {msg} at {reply} {day}".strip()
     else:
         # Not a time — drop the pending reminder and let the turn route normally.
         del _pending_reminders[t.conversation_id]
@@ -2102,14 +2407,15 @@ def _run_search(t, query, engines):
     live = engines == settings.SEARCH_NEWS_ENGINES
     fresh = bool(re.search(r"\b(19|20)\d{2}\b", query))
     try:
-        direct_answer, results, query = B.searxng.search_best(
-            query,
-            engines=engines,
-            count=settings.SEARCH_LIVE_RESULT_COUNT if live else 0,
-            wiki=not live,
-            categories="news" if live else "general",
-            fresh=fresh,
-        )
+        with turn_timing.timed("search"):
+            direct_answer, results, query = B.searxng.search_best(
+                query,
+                engines=engines,
+                count=settings.SEARCH_LIVE_RESULT_COUNT if live else 0,
+                wiki=not live,
+                categories="news" if live else "general",
+                fresh=fresh,
+            )
         if direct_answer or results:
             t.extra_context = B.searxng.format_for_prompt(
                 query, direct_answer, results, live=live
@@ -2170,7 +2476,7 @@ def _handle_knowledge(t):
 
 def _start_recipe(t, dish, servings=0):
     """Find `dish` online and read its ingredients. Never a made-up recipe:
-    no page with recipe data means saying so (docs/recipe_skill_plan.md).
+    no page with recipe data means saying so (see ANTIGUA_SKILLS/recipes/README.md).
     `servings` is the "for 4 people" of the request, or the target carried
     from the recipe before it."""
     # A fresh search takes several seconds; say something while it runs.
@@ -2186,7 +2492,9 @@ def _start_recipe(t, dish, servings=0):
         log.info("recipe_not_found: %r", dish)
         reply = f"Sorry, I couldn't find a recipe online for {dish}."
     else:
-        session, reply = recipe_session.start(dish, recipes, servings)
+        # The one picked or cooked last time goes first (household_memory).
+        recipes, lead = household_memory.store().recall_recipe(dish, recipes)
+        session, reply = recipe_session.start(dish, recipes, servings, lead)
         log.info("Recipe: %r -> %r from %s (%d candidates)", dish, session.recipe.title,
                  session.recipe.url, len(recipes))
     if not streamed:
@@ -2287,9 +2595,11 @@ def _publish_audio(t, text, lang=None):
     for chunk in _speech_chunks(text):
         if _stop_epoch != epoch:
             return
-        wav_path = B.synthesize(chunk, lang=lang or t.language)
+        with turn_timing.timed("tts"):
+            wav_path = B.synthesize(chunk, lang=lang or t.language)
         if wav_path and not t.quiet:
             settings.mqtt_publish(t.play_topic, {"audio_url": f"{B.audio_url_base()}/audio/{Path(wav_path).name}"})
+            turn_timing.audio_out()
 
 
 def _handle_recipe(t):
@@ -2314,10 +2624,15 @@ def _handle_recipe_session(t):
     eggs... The session decides what it can claim."""
     if B.recipes is None or not t.transcript:
         return None
+    session = recipe_session.current()
+    before = session.stage if session else None
     reply = recipe_session.handle(t.transcript)
     if reply is None:
         return None
     log.info("Recipe turn: %r -> %r", t.transcript, reply.text[:80])
+    if session is not None:  # the same object, moved on by handle()
+        household_memory.store().note_cooking(session.dish, session.recipe, before,
+                                              session.stage, t.speaker)
     if reply.fetch:
         prev = recipe_session.current()
         return _start_recipe(t, reply.fetch, getattr(prev, "pending_servings", 0) if prev else 0)
@@ -2443,7 +2758,224 @@ def _knowledge_followup(t, route) -> bool:
     return True
 
 
+# ── Small everyday requests (intents/utility.py) ─────────────────────────────
+
+_stopwatch = {"started": None, "elapsed": 0.0}   # one, for the house
+_last_said = {"text": "", "at": 0.0}             # for "repeat that"
+_REPEAT_WINDOW = 600
+
+_LETTER_NAMES = dict(zip("abcdefghijklmnopqrstuvwxyz", (
+    "ay bee see dee ee eff gee aitch eye jay kay el em en oh pee cue ar ess tee you vee "
+    "double-you ex why zee").split()))
+
+_HELP_TEXT = ("I can set timers, alarms and reminders, play music and podcasts, and tell you "
+              "the weather, the news, scores and drive times. I control the lights, the TV and "
+              "the kitchen display, read you recipes step by step, keep shopping lists, and answer "
+              "questions. Just ask.")
+
+
+def _spoken_span(seconds: float) -> str:
+    s = int(round(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    parts = [f"{n} {u}{'' if n == 1 else 's'}" for n, u in ((h, "hour"), (m, "minute"), (sec, "second")) if n]
+    if not parts:
+        return "zero seconds"
+    return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + f" and {parts[-1]}"
+
+
+def _stopwatch_elapsed() -> float:
+    run = time.time() - _stopwatch["started"] if _stopwatch["started"] else 0.0
+    return _stopwatch["elapsed"] + run
+
+
+def _handle_stopwatch(t):
+    action = utility.parse_stopwatch(t.transcript)
+    running = _stopwatch["started"] is not None
+    if action == "start":
+        if running:
+            return _speak(t, f"The stopwatch is already running: {_spoken_span(_stopwatch_elapsed())}.")
+        _stopwatch["started"] = time.time()
+        return _speak(t, "Stopwatch started." if not _stopwatch["elapsed"] else "Stopwatch running again.")
+    if action == "reset":
+        _stopwatch.update(started=time.time() if running else None, elapsed=0.0)
+        return _speak(t, "Stopwatch reset." + (" It's still running." if running else ""))
+    total = _stopwatch_elapsed()
+    if action == "stop":
+        if not running:
+            return _speak(t, "The stopwatch isn't running." if not total
+                          else f"The stopwatch is stopped at {_spoken_span(total)}.")
+        _stopwatch.update(started=None, elapsed=total)
+        return _speak(t, f"Stopped at {_spoken_span(total)}.")
+    if not running and not total:
+        return _speak(t, "The stopwatch isn't running.")
+    return _speak(t, f"{_spoken_span(total)}{'' if running else ', stopped'}.")
+
+
+def _handle_spell(t):
+    word = utility.parse_spell(t.transcript)
+    letters = [_LETTER_NAMES.get(c, c) for c in word if c.isalpha()]
+    return _speak(t, f"{word.capitalize()} is spelled {', '.join(letters)}.")
+
+
+def _handle_random(t):
+    req = utility.parse_random(t.transcript)
+    if req[0] == "coin":
+        return _speak(t, f"It's {random.choice(['heads', 'tails'])}.")
+    if req[0] == "dice":
+        _, count, sides = req
+        rolls = [random.randint(1, sides) for _ in range(count)]
+        if count == 1:
+            return _speak(t, f"You rolled {'an' if rolls[0] in (8, 11, 18) else 'a'} {rolls[0]}.")
+        return _speak(t, f"You rolled {_speak_items([str(r) for r in rolls])}, for {sum(rolls)}.")
+    _, lo, hi = req
+    return _speak(t, f"{random.randint(lo, hi)}.")
+
+
+def _handle_help(t):
+    return _speak(t, _HELP_TEXT)
+
+
+def _handle_repeat(t):
+    if not _last_said["text"] or time.time() - _last_said["at"] > _REPEAT_WINDOW:
+        return _speak(t, "I haven't said anything lately.")
+    return _speak(t, _last_said["text"])
+
+
+def _handle_mute(t):
+    action = utility.parse_mute(t.transcript)
+    if B.music is not None and B.music.playing() and action == "mute":
+        return _handle_music(t, MusicIntent("control", "pause"))
+    if B.home is None or not B.home.tv_available():
+        return _speak(t, "There's nothing playing to mute.")
+    result = B.home.tv(f"tv_{action}")
+    log.info("Mute -> TV: %s -> %s", action, result)
+    if result != "ok":
+        return _speak(t, _TV_NO_RESPONSE)
+    return _resp(t, "", None, action=f"tv_{action}")
+
+
+def _handle_volume_set(t):
+    level = utility.parse_volume_level(t.transcript)
+    if B.music is not None and B.music.playing():
+        return _handle_music(t, MusicIntent("control", "volume_set", level=level))
+    if B.home is None or not B.home.tv_available():
+        return _speak(t, "There's nothing playing to change the volume of.")
+    result = B.home.tv("tv_volume_set", str(level))
+    log.info("Volume set -> TV: %d -> %s", level, result)
+    return _speak(t, f"TV volume {level}." if result == "ok" else _TV_NO_RESPONSE)
+
+
+def _handle_unsupported(t):
+    # A conversation is talk, not commands: "set me straight" isn't a request.
+    if chat.active(t.conversation_id):
+        return None
+    reply = utility.unsupported_reply(t.transcript)
+    log.info("Unsupported: %r -> %r", t.transcript, reply)
+    return _speak(t, reply)
+
+
+# ── Inside the house, store hours, markets, air ──────────────────────────────
+
+
+def _handle_climate(t):
+    kind = parse_climate_request(t.transcript)
+    reply = climate_skill.answer(kind)
+    log.info("Climate: %s -> %r", kind, reply)
+    return _speak(t, reply)
+
+
+def _handle_sysinfo(t):
+    kind = parse_sysinfo_request(t.transcript)
+    try:
+        reply = (sysinfo_skill.net_answer(kind[4:]) if kind.startswith("net_")
+                 else sysinfo_skill.system_answer(kind))
+    except Exception:
+        log.exception("Sysinfo: %s", kind)
+        reply = "I couldn't read the system stats just now."
+    log.info("Sysinfo: %s -> %r", kind, reply)
+    return _speak(t, reply)
+
+
+# With the internet down (netstatus), these can only time out: say so at once.
+_NEEDS_INTERNET = {
+    "news": "get the news", "podcast": "play podcasts", "sports": "check scores",
+    "market": "check prices", "air": "check the air quality", "hours": "look up store hours",
+    "commute": "check traffic",
+}
+# These fall back to the model, which answers from what it knows (offline_hint).
+_OFFLINE_TO_LLM = ("search", "knowledge")
+
+
+def _offline_reply(t, route):
+    what = _NEEDS_INTERNET.get(route)
+    if route == "music":
+        intent = parse_music(t.transcript)
+        if intent is not None and intent.kind == "play":
+            what = "play from Apple Music"     # pause, skip and volume stay local
+    if what is None:
+        return None
+    reply = f"I can't {what} right now. {sysinfo_skill.offline_phrase()}"
+    log.info("Offline: %s -> %r", route, reply)
+    return _speak(t, reply)
+
+
+def _handle_air(t):
+    kind = parse_air_request(t.transcript)
+    reply = live_skill.pollen_answer() if kind == "pollen" else live_skill.air_answer()
+    if reply is None:
+        reply = ("I can't get the pollen count right now." if kind == "pollen"
+                 else "I can't get the air quality right now.")
+    log.info("Air: %s -> %r", kind, reply)
+    return _speak(t, reply)
+
+
+def _handle_market(t):
+    req = parse_market_request(t.transcript)
+    reply = live_skill.market_answer(req.kind, req.key)
+    log.info("Market: %s %s -> %r", req.kind, req.key, reply)
+    return _speak(t, reply or "I can't get market prices right now.")
+
+
+def _handle_hours(t):
+    req = parse_hours_request(t.transcript)
+    if B.commute is None or req is None:
+        return None
+    try:
+        status, val = B.commute.resolver.resolve(req.place)
+    except Exception:
+        log.exception("Hours: resolving %r", req.place)
+        return None
+    if status == "ask":
+        val = val[1][0]           # nearest of a chain; or the first of a shared name
+        status = "found"
+    if status != "found" or not val.osm:
+        log.info("Hours: no store for %r (%s)", req.place, status)
+        return None               # web search has a go
+    week = hours_skill.parse_opening_hours(hours_skill.opening_hours(val) or "")
+    if week is None:
+        log.info("Hours: no readable hours for %s (%s)", val.label or val.name, val.osm)
+        return None
+    label = val.label or val.name
+    reply = hours_skill.answer(req.kind, label, week, req.day)
+    log.info("Hours: %s %s -> %r", req.kind, val.osm, reply)
+    return _speak(t, reply)
+
+
 _HANDLERS = {
+    "stopwatch": _handle_stopwatch,
+    "spell": _handle_spell,
+    "random": _handle_random,
+    "help": _handle_help,
+    "repeat": _handle_repeat,
+    "mute": _handle_mute,
+    "volume_set": _handle_volume_set,
+    "climate": _handle_climate,
+    "sysinfo": _handle_sysinfo,
+    "air": _handle_air,
+    "hours": _handle_hours,
+    "market": _handle_market,
+    "unsupported": _handle_unsupported,
     "funny_sound": _handle_funny_sound,
     "volume": _handle_volume,
     "podcast": _handle_podcast,
@@ -2455,6 +2987,8 @@ _HANDLERS = {
     "time_date": _handle_time_date,
     "weather": _handle_weather,
     "display": _handle_display,
+    "memory_household": _handle_memory_household,
+    "memory_pref": _handle_memory_pref,
     "memory_save": _handle_memory_save,
     "memory_forget_content": _handle_memory_forget_content,
     "memory_forget_last": _handle_memory_forget_last,
@@ -2473,6 +3007,9 @@ _HANDLERS = {
     "timer_set": _handle_timer_set,
     "alarm_set": _handle_alarm_set,
     "reminder_set": _handle_reminder_set,
+    "announce": _handle_announce,
+    "presence": _handle_presence,
+    "arrival_reminder": _handle_arrival_reminder,
     "calc": _handle_calc,
     "commute": _handle_commute,
     "sports": _handle_sports,
@@ -2522,6 +3059,9 @@ def _handle_pending_reply(t):
                 reply = f"Done, I've forgotten that {person_reply} {deleted[0]['raw']}."
         else:
             reply = f"I don't have any memories about {keyword} for {person_reply}."
+    elif pending["fact"] == "__fact__":
+        del _pending_memories[t.conversation_id]
+        reply = _save_fact(t, person_reply, pending["text"], pending["decision"])
     elif pending["fact"] == "__medicine_query__":
         del _pending_memories[t.conversation_id]
         reply = _answer_medicine_query(person_reply)
@@ -2599,6 +3139,59 @@ def _news_followup_context(t) -> str | None:
     return "\n".join(lines) + footer
 
 
+# answer_length preference -> (per-turn hint, max_tokens floor)
+_LENGTH_HINTS = {"short": ("Answer in one short sentence.", None),
+                 "long": ("A fuller answer is welcome, up to four sentences.", 160)}
+
+
+def _household_hints(t, route, turn_hint):
+    """The household file's say in this turn (household_memory.py). Each
+    hint is one line; the servers put each in its own parentheses. Every
+    word here is a fixed template except the notes, which are quoted as
+    information, and a call-me name, which was validated when it was set."""
+    hm = household_memory.store()
+    if hm.pref("reply_language") == "es":
+        t.language = "es"
+    hints = [turn_hint] if turn_hint else []
+    if not t.grounding:
+        rules = hm.rules_hint()
+        if rules:
+            hints.append(rules)
+        length = _LENGTH_HINTS.get(hm.pref("answer_length"))
+        if length:
+            hints.append(length[0])
+            if length[1] and not t.max_tokens:
+                t.max_tokens = length[1]
+        name = hm.call_name(t.speaker)
+        if name:
+            hints.append(f'The speaker is {t.speaker}; they like to be called "{name}".')
+    if route == "llm" and not t.grounding and t.extra_context is None:
+        notes = hm.prompt_notes(t.transcript)
+        if notes:
+            hints.append(notes)
+            log.info("Household notes: %s", notes)
+    return "\n".join(hints) or None
+
+
+_SPLIT_MIN_CHARS = 20   # neither part shorter than this: a stub sounds clipped
+
+
+def _split_first(sentence: str) -> tuple[str, str]:
+    """(head, rest) of a long first sentence, cut at the comma nearest its
+    middle, or (sentence, "") when it's short or has no usable comma
+    (settings.TTS_SPLIT_FIRST_OVER_CHARS). The rest joins the tail, which is
+    synthesized as one utterance, so only one seam is added."""
+    limit = settings.TTS_SPLIT_FIRST_OVER_CHARS
+    if not limit or len(sentence) <= limit:
+        return sentence, ""
+    cuts = [m.end() for m in re.finditer(r",\s", sentence)
+            if _SPLIT_MIN_CHARS <= m.end() <= len(sentence) - _SPLIT_MIN_CHARS]
+    if not cuts:
+        return sentence, ""
+    cut = min(cuts, key=lambda i: abs(i - len(sentence) / 2))
+    return sentence[:cut].rstrip(), sentence[cut:].strip()
+
+
 def _llm_tail(t, route):
     """Context injection (memory follow-up, memory query, LLM search router)
     and the streaming LLM → per-sentence TTS → MQTT publish loop."""
@@ -2657,8 +3250,11 @@ def _llm_tail(t, route):
         and settings.SEARCH_ENABLED
         and t.extra_context is None
         and B.route_search_with_llm is not None
+        and netstatus.online()
     ):
-        routed = B.route_search_with_llm(t.transcript)
+        with turn_timing.timed("search_router"):
+            routed = (t.search_route.result() if t.search_route is not None
+                      else B.route_search_with_llm(t.transcript))
         if routed:
             query = routed
             engines = (
@@ -2684,6 +3280,7 @@ def _llm_tail(t, route):
     if (turn_hint is None and t.extra_context is None and not t.grounding
             and chat.active(t.conversation_id)):
         turn_hint = chat.HINT
+    turn_hint = _household_hints(t, route, turn_hint)
 
     settings.mqtt_publish("antigua/status", {"state": "thinking"})
     t_llm = time.time()
@@ -2692,14 +3289,16 @@ def _llm_tail(t, route):
     first_sentence = True
     server_base = B.audio_url_base()
 
-    def _publish(text_chunk):
+    def _publish(text_chunk, stage):
         if _stop_epoch != epoch:
             return
-        wav_path = B.synthesize(text_chunk, lang=t.language)
+        with turn_timing.timed(stage):
+            wav_path = B.synthesize(text_chunk, lang=t.language)
         if wav_path:
             audio_url = f"{server_base}/audio/{Path(wav_path).name}"
             if not t.quiet:
                 settings.mqtt_publish(t.play_topic, {"audio_url": audio_url})
+                turn_timing.audio_out()
             log.info("Chunk published: %s", text_chunk[:60])
 
     tail_parts = []
@@ -2721,14 +3320,18 @@ def _llm_tail(t, route):
             break
         response_parts.append(sentence)
         if first_sentence:
+            turn_timing.add("llm_first", time.time() - t_llm)
             settings.mqtt_publish("antigua/status", {"state": "speaking"})
             first_sentence = False
-            _publish(sentence)
+            head, rest = _split_first(sentence)
+            _publish(head, "tts_first")
+            if rest:
+                tail_parts.append(rest)
         else:
             tail_parts.append(sentence)
 
     if tail_parts:
-        _publish(" ".join(tail_parts))
+        _publish(" ".join(tail_parts), "tts_rest")
 
     llm_time = round(time.time() - t_llm, 2)
 
@@ -2751,6 +3354,7 @@ def run_pipeline(audio_path, conversation_id="", follow_up=False, play_topic="an
     # 1. STT (speaker ID runs in a thread parallel to it — both read the same
     # WAV, so on a capable backend this costs approximately zero wall-clock
     # time; on the fallback, B.identify_speaker is None and nothing runs).
+    turn_timing.start()
     settings.mqtt_publish("antigua/status", {"state": "transcribing"})
     speaker_result = {}
     speaker_thread = None
@@ -2766,16 +3370,19 @@ def run_pipeline(audio_path, conversation_id="", follow_up=False, play_topic="an
 
     _cleanup_last_topics()
     prefer = _conv_language.get(conversation_id, {}).get("lang")
-    stt_result = B.transcribe(audio_path, prefer=prefer) if prefer else B.transcribe(audio_path)
+    with turn_timing.timed("stt"):
+        stt_result = B.transcribe(audio_path, prefer=prefer) if prefer else B.transcribe(audio_path)
     language = stt_result.get("language", "en")
     if stt_result.get("lang_probs"):
         log.info("STT language: %s %s", language, stt_result["lang_probs"])
     transcript = strip_wake_prefix(correct_transcript(stt_result["text"]))
     if language == "en":   # medium.en is English-only
-        transcript = _second_opinion(audio_path, transcript)
+        with turn_timing.timed("stt_second"):
+            transcript = _second_opinion(audio_path, transcript)
 
     if speaker_thread is not None:
-        speaker_thread.join(timeout=5.0)  # generous — extraction is normally <0.5s
+        with turn_timing.timed("speaker_wait"):
+            speaker_thread.join(timeout=5.0)  # generous — extraction is normally <0.5s
 
     return dispatch_text(
         transcript,
@@ -2833,9 +3440,15 @@ def dispatch_text(transcript, conversation_id="", follow_up=False, **kw):
     mic keeps listening without the wake word."""
     if not conversation_id:
         conversation_id = os.urandom(8).hex()
-    result = _chat_gate(transcript, conversation_id, follow_up, kw)
-    if result is None:
-        result = _dispatch_text(transcript, conversation_id, follow_up, **kw)
+    turn_timing.start()
+    try:
+        result = _chat_gate(transcript, conversation_id, follow_up, kw)
+        if result is None:
+            result = _dispatch_text(transcript, conversation_id, follow_up, **kw)
+    finally:
+        turn_timing.finish()
+    if result.get("response") and not kw.get("quiet"):
+        _last_said.update(text=result["response"], at=time.time())
     if chat.active(conversation_id):
         if result.get("end_conversation"):
             chat.end(conversation_id, "nothing to answer")
@@ -2844,6 +3457,11 @@ def dispatch_text(transcript, conversation_id="", follow_up=False, **kw):
                             bool(result.get("expects_reply")))
             result["chat_mode"] = True
     return result
+
+
+def _timed_check_addressed(text, last):
+    with turn_timing.timed("addressee"):
+        return B.check_addressed(text, last)
 
 
 def _chat_gate(transcript, conversation_id, follow_up, kw):
@@ -2857,7 +3475,7 @@ def _chat_gate(transcript, conversation_id, follow_up, kw):
             return _speak(t, chat.goodbye())
         if (follow_up and text and chat.needs_check(conversation_id)
                 and not is_garbage_transcript(text)
-                and not B.check_addressed(text, chat.last_reply(conversation_id))):
+                and not _timed_check_addressed(text, chat.last_reply(conversation_id))):
             # The TV, people talking to each other, her own echo: say nothing.
             chat.end(conversation_id, "not addressed to her")
             return _resp(t, "", "", end_conversation=True)
@@ -2875,9 +3493,34 @@ def _chat_gate(transcript, conversation_id, follow_up, kw):
     return _speak(t, reply)
 
 
+# Run before the garbage filter and routing, in this order; the first that
+# answers ends the turn. Most take a bare word ("yes", "six", "both",
+# "Montrose", "next") that the garbage filter would throw away.
+_BEFORE_ROUTING = (
+    _handle_ringing,               # "stop" / "I'm up" silences an alarm; first, so a
+                                   # "stop" never reaches the music or a pending question
+    _handle_pending_reply,         # pending memory: a bare one-word name
+    _handle_pending_reminder,      # "what time tomorrow?": a bare "six"
+    _handle_pending_set,           # "for what time?" / "for how long?": a bare "7"
+    _handle_pending_podcast,       # "want Friday's episode?": "yes"
+    _handle_pending_commute,       # "which Niko Niko's?": "Montrose"
+    _handle_pending_reboot,        # "Reboot airplaypi?": "yes"
+    _handle_pending_timer_choice,  # "which timer?": "both", "first"
+    _handle_clock_mode,            # "clock mode" / "back to the dashboard": ahead of the
+                                   # recipe card and the session, which take "go back"
+    _handle_recipe_display,        # "show the recipe again": ahead of the session,
+                                   # which would take "go back" as a step
+    _handle_howto,                 # "walk me through ...": ahead of the session, so a
+                                   # new guide replaces the open recipe or guide
+    _handle_recipe_session,        # cooking: "next", "how much salt?" — before music,
+                                   # so a bare "next" is the next step
+    _handle_music_correction,      # "no, the Adele one" right after a play by name
+)
+
+
 def _dispatch_text(transcript, conversation_id="", follow_up=False, *,
                    speaker=None, stt_time=0.0, confidence=1.0, quiet=False,
-                   play_topic="antigua/play", audio_path=None, language="en"):
+                   play_topic="antigua/play", audio_path=None, language="en", source="voice"):
     """Everything after STT: garbage filter, classify, handler dispatch, LLM
     tail. Split out so a text request (tests, the /pipeline_text debug
     endpoint) drives the exact same path a spoken turn does. quiet=True
@@ -2895,89 +3538,29 @@ def _dispatch_text(transcript, conversation_id="", follow_up=False, *,
         transcript, language = english, "es"
 
     t = _Turn(transcript, conversation_id, stt_time, speaker=speaker, quiet=quiet,
-              play_topic=play_topic, audio_path=audio_path, language=language)
+              play_topic=play_topic, audio_path=audio_path, language=language, source=source)
+    mcp_client.begin_turn(transcript or "", speaker, conversation_id,
+                          path=source if source == "phone" else "text" if quiet else "voice")
     if language == "es":
         _conv_language[conversation_id] = {"lang": "es", "expires": time.time() + _CONV_LANGUAGE_TTL}
     else:
         _conv_language.pop(conversation_id, None)
 
-    # Something is ringing: "stop" / "I'm up" silences it. First, so a "stop"
-    # never reaches the music or a pending question.
-    result = _handle_ringing(t)
-    if result is not None:
-        return result
-
-    # Pending memory BEFORE garbage filter — a bare one-word name would be rejected
-    result = _handle_pending_reply(t)
-    if result is not None:
-        return result
-
-    # Pending reminder time ("what time tomorrow?") — also before the garbage
-    # filter, since a bare "six" is a valid answer.
-    result = _handle_pending_reminder(t)
-    if result is not None:
-        return result
-
-    # Pending "for what time?" / "for how long?" — a bare "7" is an answer.
-    result = _handle_pending_set(t)
-    if result is not None:
-        return result
-
-    # Pending "want Friday's episode?" — before the garbage filter ("yes").
-    result = _handle_pending_podcast(t)
-    if result is not None:
-        return result
-
-    # Pending "which Niko Niko's?" — before the garbage filter ("Montrose").
-    result = _handle_pending_commute(t)
-    if result is not None:
-        return result
-
-    # Pending "Reboot airplaypi?" — before the garbage filter ("yes").
-    result = _handle_pending_reboot(t)
-    if result is not None:
-        return result
-
-    # Pending "which timer?" — before the garbage filter too ("both", "first").
-    result = _handle_pending_timer_choice(t)
-    if result is not None:
-        return result
-
-    # "Show the recipe again" / "stop the display" — the recipe card on the
-    # kiosk; ahead of the session, which would take "go back" as a step.
-    result = _handle_recipe_display(t)
-    if result is not None:
-        return result
-
-    # "Walk me through cutting out drywall" — ahead of the session, so a new
-    # guide replaces the open recipe or guide.
-    result = _handle_howto(t)
-    if result is not None:
-        return result
-
-    # A recipe being cooked: "next", "go back", "how much salt?" — before the
-    # garbage filter and before music, so a bare "next" is the next step.
-    result = _handle_recipe_session(t)
-    if result is not None:
-        return result
-
-    # "No, the Adele one" right after Antigua started something by name.
-    result = _handle_music_correction(t)
-    if result is not None:
-        return result
+    # Ringing alarms, pending questions and screen/recipe modes, in order;
+    # see _BEFORE_ROUTING for why each sits where it does.
+    for handler in _BEFORE_ROUTING:
+        result = handler(t)
+        if result is not None:
+            return result
 
     if not transcript or is_garbage_transcript(transcript):
-        if follow_up or not transcript.strip():
-            # VAD-opened follow-up window caught background noise (TV etc.),
-            # or Whisper heard no words at all (a false wake word on music).
-            # End the conversation silently — "didn't catch that" would be noise.
-            log.info("Empty/garbage transcript — ending silently")
-            t.transcript = ""
-            return _resp(t, "", "", end_conversation=True)
-        reply = random.choice(_DIDNT_CATCH)
-        wav_path = B.synthesize(reply)
+        # No words, or one that isn't a command: nearly always a false wake
+        # (2026-10-15: every "didn't catch that" in a week of kitchen logs
+        # answered the TV or chatter). Say nothing; a fresh wake gets the soft
+        # chat-end cue so a real request knows to try again.
+        log.info("Empty/garbage transcript — ending silently")
         t.transcript = ""
-        return _resp(t, reply, wav_path)
+        return _dismiss(t, cue=not follow_up)
 
     log.info("STT [%.2fs]: %s", stt_time, transcript)
     if howto.HOWTO_SHAPED.match(transcript):
@@ -2990,6 +3573,7 @@ def _dispatch_text(transcript, conversation_id="", follow_up=False, *,
     # 2. Dispatch on the classified route. Handlers return a response dict, or
     # None to continue into the LLM tail (with any context they attached).
     route = classify(transcript)
+    turn_timing.set_route(route)
     # Weather-classifier miss log (grep 'weather_intent_miss') — a weather-ish
     # turn the routing regexes didn't claim, so it fell to the LLM. Review these
     # to widen _WEATHER_ROUTE_RE toward how the household actually phrases things.
@@ -3001,6 +3585,22 @@ def _dispatch_text(transcript, conversation_id="", follow_up=False, *,
         return _recipe_reply(_llm_tail(t, "recipe_question"))
     if _knowledge_followup(t, route):
         return _llm_tail(t, "knowledge_followup")
+
+    # Nothing claimed it, so it would go to the model. After a fresh wake
+    # word, check it was said to her at all — the TV and people talking to
+    # each other set off the wake word as often as a real request does.
+    if route in ("llm", "unsupported") and not follow_up and not chat.active(t.conversation_id):
+        if route == "llm" and netstatus.online():
+            _start_search_router(t)
+        if not _wake_addressed(t):
+            return _dismiss(t)
+
+    if not netstatus.online():
+        result = _offline_reply(t, route)
+        if result is not None:
+            return result
+        if route in _OFFLINE_TO_LLM:
+            route = "llm"
 
     handler = _HANDLERS.get(route)
     if handler is not None:

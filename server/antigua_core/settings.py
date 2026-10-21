@@ -108,6 +108,16 @@ RECIPE_SESSION_TTL = 4 * 3600      # a cooking session survives a long bake
 RECIPE_ANSWER_TTL = 600            # bare "yes"/"no" answers a question this recent
 RECIPE_QA_MAX_TOKENS = 110         # grounded answer to a free-form cooking question
 
+# ── Inside the house, store hours, markets, air ─────────────────────────────
+CLIMATE_URL = None                 # the AC controller's ac-data-server; None = no indoor answers
+CLIMATE_TIMEOUT = 3
+HOURS_ENABLED = True               # store hours from OpenStreetMap; needs commute (the resolver)
+HOURS_OSM_API = "https://api.openstreetmap.org/api/0.6"
+HOURS_TIMEOUT = 4
+LIVE_ENABLED = True                # stock/crypto prices, air quality, pollen
+SYSINFO_PEERS = []                 # [{name, host, port}] other boxes "is everything running" checks
+LIVE_TIMEOUT = 4
+
 # ── News ─────────────────────────────────────────────────────────────────────
 NEWS_TTL = 1200
 NEWS_MAX_TOKENS = 150
@@ -126,6 +136,14 @@ SEARCH_HOME_CITY = ""
 SEARCH_CACHE_TTL = 900
 SEARCH_ROUTER_ENABLED = True
 SEARCH_ROUTER_TIMEOUT = 3
+# Start the search router alongside the wake addressee check instead of after
+# it (its answer is dropped if the speech wasn't for her). Only a win when
+# Ollama serves two requests at once (OLLAMA_NUM_PARALLEL >= 2).
+SEARCH_ROUTER_PARALLEL = False
+# A first LLM sentence longer than this is spoken in two parts, split at a
+# comma, so audio starts sooner (Kokoro on the CPU takes ~1s per 100 chars).
+# 0 = off: whole sentences only, for continuous intonation.
+TTS_SPLIT_FIRST_OVER_CHARS = 0
 SEARCH_MAX_TOKENS_LONG = 220
 SEARCH_MAX_TOKENS = 120
 SEARCH_TIMEOUT = 4
@@ -150,6 +168,13 @@ PARALLEL_MODE = "fast"
 # ── Memory / conversation / timers ──────────────────────────────────────────
 MEMORY_TTL_DAYS = 14
 MEMORY_STORE_PATH = DATA_DIR / "memories.json"
+# Household memory (household_memory.py): the hand-editable file of facts,
+# preferences, learned recipes and pending behavior requests, and the log of
+# every decision about it. memory.classifier: "local" asks the Ollama model
+# to sort a "remember ..." the rules can't place; "rules" never asks.
+HOUSEHOLD_MEMORY_PATH = DATA_DIR / "household_memory.yaml"
+MEMORY_LOG_PATH = DATA_DIR / "memory_log.jsonl"
+MEMORY_CLASSIFIER = "local"
 # Household members, from server.yaml's household: block. Each is
 # {"name": ..., "nicknames": [...], "misheard_as": [...], "say_as": ...}:
 #   nicknames   — also accepted as this person ("kat" -> "Katherine")
@@ -189,6 +214,8 @@ DISPLAY_COMMANDS = []
 
 # PinedaDisplay Web, from server.yaml's pineda: block (antigua_core/pineda.py).
 PINEDA_URL = None             # e.g. http://127.0.0.1:8090; None = skill off
+PINEDA_STANDBY_URL = None     # the standby box's pineda-web: alarms are mirrored there too
+PINEDA_TOKEN_FILE = "/etc/antigua/pineda-mcp.env"  # PINEDA_MCP_TOKEN=... for pineda-web's /mcp
 PINEDA_PROFILE = "default"    # the kiosk's profile — its theme wins over the global one
 PINEDA_DEVICE = None          # the kiosk's device id, for "this photo"; None = latest screen
 PINEDA_REBOOT_DELAY_S = 10    # airplaypi plays the "rebooting" reply first
@@ -258,6 +285,18 @@ def configure(cfg: dict, *, mqtt_publish_fn=None):
     g["COMMUTE_AREA_RADIUS_KM"] = co.get("area_radius_km", COMMUTE_AREA_RADIUS_KM)
     g["COMMUTE_ROAD_ALIASES"] = co.get("road_aliases", {})
 
+    cl = cfg.get("climate", {})
+    g["CLIMATE_URL"] = cl.get("url", CLIMATE_URL)
+    g["CLIMATE_TIMEOUT"] = cl.get("timeout_seconds", CLIMATE_TIMEOUT)
+    ho = cfg.get("hours", {})
+    g["HOURS_ENABLED"] = ho.get("enabled", HOURS_ENABLED)
+    g["HOURS_OSM_API"] = ho.get("osm_api", HOURS_OSM_API)
+    g["HOURS_TIMEOUT"] = ho.get("timeout_seconds", HOURS_TIMEOUT)
+    lv = cfg.get("live", {})
+    g["LIVE_ENABLED"] = lv.get("enabled", LIVE_ENABLED)
+    g["LIVE_TIMEOUT"] = lv.get("timeout_seconds", LIVE_TIMEOUT)
+    g["SYSINFO_PEERS"] = cfg.get("sysinfo", {}).get("peers", SYSINFO_PEERS)
+
     k = cfg.get("knowledge", {})
     g["KNOWLEDGE_ENABLED"] = k.get("enabled", KNOWLEDGE_ENABLED)
     g["KNOWLEDGE_TIMEOUT"] = k.get("timeout_seconds", KNOWLEDGE_TIMEOUT)
@@ -285,6 +324,8 @@ def configure(cfg: dict, *, mqtt_publish_fn=None):
     g["NEWS_SOURCES"] = n.get("sources", NEWS_SOURCES)
     g["NEWS_MAX_ITEMS"] = n.get("max_headlines", NEWS_MAX_ITEMS)
 
+    g["TTS_SPLIT_FIRST_OVER_CHARS"] = int((cfg.get("tts") or {}).get("split_first_over_chars", 0) or 0)
+
     s = cfg.get("search", {})
     g["SEARCH_ENABLED"] = s.get("enabled", SEARCH_ENABLED)
     g["SEARCH_URL"] = s.get("url", SEARCH_URL)
@@ -294,6 +335,7 @@ def configure(cfg: dict, *, mqtt_publish_fn=None):
     g["SEARCH_CACHE_TTL"] = s.get("cache_ttl_seconds", SEARCH_CACHE_TTL)
     g["SEARCH_ROUTER_ENABLED"] = s.get("router_enabled", SEARCH_ROUTER_ENABLED)
     g["SEARCH_ROUTER_TIMEOUT"] = s.get("router_timeout_seconds", SEARCH_ROUTER_TIMEOUT)
+    g["SEARCH_ROUTER_PARALLEL"] = bool(s.get("router_parallel", SEARCH_ROUTER_PARALLEL))
     g["SEARCH_MAX_TOKENS_LONG"] = s.get("max_tokens_search_long", SEARCH_MAX_TOKENS_LONG)
     g["SEARCH_MAX_TOKENS"] = s.get("max_tokens_search", SEARCH_MAX_TOKENS)
     g["SEARCH_TIMEOUT"] = s.get("timeout_seconds", SEARCH_TIMEOUT)
@@ -310,6 +352,9 @@ def configure(cfg: dict, *, mqtt_publish_fn=None):
         DATA_DIR / "memories.json" if os.environ.get("ANTIGUA_DATA_DIR")
         else BASE_DIR / m.get("storage_path", "data/memories.json")
     )
+    g["HOUSEHOLD_MEMORY_PATH"] = DATA_DIR / "household_memory.yaml"
+    g["MEMORY_LOG_PATH"] = DATA_DIR / "memory_log.jsonl"
+    g["MEMORY_CLASSIFIER"] = m.get("classifier", MEMORY_CLASSIFIER)
     # household: replaces the older memory.users list of bare names.
     g["HOUSEHOLD"] = [
         {"name": p} if isinstance(p, str) else dict(p)
@@ -330,6 +375,8 @@ def configure(cfg: dict, *, mqtt_publish_fn=None):
     # PinedaDisplay Web (the airplaypi kiosk screen). No url = no display skill.
     pw = cfg.get("pineda") or {}
     g["PINEDA_URL"] = pw.get("url")
+    g["PINEDA_STANDBY_URL"] = pw.get("standby_url")
+    g["PINEDA_TOKEN_FILE"] = pw.get("token_file", g["PINEDA_TOKEN_FILE"])
     g["PINEDA_PROFILE"] = pw.get("profile", PINEDA_PROFILE)
     g["PINEDA_DEVICE"] = pw.get("device")
     g["PINEDA_REBOOT_DELAY_S"] = pw.get("reboot_delay_seconds", PINEDA_REBOOT_DELAY_S)

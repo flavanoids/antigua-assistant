@@ -39,7 +39,7 @@ import time
 import uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from urllib.parse import urlparse
 
 import paho.mqtt.client as mqtt
@@ -47,7 +47,7 @@ import requests
 import yaml
 from faster_whisper import WhisperModel
 
-from antigua_core import pipeline
+from antigua_core import household_memory, pipeline
 from antigua_core import server_common
 from antigua_core import settings as core_settings
 from antigua_core.caches import NewsCache, NWSAlertsCache, SearXNGSkill, WeatherCache
@@ -55,7 +55,8 @@ from antigua_core.classify import extract_weather_location
 from antigua_core.knowledge import WikiKnowledge
 from antigua_core.commute import CommuteProvider
 from antigua_core import calc_currency
-from antigua_core.pineda import PinedaClient, TimerMirror
+from antigua_core.pineda import TimerMirror
+from antigua_core.pineda import connect as pineda_connect
 from antigua_core.recipe import RecipeFinder
 from antigua_core import sports as sports_skill
 from antigua_core import weather as weather_skill
@@ -63,8 +64,9 @@ from antigua_core.pipeline import format_active_timers
 from antigua_core.music_router import llm_route_music
 from antigua_core.router import llm_route_search
 from antigua_core.home_control import HomeControl
-from antigua_core.mcp_client import McpHub, read_env_file
+from antigua_core.mcp_client import TOOL_LOG, McpHub, read_env_file
 from antigua_core.music import MusicControl
+from antigua_core.alarm_http import AlarmRoutes
 from antigua_core.stores import ConversationStore, ListStore, MemoryStore, TimerManager
 from antigua_core.tts_text import clean_for_tts
 
@@ -77,7 +79,8 @@ CONFIG_PATH = core_settings.local_or_example(Path(__file__).parent / "config" / 
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    # Milliseconds, like the kitchen bridge's log, so a turn's stages line up.
+    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("antigua-fallback")
@@ -99,6 +102,7 @@ REMOTE_TTS_URL = "http://localhost:5500/tts"          # same box on the backup
 PRIMARY_HOST = "10.77.0.1"                            # the primary over wg0
 PRIMARY_HEALTH_URL = f"http://{PRIMARY_HOST}:9393/health"
 PRIMARY_TIMERS_URL = f"http://{PRIMARY_HOST}:9393/timers"
+PRIMARY_HANDOFF_URL = f"http://{PRIMARY_HOST}:9393/handoff"
 PRIMARY_POLL_S = 5
 PRIMARY_DOWN_AFTER = 2        # consecutive misses before taking over
 PRIMARY_UP_AFTER = 3          # consecutive hits before standing down
@@ -193,8 +197,8 @@ recipes = (RecipeFinder(core_settings.RECIPE_CACHE_DAYS)
            if core_settings.RECIPE_ENABLED and core_settings.SEARCH_ENABLED else None)
 # pineda.url is localhost:8090 on both boxes: each runs a pineda-web, and the
 # kiosk fails over to this one's when the primary is down.
-pineda = (PinedaClient(core_settings.PINEDA_URL, profile=core_settings.PINEDA_PROFILE,
-                       device=core_settings.PINEDA_DEVICE)
+pineda = (pineda_connect(core_settings.PINEDA_URL, token_file=core_settings.PINEDA_TOKEN_FILE,
+                         device=core_settings.PINEDA_DEVICE)
           if core_settings.PINEDA_URL else None)
 conversations = ConversationStore()
 memory_store = MemoryStore()
@@ -203,7 +207,12 @@ timers = TimerManager(
     on_fire=lambda label, kind="timer", message=None: _on_timer_fire(label, kind, message),
     on_change=lambda: timer_mirror and timer_mirror.push(),
 )
-timer_mirror = TimerMirror(pineda, timers.list_active) if pineda else None
+# While standing in, the alarms go to both pineda-webs: this box's (the kiosk's
+# while primary-server is down) and the primary's (when only Antigua is down there).
+timer_mirror = (TimerMirror(
+    [pineda, pineda_connect(f"http://{PRIMARY_HOST}:8090", token_file=core_settings.PINEDA_TOKEN_FILE)],
+    timers.list_active,
+    in_charge=lambda: _active) if pineda else None)
 
 
 def _on_timer_fire(label: str, kind: str = "timer", message: str | None = None):
@@ -297,6 +306,7 @@ def _build_messages(transcript, conversation_id="", extra_context=None):
     alerts_str = nws_alerts_cache.format_for_prompt()
     if alerts_str:
         system_with_context += f"\n{alerts_str}"
+    system_with_context += household_memory.store().rules_block()
 
     if not messages or messages[0]["role"] != "system":
         messages.insert(0, {"role": "system", "content": system_with_context})
@@ -358,11 +368,13 @@ def ask_llm_stream(transcript, conversation_id="", extra_context=None,
     t0 = time.time()
     messages = _build_messages(transcript, conversation_id, extra_context or grounding_context)
     if turn_hint:  # persona.py's stage direction; history keeps the bare transcript
-        messages[-1]["content"] += f"\n({turn_hint})"
+        messages[-1]["content"] += "".join(f"\n({h})" for h in turn_hint.split("\n") if h)
     payload = _llm_payload(messages, max_tokens_override, temperature_override, stream=True)
     buf = full = ""
     try:
-        with requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=90, stream=True) as resp:
+        # (connect, first token): the CPU model is slower than the primary's,
+        # but the turn must still end inside the kitchen bridge's 60s.
+        with requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=(2, 40), stream=True) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines():
                 if not line:
@@ -373,10 +385,6 @@ def ask_llm_stream(transcript, conversation_id="", extra_context=None,
                 *done, buf = _SENTENCE_SPLIT.split(buf)
                 for sentence in filter(None, (d.strip() for d in done)):
                     yield sentence
-    except requests.Timeout:
-        log.warning("LLM stream timeout")
-        yield "Hmm, let me think about that and get back to you."
-        return
     except requests.RequestException:
         log.exception("LLM request failed")
         yield "Sorry, I'm having a little trouble right now."
@@ -457,6 +465,7 @@ def get_local_ip():
 
 # ── Pipeline (shared core, fallback backend) ─────────────────────────────────
 
+TOOL_LOG.open(core_settings.DATA_DIR / "tool_calls.db")
 mcp_hub = McpHub.from_config(cfg.get("mcp"), core_settings.BASE_DIR)
 
 # Music Assistant (Apple Music). The token lives in the same gitignored env
@@ -477,6 +486,9 @@ def remember_exchange(conversation_id, transcript, reply):
     conversations.add_message(conversation_id, "user", transcript)
     conversations.add_message(conversation_id, "assistant", reply)
 
+
+# The primary owns the household memory file; here it's only read.
+household_memory.set_store(household_memory.HouseholdMemory(read_only=True))
 
 pipeline.init(pipeline.Backend(
     transcribe=transcribe,
@@ -526,7 +538,12 @@ def cleanup_loop():
 # ── HTTP Server ───────────────────────────────────────────────────────────────
 
 
-class FallbackHandler(BaseHTTPRequestHandler):
+class FallbackHandler(AlarmRoutes, BaseHTTPRequestHandler):
+    alarm_timers = timers
+
+    def alarms_ready(self) -> bool:
+        return _active   # otherwise the primary has them
+
     def log_message(self, fmt, *args):
         log.debug("HTTP: %s", fmt % args)
 
@@ -542,11 +559,9 @@ class FallbackHandler(BaseHTTPRequestHandler):
                 "mcp": mcp_hub.status(),
             })
         elif parsed.path.startswith("/audio/"):
-            filename = parsed.path[len("/audio/"):]
-            filepath = AUDIO_OUT_DIR / filename
-            if not filepath.exists():
-                filepath = STATIC_AUDIO_DIR / filename
-            if filepath.exists():
+            filepath = server_common.audio_file(parsed.path[len("/audio/"):],
+                                                AUDIO_OUT_DIR, STATIC_AUDIO_DIR)
+            if filepath is not None:
                 data = filepath.read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "audio/wav")
@@ -559,7 +574,17 @@ class FallbackHandler(BaseHTTPRequestHandler):
             self._json(200, {"memories": memory_store.active()})
         elif parsed.path == "/lists":
             self._json(200, {"lists": list_store.all_lists()})
+        elif self.route_alarms("GET"):
+            pass
         else:
+            self._json(404, {"error": "not found"})
+
+    def do_PATCH(self):
+        if not self.route_alarms("PATCH"):
+            self._json(404, {"error": "not found"})
+
+    def do_DELETE(self):
+        if not self.route_alarms("DELETE"):
             self._json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -572,6 +597,8 @@ class FallbackHandler(BaseHTTPRequestHandler):
             self._handle_activate()
         elif parsed.path == "/deactivate":
             self._handle_deactivate()
+        elif self.route_alarms("POST"):
+            pass
         else:
             self._json(404, {"error": "not found"})
 
@@ -583,8 +610,9 @@ class FallbackHandler(BaseHTTPRequestHandler):
         # the moment antigua-server dies). Mark us active so the watcher is
         # the one that later unloads whatever this request loads.
         Thread(target=_activate, args=("pipeline request",), daemon=True).start()
-        length = int(self.headers.get("Content-Length", 0))
-        audio = self.rfile.read(length)
+        audio = server_common.read_body(self, server_common.MAX_AUDIO_BYTES)
+        if audio is None:
+            return
         tmp = AUDIO_OUT_DIR / f"_in_{uuid.uuid4().hex[:8]}.wav"
         tmp.write_bytes(audio)
 
@@ -616,9 +644,11 @@ class FallbackHandler(BaseHTTPRequestHandler):
     def _handle_pipeline_text(self):
         """QA seam, as on the primary: the full classify + dispatch on a text
         string, skipping STT. Silent by default (no antigua/play)."""
-        length = int(self.headers.get("Content-Length", 0))
+        body = server_common.read_body(self, server_common.MAX_JSON_BYTES)
+        if body is None:
+            return
         try:
-            data = json.loads(self.rfile.read(length))
+            data = json.loads(body)
         except json.JSONDecodeError:
             self._json(400, {"error": "invalid JSON"})
             return
@@ -652,7 +682,6 @@ class FallbackHandler(BaseHTTPRequestHandler):
     def _json(self, code, data):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
@@ -692,8 +721,16 @@ def _activate(reason: str):
         _active = True
     log.warning("ACTIVATING fallback (%s) — loading STT + %s", reason, OLLAMA_MODEL)
     mqtt_publish("antigua/status", {"state": "fallback_active"})
+    # The primary's latest memories and lists (copied here by its cron), not
+    # whatever this process loaded at boot.
+    memory_store.reload()
+    list_store.reload()
     snap = _load_primary_timers()
     timers.adopt(snap["timers"], primary_alive_until=snap["alive_until"])
+    _taken.update(timers=timers.revision, memories=_digest(memory_store.export()),
+                  lists=_digest(list_store.all_lists()))
+    if timer_mirror:
+        timer_mirror.push()
     mcp_hub.warm()
     pipeline.B.home.warm()
     if music is not None:
@@ -709,12 +746,56 @@ def _activate(reason: str):
         log.warning("Fallback warm-up failed (will load on first request): %s", e)
 
 
+# What this box had when it took over, to tell on the way out whether it has
+# anything to hand back.
+_taken: dict = {}
+
+
+def _digest(data) -> str:
+    return json.dumps(data, sort_keys=True)
+
+
+def _hand_back() -> bool:
+    """Give the primary what changed here while it was down: the whole alarm
+    list (set, changed, rung or deleted by voice or the phone), and memories
+    and lists if those changed. False if it can't be reached — stay active."""
+    body = {}
+    if timers.revision != _taken.get("timers"):
+        body["timers"] = timers.export_all()
+    if _digest(memory_store.export()) != _taken.get("memories"):
+        body["memories"] = memory_store.export()
+    if _digest(list_store.all_lists()) != _taken.get("lists"):
+        body["lists"] = list_store.all_lists()
+    if not body:
+        return True
+    try:
+        requests.post(PRIMARY_HANDOFF_URL, json=body, timeout=5).raise_for_status()
+    except Exception as e:
+        log.warning("Hand-back to the primary failed, staying active: %s", e)
+        return False
+    log.warning("Handed back to the primary: %s", ", ".join(body))
+    if "timers" in body:
+        _handed_timers.set()
+    return True
+
+
+_handed_timers = Event()
+
+
 def _deactivate(reason: str):
     global _active, _llm_warm, _whisper_model
     with _active_lock:
         if not _active:
             return
+    _handed_timers.clear()
+    if not _hand_back():
+        return
+    with _active_lock:
         _active = False
+    if _handed_timers.is_set():
+        # The primary has them all now, including ones set here; keeping
+        # them would ring them twice.
+        timers.cancel_all()
     log.info("Standing down (%s) — releasing STT + LLM, back to TTS-only", reason)
     mqtt_publish("antigua/status", {"state": "primary_restored"})
     timers.drop_adopted()
@@ -783,6 +864,8 @@ def main():
     Thread(target=cleanup_loop, daemon=True).start()
 
     timers._load()
+    if timer_mirror:
+        timer_mirror.keep_fresh()
 
     Thread(target=nws_alerts_cache.get, daemon=True).start()
     for src in [s["name"] for s in NEWS_SOURCES]:

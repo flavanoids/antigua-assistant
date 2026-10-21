@@ -43,13 +43,8 @@ All in `server/antigua_server.py`.
 LLM-generated with injected headlines. When a news request is detected:
 
 1. `news_cache.format_for_prompt(source_filter, topic_filter)` builds a numbered headline list
-2. That string is passed to `ask_llm()` as `extra_context` (replaces the default weather context)
+2. `pipeline._handle_news` sets it as the turn's `extra_context` (replacing the default weather context), and the LLM tail passes it to `ask_llm_stream()`
 3. `max_tokens` is overridden to `news.max_tokens_news` (default 150) to allow longer responses
-
-```python
-news_context = news_cache.format_for_prompt(source_filter, topic_filter)
-llm_result = ask_llm(transcript, extra_context=news_context, max_tokens_override=news_tokens)
-```
 
 ---
 

@@ -46,7 +46,7 @@ each skill works inside, see [ANTIGUA_SKILLS/](ANTIGUA_SKILLS/README.md).
 
 **Behavior**:
 - Fires: alarm sound + TTS voice ("Your pasta timer is done." / "Good morning, your alarm is going off." / "Reminder: move the laundry.")
-- A reminder with no time ("remind me to buy milk") can't be set — she answers from the LLM instead.
+- A reminder with no time ("remind me to buy milk") gets "When should I remind you?", and "in 20 minutes", "at 5" or "tomorrow at 9" sets it. A place ("...when I get home") isn't a time: she says so and asks for one.
 - Bare daypart words default: morning 8 AM, afternoon 2 PM, evening 7 PM, night/tonight 9 PM.
 - If you give a day but no time ("remind me to call the dentist tomorrow"), she asks "What time tomorrow?" and sets it from your answer.
 - Rings (announcement + a 5s bell; a soft chime for reminders) every 30s until you say the wake word or "stop", for up to 5 minutes. The bell stays short because the mic sits next to the speaker: the wake word is heard in the quiet between rings. `alarm_repeat_seconds` / `alarm_max_seconds` / `alarm_ring_seconds` in `satellite.yaml`
@@ -181,18 +181,36 @@ each skill works inside, see [ANTIGUA_SKILLS/](ANTIGUA_SKILLS/README.md).
 
 ---
 
+## Cameras & Front Door
+
+**What she does**: Shows the Eufy doorbell and garage camera feeds on the display, answers about the front door lock, and reports on doorbell rings and camera activity. Details: [ANTIGUA_SKILLS/security/](ANTIGUA_SKILLS/security/README.md).
+
+**How to ask**:
+- "Show me the front door" / "Pull up the garage camera" / "Who's at the door?"
+- "Lock the door" — and "did I lock the door?", "is the door locked?", "when did the door get locked?"
+- "When did the doorbell ring?" / "Did anyone come by the garage earlier today?"
+- "What's the doorbell's battery?" / "How's the garage camera's battery?"
+
+**Behavior**: A doorbell ring puts the front door camera on the display on its own; motion and person detections are only logged. Camera feeds close themselves when the card is dismissed or times out, so a battery camera isn't left streaming. Every lock change, ring and detection is kept in a local log, so "when" questions are answered from here even after Home Assistant's own history is purged.
+
+**Limits**: She can lock the door but **never unlock it** — a mishearing or the TV saying her name must never open the door; "unlock the door" gets an explanation. Primary server only. Cameras and the lock need Home Assistant reachable.
+
+---
+
 ## PinedaDisplay (the airplaypi screen)
 
 **What she does**: Controls the PinedaDisplay dashboard on the airplaypi kiosk and answers questions about what's on it. Details: [ANTIGUA_SKILLS/pineda_display/](ANTIGUA_SKILLS/pineda_display/README.md).
 
 **How to ask**:
+- "Show me pictures of strawberries" / "Search for photos of red pandas" / "Pictures of vintage cars"
+- "Tell me more about picture B" / "What is photo C?" / "Tell me about picture 2"
 - "Change the theme to ocean" / "Switch to the groovy theme" / "Random theme" / "What themes are there?"
 - "Restart the display" / "Reboot the Pi" (she asks you to say yes first)
 - "Who said this quote?" / "Read the quote" / "Tell me more about this quote"
 - "Say the Spanish phrase" / "What's the word of the day?"
 - "When was this photo taken?"
 
-**Behavior**: Theme changes stick until you change them again, and each light theme still turns to its night version at sundown. The Spanish phrase plays in the Spanish voice, then the meaning in English, then the Spanish again. Running timers show in the display's small moon card.
+**Behavior**: Theme changes stick until you change them again, and each light theme still turns to its night version at sundown. The Spanish phrase plays in the Spanish voice, then the meaning in English, then the Spanish again. Running timers show in the display's small moon card. Image searches display an interlocking mosaic collage with identifier badges (A, B, C...) on screen; asking about any picture spotlights the tile and speaks details grounded in the search results.
 
 **Limits**: Only the primary server can reach the display. Photos without a camera date (screenshots, edited images) can't be dated. A reboot takes music and her voice away for about a minute.
 
@@ -344,8 +362,108 @@ On a timed step ("bake 45 minutes") she offers to set a timer. While a recipe is
 
 ---
 
+## Everyday Odds and Ends
+
+**What she does**: Small requests answered in code, no LLM.
+
+**How to ask**:
+- "Start a stopwatch" / "What's the stopwatch at?" / "Stop the stopwatch" / "Reset the stopwatch"
+- "How do you spell necessary?" (letter by letter)
+- "Flip a coin" / "Roll a die" / "Roll two dice" / "Roll a 20-sided die" / "Pick a number between 1 and 10"
+- "Repeat that" / "What did you say?" (her last reply, within 10 minutes)
+- "What can you do?" / "Help"
+- "Mute" / "Unmute" (pauses the music if it's playing, else mutes the TV)
+- "Set the volume to 3" (1–10 means tens of percent) / "Volume to 40 percent" (the music if it's playing, else the TV)
+
+**Can't do yet**: a command no skill can carry out ("text Mom", "what's on my calendar", "set the thermostat to 70", "open the garage door", "order paper towels") gets an honest "I can't do that yet" instead of a made-up "Got it". The wake-word check still runs first, so the TV saying "call now" gets no answer.
+
+---
+
+## Inside the House (thermostat)
+
+**What she knows**: The thermostat's indoor temperature, humidity and setpoint, and whether the AC is running, from the AC controller's read-only data server (`climate:` in `server.yaml`). It logs every 30 minutes; an answer more than an hour old says what time it's from.
+
+**How to ask**: "What's the temperature inside?" / "How warm is it in the house?" / "Is the AC running?" / "What's the thermostat set to?" / "How humid is it inside?"
+
+**Limits**: Read-only. The AC controller sets the thermostat itself every half hour, so "set the thermostat to 70" gets "I can't change the thermostat".
+
+---
+
+## Store Hours
+
+**What she knows**: Opening hours for businesses near home, from OpenStreetMap. The place is found the same way as for drive times, so "the Lowe's on Ella" works; with several nearby she answers for the closest and names it.
+
+**How to ask**: "What time does Costco close?" / "Is Target open?" / "How late is Home Depot open?" / "When does Kroger open tomorrow?" / "What are the hours for Niko Niko's?" / "What time does Costco open on Sunday?"
+
+**Limits**: Only stores whose OpenStreetMap entry lists hours (most chains near home do). Holiday hours aren't known. Anything else goes to web search as before.
+
+---
+
+## Markets
+
+**What she knows**: Stock prices (Yahoo Finance), the S&P 500, Dow and Nasdaq, and crypto prices (CoinGecko), with the day's change. After the close she says "closed at".
+
+**How to ask**: "How's the stock market?" / "How's the Dow?" / "How's Apple stock doing?" / "What's Tesla stock at?" / "What's the price of bitcoin?" / "What's ethereum at?"
+
+**Limits**: Plain "how's Apple doing" isn't taken as a stock question; say "stock". Prices can be delayed up to 15 minutes.
+
+---
+
+## Air Quality & Pollen
+
+**What she knows**: The US air quality index for home (Open-Meteo), with a warning if it's forecast to get unhealthy later, and today's pollen level and main allergens (pollen.com).
+
+**How to ask**: "What's the air quality?" / "What's the AQI?" / "What's the pollen count?" / "How bad are allergies today?"
+
+**Limits**: Home only; another city's air goes to web search.
+
+---
+
+## Good Morning
+
+**What she does**: On weekday mornings, when you come back in from letting the dogs out, she says "Good morning", your name (`morning.name` in `server.yaml`) and a positive affirmation, once a day. The trigger is the back door's contact sensor in Home Assistant: the first opening after 5 AM is going out, the next one is coming back in, and she speaks 12 seconds after the door shuts. 60 affirmations from published lists (sources in `server/antigua_core/morning.py`), none repeated until all have been said.
+
+**Limits**: Weekdays only, holidays included. Gives up for the day if nobody comes back within 20 minutes. Primary server only (it needs Home Assistant).
+
+---
+
+## Who's Home & Arrival Reminders
+
+Presence is based on the household's phones on the Wi-Fi (`presence:` and
+each person's `devices:` in server.yaml; see docs/ios_shortcut.md).
+
+- "Who's home?" / "Is anybody home?" / "Is Alex home yet?"
+- "Remind me to take out the trash when I get home": "me" needs a known
+  speaker, such as the Ask Antigua shortcut on that person's phone.
+- "Tell Katherine dinner's in the fridge when they get home"
+- Arrival reminders are spoken in the kitchen about a minute after the
+  phone rejoins the Wi-Fi.
+
+---
+
+## Announcements
+
+Antigua says it on another room's speaker (`announce:` in server.yaml) through
+Music Assistant: a chime, music lowered, Antigua's voice, music back.
+
+- "Tell the bedroom dinner's ready" / "Announce the movie's starting upstairs"
+- "Announce that we're leaving" goes to the bedroom when said in the kitchen,
+  and everywhere when it comes from a phone.
+- "Tell everyone ...": every room except the one you're in.
+
+---
+
+## Ask Antigua (iPhone, iPad, Mac, Watch)
+
+An iOS Shortcut sends a typed or spoken request to Antigua over the LAN. The
+answer comes back to the phone, and every skill above works.
+Setup: docs/ios_shortcut.md.
+
+---
+
 ## Not Yet Implemented
 
-- Smart home controls beyond lights and the TV (locks, thermostats)
-- Calendar and email
+- Smart home controls beyond lights, the TV and the front door lock (she can read the thermostat but not change it)
+- Calendar, email, texts and calls
+- Flight and package tracking
 - A custom "Hey Antigua" wake word (the wake word is "Alexa" for now)

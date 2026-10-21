@@ -1,65 +1,35 @@
 # Skill: Time & Date
 
 **Status:** Active  
-**Pipeline stage:** LLM bypass — Python formats the answer directly, LLM never called
+**Pipeline stage:** LLM bypass — Python answers, the LLM is never called
 
 ---
 
 ## What It Does
 
-Intercepts pure time and date queries and answers them immediately using `datetime.now()`, skipping the LLM entirely. This eliminates ~1-2s of LLM latency for the most common factual queries.
+Answers clock and calendar questions deterministically in the home timezone
+(`weather.home_tz` in server.yaml → `settings.WEATHER_HOME_TZ`), not the
+server's system clock. The 4b model is bad at date arithmetic; nothing here
+reaches it.
 
----
+| Kind | Examples | Reply |
+|---|---|---|
+| Now | "what time is it", "tell me the time", "what's today", "what year is it", "what week of the year is it", "how many days left in the year" | "It's 1:56 PM." / "Today is Thursday, October 15." |
+| Other days | "what's tomorrow's date", "what day was yesterday", "what's the date in two weeks", "what date is 90 days from now" | "2 weeks from now is Thursday, October 29." |
+| Weekday of | "what day is Christmas", "what day of the week is November 3rd", "what day is the 31st" | "November 3 is a Tuesday." |
+| When is | "when is Thanksgiving / Easter / Mother's Day" | "Thanksgiving is Thursday, November 26, 42 days from now." |
+| Countdowns | "how many days until Christmas", "how many weeks till New Year's", "how many sleeps until Christmas", "how many days until the weekend" | "Christmas is 71 days away, on Friday, December 25." |
+| Since | "how many days since the Fourth of July", "how long ago was Easter" | "The Fourth of July was 103 days ago." |
+| Clock gap | "how long until 5 pm", "how many hours until midnight" | "3 hours and 4 minutes until 5 PM." |
+| Yes / no | "is it Friday", "is today the 15th", "is it the weekend", "is it Halloween" | "No, it's Thursday." |
+| Holidays | "is today a holiday", "is Monday a holiday", "what's the next holiday" | "No holiday today. The next one is Halloween, in 16 days." |
+| World clock | "what time is it in Tokyo" | "It's 3:56 AM Friday in Tokyo, 14 hours ahead of us." |
+| Time zone | "what time zone are we in" | "We're on Central Daylight Time." |
+| Clocks | "when do the clocks change", "when do we fall back" | "Daylight saving time ends on Sunday, November 1, in 17 days. At 2 AM the clocks go back an hour." |
 
-## How Users Trigger It
-
-- "What time is it?"
-- "What's the time?"
-- "What time is it right now?"
-- "What day is it?"
-- "What's today's date?"
-- "What is the date today?"
-- "What day of the week is it?"
-- "What year is it?"
-- "Which is today?" (STT variant)
-
-**Does NOT fire on:**
-- "What's the weather today?" (weather skill handles)
-- "How much time is left on my timer?" (timer skill handles)
-- "What time does the sun set?" (goes to LLM — requires reasoning)
-
----
-
-## Detection
-
-```python
-format_time_date_response(transcript)  # returns answer string or None
-```
-
-Internally uses two regexes:
-
-- `_TIME_QUERY_RE` — matches time-of-day requests ("what time is it", "current time", etc.)
-- `_DATE_QUERY_RE` — matches date/day requests ("what day is it", "today's date", "which is today", etc.)
-
-Both in `server/antigua_server.py` (~line 788).
-
-The function returns:
-- `"It's 3:47 PM."` — time only
-- `"Today is Wednesday, April 22."` — date only
-- `"It's 3:47 PM on Wednesday, April 22."` — both matched
-
----
-
-## Response
-
-Python-generated, no LLM. Formatted with `datetime.now()`:
-
-```python
-time_str = now.strftime("%-I:%M %p")   # e.g. "3:47 PM"
-date_str = now.strftime("%A, %B %-d")  # e.g. "Wednesday, April 22"
-```
-
-Goes straight to `synthesize()` (TTS) and returns. Total pipeline: STT + TTS only.
+**Not ours** (the parser declines anything mentioning these): timers, alarms,
+reminders, weather, sunrise/sunset (weather skill), games/shows (search),
+store hours, trash pickup, "my birthday" (memory).
 
 ---
 
@@ -67,42 +37,25 @@ Goes straight to `synthesize()` (TTS) and returns. Total pipeline: STT + TTS onl
 
 | What | Where |
 |---|---|
-| Detection regexes | `_TIME_QUERY_RE`, `_DATE_QUERY_RE` (~line 788, `server/antigua_server.py`) |
-| Response formatter | `format_time_date_response(transcript)` (~line 805) |
-| Pipeline hook | `run_pipeline()` — "Time/date shortcut" block, after volume check |
+| Parser + replies | `server/antigua_core/time_date.py` — `parse()` (pure, network-free), `answer()` |
+| Holiday table | `_HOLIDAYS` in the same file (US federal + common observances; Easter computed) |
+| Route guard | `is_time_date_query()` in `intents/time_date.py`, called from `classify()` |
+| Handler | `_handle_time_date` in `pipeline.py` |
+| Tests | `tests/test_time_date.py` (pinned clock, stub geocoder, TTS digit check) |
 
----
+`answer()` returns None to fall through to the LLM — only when a world-clock
+question arrives without a geocoder (the fallback server).
 
-## Config Knobs
-
-None. Time is read from the server's system clock (`datetime.now()`).
-
-If the server's timezone is wrong, the reported time will be wrong. Set the system timezone on the primary:
-
-```bash
-sudo timedatectl set-timezone America/Chicago
-```
-
----
-
-## MQTT Events
-
-None specific to this skill.
-
----
-
-## Limitations
-
-- Does not add weather context (unlike the LLM path, which always appended weather). If the user asks "what time is it and what's the weather?", this skill fires and the weather half is dropped.
-- Year is not included in date responses by default to keep the answer short. "What year is it?" returns the full date string (e.g., "Today is Wednesday, April 22.") — the user must infer the year.
-- The date format (`%B %-d`) omits the year. If you want it: change `"%A, %B %-d"` to `"%A, %B %-d, %Y"`.
+World-clock cities go through the weather skill's `GeocodeCache`
+(`data/geocode_cache.json`), so a city is looked up on Open-Meteo once and
+cached after.
 
 ---
 
 ## How to Extend
 
-**Include the year:** Change `now.strftime("%A, %B %-d")` to `now.strftime("%A, %B %-d, %Y")` in `format_time_date_response()`.
-
-**Add weather to the bypass response:** Call `weather_cache.format_for_prompt()` and append a one-liner if the transcript includes weather keywords. Keep the response short — TTS cost scales with length.
-
-**Add a time zone query:** Detect "what time is it in Tokyo?" and use `pytz` to convert. If matched, return the bypass response with the foreign time; otherwise fall through to LLM.
+- **New holiday:** add a `(spoken name, regex, year -> date)` row to `_HOLIDAYS`.
+- **New phrasing:** add the case to `tests/test_time_date.py` first; most
+  phrasings belong in one of the `_*_RE` patterns near `parse()`.
+- **Spanish:** `spanish.py` maps "qué hora es" / "qué día es hoy" only;
+  countdowns and world clock in Spanish still go to the LLM.

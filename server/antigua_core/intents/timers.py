@@ -901,11 +901,13 @@ _REMINDER_DAY_RE = re.compile(
 
 
 def reminder_missing_time(text: str):
-    """A reminder that names a day ("...tomorrow", "...on Friday") but no time.
+    """A reminder with no time: one that names a day ("...tomorrow", "...on
+    Friday") or nothing at all ("remind me to buy milk").
 
     Returns (message, day_phrase) so the pipeline can ask "what time?" instead
-    of guessing a point inside the day. None when the request either has no day
-    or already carries a usable time (a clock time, a daypart, or a duration).
+    of guessing; day_phrase is "" when no day was named. None when the request
+    already carries a usable time (a clock time, a daypart, or a duration) or
+    has nothing to be reminded of.
     """
     if not _REMINDER_TRIGGER_RE.search(text):
         return None
@@ -915,11 +917,11 @@ def reminder_missing_time(text: str):
     if _resolve_clock_time(norm, datetime.now(), allow_daypart=True) is not None:
         return None
     m = _REMINDER_DAY_RE.search(norm)
-    if not m:
-        return None
     message = _extract_reminder_message(text)
     if not message:
         return None
+    if not m:
+        return message, ""        # no day either: "when should I remind you?"
     day = m.group(1).lower()
     day_phrase = day if day in ("tomorrow", "today") else f"on {day}"
     return message, day_phrase

@@ -119,6 +119,30 @@ Speech heard: "{heard}"
 
 Reply with one word: YES if it is meant for Antigua, NO otherwise."""
 
+# A fresh wake word: the detector fires on TV and on people talking to each
+# other about as often as on a real "Alexa" (2026-10-15: ~30 of 75 kitchen
+# turns), and the scores don't tell them apart, so the words have to.
+_WAKE_PROMPT = """A voice assistant in a home kitchen heard its wake word, then recorded the speech \
+below. The wake word detector often fires by mistake on a TV or on people talking to each other. \
+Decide whether this speech was said to the assistant.
+
+YES: any question someone would ask an assistant (facts, how-to, word meanings, even garbled), a \
+request or command, small talk aimed at it ("how are you", "good morning", "bye"), thanks, or a \
+reaction to it ("why did you do that", "you're dumb", "that's wrong"), or a question about the \
+assistant itself ("do you like music"). Also YES for anything that answers or follows up the \
+assistant's last line below, however short.
+NO: a fragment of people talking to each other (mentions of he/she/they or things only they would \
+know, a story, an opinion about something), a line from a TV show or video, song lyrics, or one \
+side of a phone call.
+
+Examples: "tell me a joke" YES. "how are you doing" YES. "why did you say that" YES. \
+"she said no" NO. "I was joking, but do you find it interesting?" NO. "it's dangerous" NO.
+
+The assistant's last line: "{last}"
+Speech heard: "{heard}"
+
+Reply with one word: YES or NO."""
+
 
 def _echo(heard: str, last: str) -> bool:
     """Mostly her own last line coming back through the mic."""
@@ -127,20 +151,22 @@ def _echo(heard: str, last: str) -> bool:
 
 
 def is_addressed(heard: str, last: str, *, ollama_host, model, timeout, keep_alive="15m",
-                 num_ctx=8192) -> bool:
-    """Fails closed: if the model can't answer, the chat ends rather than
-    risk answering the TV."""
+                 num_ctx=8192, after_wake=False) -> bool:
+    """In a chat it fails closed: if the model can't answer, the chat ends
+    rather than risk answering the TV. After a wake word it fails open — the
+    detector did hear something like her name."""
     if _NAMED_RE.search(heard):
         return True
     if last and _echo(heard, last):
         log.info("Chat addressee: echo of her last line")
         return False
+    prompt = _WAKE_PROMPT if after_wake else _ADDRESSEE_PROMPT
     try:
         resp = requests.post(
             f"{ollama_host}/api/generate",
             json={
                 "model": model,
-                "prompt": _ADDRESSEE_PROMPT.format(last=last or "(nothing yet)", heard=heard.strip()),
+                "prompt": prompt.format(last=last or "(nothing yet)", heard=heard.strip()),
                 "stream": False,
                 "think": False,
                 # Must match the chat calls, or Ollama reloads the model.
@@ -152,7 +178,12 @@ def is_addressed(heard: str, last: str, *, ollama_host, model, timeout, keep_ali
         resp.raise_for_status()
         answer = (resp.json().get("response") or "").strip().upper()
     except Exception as e:
+        if after_wake:
+            log.warning("Wake addressee check failed (answering anyway): %s", e)
+            return True
         log.warning("Chat addressee check failed (ending chat): %s", e)
         return False
-    log.info("Chat addressee: %r -> %s", heard, answer or "(empty)")
+    log.info("%s addressee: %r -> %s", "Wake" if after_wake else "Chat", heard, answer or "(empty)")
+    if after_wake and not answer:
+        return True
     return answer.startswith("YES")

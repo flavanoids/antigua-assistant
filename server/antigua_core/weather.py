@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from . import settings
+from . import netstatus, settings
 from .classify import resolve_day_offset
 
 log = logging.getLogger("antigua_core")
@@ -839,12 +839,12 @@ class WeatherProvider:
             if now - at >= self._ttl:
                 with self._lock:
                     busy = k in self._inflight
-                if not busy:
+                if not busy and netstatus.online():
                     threading.Thread(target=self._refresh_once, args=(loc,), daemon=True).start()
                 if fc is not None:   # None = a failed cold fetch, retried here
                     fc.stale = now - at >= self._ttl * 4
             return fc
-        return self._refresh_once(loc)
+        return self._refresh_once(loc) if netstatus.online() else None
 
     _FAIL_TTL = 90
 
@@ -1015,7 +1015,8 @@ def answer(text: str, provider: WeatherProvider, *, now: datetime | None = None)
     prefix = _loc_prefix(loc, home)
     if prefix:
         body = body[:1].lower() + body[1:]
-    stale_note = " (my data's a little old right now)" if fc.stale else ""
+    stale_note = (" (that's from before the internet went down)" if not netstatus.online()
+                  else " (my data's a little old right now)" if fc.stale else "")
     return _cap_sentence(prefix + body + stale_note)
 
 

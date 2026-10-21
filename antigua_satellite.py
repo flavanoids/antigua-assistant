@@ -32,7 +32,6 @@ import requests
 
 CONFIG_PATH = Path(__file__).parent / "config" / "satellite.yaml"
 AUDIO_DIR = Path(__file__).parent / "audio"
-SOUND_SLEEP = AUDIO_DIR / "acknowledge.wav"
 CUE_CACHE_DIR = AUDIO_DIR / "cues"
 
 logging.basicConfig(
@@ -54,13 +53,44 @@ _PA_SINK = "alsa_output.platform-soc_sound.stereo-fallback"
 ANTIGUA_VOLUME_PCT = 70          # Antigua's own speaking level (0-100). Per-stream
                                  # volume, independent of the shairport-sync / AirPlay
                                  # sink volume that iOS controls.
+NIGHT_VOLUME_PCT = 30            # Quiet hours speaking level (0-100).
+NIGHT_HOURS = "22:30-07:00"      # Quiet hours window; "" or None to disable.
+ALARM_VOLUME_PCT = 75            # Alarm ring level (always audible, even during quiet hours).
 
 
-def _antigua_vol_args():
-    """paplay args so Antigua speaks at ANTIGUA_VOLUME_PCT of full scale as a
+def in_hours(hours_str: str, now: time.struct_time | None = None) -> bool:
+    """True when the current local time falls within 'HH:MM-HH:MM' (inclusive start, exclusive end)."""
+    if not hours_str:
+        return False
+    try:
+        parts = hours_str.strip().split("-")
+        if len(parts) != 2:
+            return False
+        start_h, start_m = (int(x) for x in parts[0].strip().split(":"))
+        end_h, end_m = (int(x) for x in parts[1].strip().split(":"))
+        start = start_h * 60 + start_m
+        end = end_h * 60 + end_m
+    except (ValueError, IndexError):
+        return False
+    t = now or time.localtime()
+    minute = t.tm_hour * 60 + t.tm_min
+    return start <= minute < end if start <= end else (minute >= start or minute < end)
+
+
+def current_volume_pct(kind: str = "speech") -> int:
+    """Current volume percentage (0-100) scaled by kind (speech vs alarm) and time of day."""
+    if kind == "alarm":
+        return max(0, min(100, ALARM_VOLUME_PCT))
+    if in_hours(NIGHT_HOURS):
+        return max(0, min(100, NIGHT_VOLUME_PCT))
+    return max(0, min(100, ANTIGUA_VOLUME_PCT))
+
+
+def _antigua_vol_args(kind: str = "speech"):
+    """paplay args so Antigua speaks at current_volume_pct() of full scale as a
     per-stream (sink-input) volume. Does NOT change the sink volume that
     shairport-sync / AirPlay uses."""
-    pct = max(0, min(100, ANTIGUA_VOLUME_PCT))
+    pct = current_volume_pct(kind=kind)
     return ["--volume", str(round(65536 * pct / 100))]
 
 
@@ -86,11 +116,37 @@ _FALLBACK_NOTIFY_TIMEOUT = 5     # seconds to wait for /activate or /deactivate
 
 _primary_up = True               # optimistic: assume primary is up at boot
 _server_lock = Lock()
+# One missed probe is not an outage: on 2026-10-15 two Wi-Fi blips (a /health
+# that answers in <1ms timing out at 3s) each told the backup to load its
+# model and start its MCP servers. Like the standby bridge, the satellite now
+# fails over after FAILOVER_MISSES misses in a row (~1 min) and restores
+# after RESTORE_HITS answers in a row.
+FAILOVER_MISSES = 3
+RESTORE_HITS = 2
+
+
+class PrimaryWatch:
+    """Debounces /health probe results into up/down transitions."""
+
+    def __init__(self, misses=FAILOVER_MISSES, hits=RESTORE_HITS):
+        self.up, self._need_down, self._need_up, self._run = True, misses, hits, 0
+
+    def probe(self, ok: bool) -> str | None:
+        """Feed one probe result; "down" or "up" on a transition, else None."""
+        if ok == self.up:
+            self._run = 0
+            return None
+        self._run += 1
+        if self._run < (self._need_up if ok else self._need_down):
+            return None
+        self.up, self._run = ok, 0
+        return "up" if ok else "down"
 
 
 def load_config():
     global SERVER_HOST, SERVER_PORT, MQTT_BROKER, MQTT_PORT
-    global ANTIGUA_VOLUME_PCT, DISPLAY_ENABLED, _PA_SINK
+    global ANTIGUA_VOLUME_PCT, NIGHT_VOLUME_PCT, NIGHT_HOURS, ALARM_VOLUME_PCT
+    global DISPLAY_ENABLED, _PA_SINK
     global FALLBACK_HOST, FALLBACK_PORT, _HEALTH_CHECK_INTERVAL
 
     if not CONFIG_PATH.exists():
@@ -114,6 +170,9 @@ def load_config():
     if "satellite" in cfg:
         s = cfg["satellite"]
         ANTIGUA_VOLUME_PCT = s.get("antigua_volume_pct", ANTIGUA_VOLUME_PCT)
+        NIGHT_VOLUME_PCT = s.get("night_volume_pct", NIGHT_VOLUME_PCT)
+        NIGHT_HOURS = s.get("night_hours", NIGHT_HOURS)
+        ALARM_VOLUME_PCT = s.get("alarm_volume_pct", ALARM_VOLUME_PCT)
         _PA_SINK = s.get("output_device", _PA_SINK)
         global _ALARM_RING_S, _ALARM_REPEAT_S, _ALARM_MAX_S
         _ALARM_RING_S = float(s.get("alarm_ring_seconds", _ALARM_RING_S))
@@ -165,16 +224,24 @@ def _on_mqtt_message(client, userdata, msg):
         except Exception as e:
             log.error(f"antigua/listening error: {e}")
 
+    elif msg.topic == "antigua/alarm_schedule":
+        try:
+            data = json.loads(msg.payload)
+            _alarm_store.update_schedule(data.get("alarms", []))
+        except Exception as e:
+            log.error(f"antigua/alarm_schedule error: {e}")
+
     elif msg.topic == "antigua/alarm":
         try:
             data = json.loads(msg.payload)
             audio_url = data.get("audio_url", "")
             label = data.get("label", "timer")
-            if audio_url:
-                # Multiple concurrent alarms are supported; each gets its own thread
-                Thread(target=_alarm_loop,
-                       args=(audio_url, label, data.get("kind", "timer"), data.get("id", "")),
-                       daemon=True).start()
+            aid = data.get("id", "")
+            _alarm_store.mark_server_handled(aid, label)
+            # Multiple concurrent alarms are supported; each gets its own thread
+            Thread(target=_alarm_loop,
+                   args=(audio_url, label, data.get("kind", "timer"), aid),
+                   daemon=True).start()
         except Exception as e:
             log.error(f"antigua/alarm error: {e}")
 
@@ -184,8 +251,12 @@ def _on_mqtt_connect(client, userdata, flags, rc, props):
     # restart drops subscriptions and paho's auto-reconnect won't restore
     # them — the satellite would stay up but never play anything again.
     for topic in ("antigua/play", "antigua/alarm", "antigua/cue", "antigua/listening", "antigua/stop",
-                  "antigua/alarm_stop"):
+                  "antigua/alarm_stop", "antigua/alarm_schedule"):
         client.subscribe(topic)
+    try:
+        mqtt_publish("antigua/alarm_sync_request", {})
+    except Exception:
+        pass
 
 
 def mqtt_connect():
@@ -320,7 +391,7 @@ Thread(target=_play_queue_worker, daemon=True, name="play-queue").start()
 
 # ── Beep synthesis ───────────────────────────────────────────────────────────
 
-def _play_beep(tones, volume=0.25):
+def _play_beep(tones, volume=0.25, kind="speech"):
     """Play a sequence of (freq_hz, duration_ms) tones inline via aplay.
     Use freq=0 for silence gaps.
     """
@@ -342,7 +413,7 @@ def _play_beep(tones, volume=0.25):
         f.write(buf.getvalue())
         tmp = f.name
     subprocess.run(
-        ["paplay", "--device", _PA_SINK, *_antigua_vol_args(), tmp],
+        ["paplay", "--device", _PA_SINK, *_antigua_vol_args(kind=kind), tmp],
         capture_output=True
     )
     try:
@@ -351,39 +422,127 @@ def _play_beep(tones, volume=0.25):
         pass
 
 
-def beep_sleep():
-    """Mycroft acknowledge sound — conversation ended."""
-    if SOUND_SLEEP.exists():
-        play_audio(str(SOUND_SLEEP))
-    else:
-        _play_beep([(880, 100), (0, 40), (660, 100), (0, 40), (440, 180)])
-
-
 def beep_alarm():
     """Three-pulse alarm pattern — non-obnoxious but attention-getting."""
-    _play_beep([(880, 180), (0, 120), (880, 180), (0, 120), (880, 180)])
+    _play_beep([(880, 180), (0, 120), (880, 180), (0, 120), (880, 180)], kind="alarm")
 
 
-# ── Volume control ────────────────────────────────────────────────────────────
+# ── Satellite Local Alarm Store & Offline Fallback ───────────────────────────
+LOCAL_ALARMS_FILE = Path(__file__).parent / "data" / "satellite_alarms.json"
+OFFLINE_ALARM_GRACE_S = 5.0  # seconds past fires_at to wait for server before ringing locally
 
-_VOL_STEP_PCT = 10  # ±10% per voice command
 
-def _get_pa_volume() -> int:
-    """Read current volume as percentage from PulseAudio sink."""
-    result = subprocess.run(
-        ["pactl", "get-sink-volume", _PA_SINK],
-        capture_output=True, text=True,
-    )
-    # Output: "Volume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB"
-    m = re.search(r"(\d+)%", result.stdout)
-    return int(m.group(1)) if m else 100
+class SatelliteAlarmStore:
+    """Local cache of upcoming alarms and timers on the Pi.
 
-def set_volume(direction: str):
-    """Adjust PulseAudio sink volume (works with shairport PA backend)."""
-    current = _get_pa_volume()
-    new_pct = min(100, current + _VOL_STEP_PCT) if direction == "volume_up" else max(0, current - _VOL_STEP_PCT)
-    subprocess.run(["pactl", "set-sink-volume", _PA_SINK, f"{new_pct}%"], capture_output=True)
-    log.info(f"Volume {direction}: {current}% -> {new_pct}%")
+    Updated via MQTT topic 'antigua/alarm_schedule'. If the primary server
+    misses an alarm by > grace_seconds (server crashed, rebooting, or network
+    is down), the satellite sounds the alarm locally so the user still wakes up.
+    """
+
+    def __init__(self, path: Path | None = None, grace_seconds: float = OFFLINE_ALARM_GRACE_S):
+        self.path = path if path is not None else LOCAL_ALARMS_FILE
+        self.grace_seconds = grace_seconds
+        self._lock = Lock()
+        self._alarms: dict[str, dict] = {}
+        self._handled_ids: set[str] = set()
+        self._load()
+
+    def update_schedule(self, alarms_list: list[dict]):
+        with self._lock:
+            new_alarms = {}
+            for a in alarms_list:
+                aid = a.get("id")
+                if not aid:
+                    continue
+                new_alarms[aid] = a
+            # Drop handled IDs that no longer appear in the schedule
+            self._handled_ids = {aid for aid in self._handled_ids if aid in new_alarms}
+            self._alarms = new_alarms
+            self._save()
+
+    def mark_server_handled(self, aid: str, label: str = ""):
+        """Called when server fires antigua/alarm. Cancels offline fallback for this alarm."""
+        with self._lock:
+            if aid:
+                self._handled_ids.add(aid)
+                self._alarms.pop(aid, None)
+            if label:
+                to_drop = [k for k, v in self._alarms.items() if v.get("label") == label]
+                for k in to_drop:
+                    self._handled_ids.add(k)
+                    self._alarms.pop(k, None)
+            self._save()
+
+    def check_due_offline(self, now: float | None = None) -> list[dict]:
+        """Return alarms that are due for offline firing (past fires_at + grace_seconds
+        and not yet handled). Marks them as handled so they don't fire repeatedly."""
+        t = now if now is not None else time.time()
+        due = []
+        with self._lock:
+            for aid, a in list(self._alarms.items()):
+                if aid in self._handled_ids:
+                    continue
+                fires_at = a.get("fires_at", 0)
+                if fires_at <= 0:
+                    continue
+                if t >= fires_at + self.grace_seconds:
+                    # Ignore stale alarms (> 10 minutes late, e.g. Pi booted after long power outage)
+                    if t - fires_at <= 600:
+                        due.append(dict(a))
+                    self._handled_ids.add(aid)
+                    self._alarms.pop(aid, None)
+            if due:
+                self._save()
+        return due
+
+    def _save(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path, "w") as f:
+                json.dump(list(self._alarms.values()), f)
+        except Exception as e:
+            log.warning(f"Failed to save satellite alarms: {e}")
+
+    def _load(self):
+        if not self.path.exists():
+            return
+        try:
+            with open(self.path) as f:
+                data = json.load(f)
+            now = time.time()
+            with self._lock:
+                for a in data:
+                    aid = a.get("id")
+                    if aid and a.get("fires_at", 0) > now - 600:
+                        self._alarms[aid] = a
+            log.info(f"Loaded {len(self._alarms)} scheduled alarm(s) into local backup store")
+        except Exception as e:
+            log.warning(f"Failed to load satellite alarms: {e}")
+
+
+_alarm_store = SatelliteAlarmStore()
+
+
+def _offline_alarm_watchdog():
+    while True:
+        try:
+            due = _alarm_store.check_due_offline()
+            for a in due:
+                label = a.get("label", "alarm")
+                aid = a.get("id", "")
+                kind = a.get("kind", "alarm")
+                log.warning(
+                    f"Offline alarm watchdog: server missed {kind} '{label}' (id={aid}) "
+                    f"by >{_alarm_store.grace_seconds:.0f}s — triggering standalone alarm!"
+                )
+                Thread(target=_alarm_loop, args=("", label, kind, aid), daemon=True).start()
+        except Exception as e:
+            log.error(f"Offline alarm watchdog error: {e}")
+        time.sleep(1.0)
+
+
+Thread(target=_offline_alarm_watchdog, daemon=True, name="alarm-watchdog").start()
 
 
 # ── Alarm loop ───────────────────────────────────────────────────────────────
@@ -410,7 +569,7 @@ def _stop_alarms(reason: str):
 
 def _play_chime():
     """Two soft rising tones: a reminder, not an alarm."""
-    _play_beep([(660, 140), (0, 60), (988, 260)], volume=0.15)
+    _play_beep([(660, 140), (0, 60), (988, 260)], volume=0.15, kind="alarm")
 
 
 def _play_until(cmd, stop_event: Event, limit_s: float | None = None):
@@ -425,6 +584,9 @@ def _play_until(cmd, stop_event: Event, limit_s: float | None = None):
 
 def _alarm_loop(audio_url: str, label: str, kind: str = "timer", fire_id: str = ""):
     key = fire_id or label
+    if key in _alarm_stops:
+        log.info(f"Alarm {key} is already ringing, ignoring duplicate trigger")
+        return
     stop_event = Event()
     _alarm_stops[key] = stop_event
     _alarm_ringing_labels.add(label)
@@ -432,14 +594,15 @@ def _alarm_loop(audio_url: str, label: str, kind: str = "timer", fire_id: str = 
              f"for up to {_ALARM_MAX_S:.0f}s, until the wake word or 'stop'")
 
     speech = None
-    try:
-        resp = requests.get(audio_url, timeout=10)
-        resp.raise_for_status()
-        with tempfile.NamedTemporaryFile(suffix=".wav", dir="/tmp", delete=False) as f:
-            f.write(resp.content)
-            speech = f.name
-    except Exception as e:
-        log.error(f"Alarm audio download failed: {e}")
+    if audio_url:
+        try:
+            resp = requests.get(audio_url, timeout=10)
+            resp.raise_for_status()
+            with tempfile.NamedTemporaryFile(suffix=".wav", dir="/tmp", delete=False) as f:
+                f.write(resp.content)
+                speech = f.name
+        except Exception as e:
+            log.error(f"Alarm audio download failed: {e}")
 
     started = time.time()
     rings = 0
@@ -448,10 +611,10 @@ def _alarm_loop(audio_url: str, label: str, kind: str = "timer", fire_id: str = 
         if kind == "reminder":
             _play_chime()
         if speech and not stop_event.is_set():
-            _play_until(["paplay", "--device", _PA_SINK, *_antigua_vol_args(), speech], stop_event)
+            _play_until(["paplay", "--device", _PA_SINK, *_antigua_vol_args(kind="alarm"), speech], stop_event)
         if kind != "reminder" and not stop_event.is_set():
             if ALARM_SOUND.exists():
-                _play_until(["paplay", "--device", _PA_SINK, str(ALARM_SOUND)], stop_event,
+                _play_until(["paplay", "--device", _PA_SINK, *_antigua_vol_args(kind="alarm"), str(ALARM_SOUND)], stop_event,
                             _ALARM_RING_S)
             else:
                 beep_alarm()
@@ -505,14 +668,17 @@ def _probe_primary() -> bool:
 
 def _health_check_loop():
     global _primary_up
+    watch = PrimaryWatch()
     while running:
         time.sleep(_HEALTH_CHECK_INTERVAL)
-        up = _probe_primary()
+        ok = _probe_primary()
+        change = watch.probe(ok)
+        if not ok and change is None and watch.up:
+            log.info("Primary missed a health check — not failing over yet")
         with _server_lock:
-            was_up = _primary_up
-            _primary_up = up
+            _primary_up = watch.up
 
-        if was_up and not up:
+        if change == "down":
             log.warning("Primary offline — activating the backup's fallback server")
             mqtt_publish("antigua/status", {"state": "fallback_active"})
             try:
@@ -520,11 +686,11 @@ def _health_check_loop():
                     f"http://{FALLBACK_HOST}:{FALLBACK_PORT}/activate",
                     timeout=_FALLBACK_NOTIFY_TIMEOUT,
                 )
-                log.info("Fallback /activate sent — 0.8b model pre-warming")
+                log.info("Fallback /activate sent — its model is loading")
             except Exception as e:
                 log.warning("Could not notify fallback server: %s", e)
 
-        elif not was_up and up:
+        elif change == "up":
             log.info("Primary restored — deactivating the fallback server")
             mqtt_publish("antigua/status", {"state": "primary_restored"})
             try:
@@ -650,15 +816,39 @@ def stream_and_play(audio_url: str):
             log.error(f"Fallback download-and-play also failed: {e2}")
 
 
-def _play_cue(audio_url: str):
-    """Play a short UI cue from a local cache — fetched from the server once,
-    then never over HTTP again, so it can't be delayed by the network."""
+# Cues fetched at startup rather than on first use: trouble.wav is played
+# when a turn failed, which is exactly when the server may not answer.
+_PRECACHED_CUES = ("wake_cue.wav", "trouble.wav")
+
+
+def _cache_cue(audio_url: str) -> Path:
     path = CUE_CACHE_DIR / Path(audio_url).name
     if not path.exists():
         resp = requests.get(audio_url, timeout=10)
         resp.raise_for_status()
         CUE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(resp.content)
+        tmp = path.with_suffix(".part")
+        tmp.write_bytes(resp.content)
+        tmp.replace(path)
+    return path
+
+
+def _precache_cues():
+    for name in _PRECACHED_CUES:
+        try:
+            _cache_cue(f"http://{SERVER_HOST}:{SERVER_PORT}/audio/{name}")
+        except Exception as e:
+            log.warning(f"Could not pre-cache cue {name}: {e}")
+
+
+def _play_cue(audio_url: str):
+    """Play a short UI cue from a local cache — fetched from the server once,
+    then never over HTTP again, so it can't be delayed by the network."""
+    try:
+        path = _cache_cue(audio_url)
+    except Exception as e:
+        log.error(f"Cue {audio_url} unavailable: {e}")
+        return
     play_audio(str(path), blocking=False)
 
 
@@ -703,6 +893,8 @@ def main():
     load_config()
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+    Thread(target=_precache_cues, daemon=True).start()
 
     # Background health check: probes primary every 20s, triggers failover/restore
     Thread(target=_health_check_loop, daemon=True).start()

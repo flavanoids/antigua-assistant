@@ -47,6 +47,24 @@ sudo systemctl daemon-reload && sudo systemctl enable --now antigua-server
 `--dir` overrides the repo path and `--whisper-dir` the whisper.cpp path
 (default: `whisper.cpp` next to the repo).
 
+Every Antigua service also gets the sandbox drop-in `server/30-hardening.conf`:
+private new files (`UMask=0077`), read-only `/usr` `/boot` `/etc`, a private
+`/tmp`, no setuid, no kernel or cgroup changes. The services still run as root
+(the satellite as its user). Install it per unit:
+
+```bash
+for u in antigua-server antigua-tts antigua-whisper kitchen-bridge; do   # primary
+    sudo install -D -m 644 server/30-hardening.conf /etc/systemd/system/$u.service.d/30-hardening.conf
+done
+sudo systemctl daemon-reload   # then restart them
+```
+
+On the Pi it's `antigua-satellite`. `deploy_fallback.sh` installs it on the
+backup. Keep the data private too:
+`chmod -R go-rwx data logs audio_in audio_out kitchen-mic/bridge/captures`,
+and `chmod 600` the configs that hold secrets (`server/config/server.yaml`,
+`kitchen-mic/bridge/config.yaml`, `config/satellite.yaml`).
+
 ## Primary
 
 Needs a GPU that Ollama and whisper.cpp (Vulkan) can use. The author runs an
@@ -69,11 +87,24 @@ AMD RX 6650 XT with 8 GB.
    faster-whisper on the CPU.
 5. **TTS.** Put `kokoro-v1.0.onnx` and `voices-v1.0.bin` (from the
    [kokoro-onnx releases](https://github.com/thewh1teagle/kokoro-onnx/releases))
-   in `models/`, then install `antigua-tts.service`. Check it with
+   in `models/`. For Kokoro's own English pronunciation (misaki) instead of
+   espeak, build the TTS venv on Python 3.13 (spaCy has no 3.14 build):
+   `uv venv -p 3.13 venv-tts && VIRTUAL_ENV=$PWD/venv-tts uv pip install -r server/requirements-tts-g2p.txt`.
+   Then install `antigua-tts.service`, which runs from `venv-tts`; pointed at
+   the main venv instead, the server falls back to espeak. Set its CPU
+   threads in a drop-in, `/etc/systemd/system/antigua-tts.service.d/40-cpu.conf`
+   (`[Service]` + `Environment=KOKORO_THREADS=<n>`): one per performance core.
+   On a hybrid Intel CPU also pin it there with `CPUAffinity=`. The author's
+   i5-12600K uses 6 and `CPUAffinity=0 2 4 6 8 10` (0.40→0.34 s for a short
+   reply); the 4-core backup uses 4 (1.16→0.78 s). Check it with
    `curl -X POST localhost:5500/tts -H 'Content-Type: application/json' -d '{"text":"hi"}' -o /tmp/t.wav`.
 6. **Search** (optional). Copy `searxng/searxng/settings.yml.example` to
    `settings.yml` and set `secret_key`, run `cd searxng && docker compose up -d`, then set
    `search.enabled: true`. See [the search skill](../ANTIGUA_SKILLS/search/README.md).
+   The image is pinned to a dated build. To update, pick a tag a few days old
+   from Docker Hub (they're rolling daily builds), change it in
+   `searxng/docker-compose.yml`, `docker compose pull && docker compose up -d`,
+   and re-run `deploy_fallback.sh` so the backup matches.
 7. **Home control** (optional). Run `server/mcp/setup.sh`, put secrets in
    `mcp.env`, and pair the Apple TV. See [server/mcp/README.md](../server/mcp/README.md)
    and [the TV skill](../ANTIGUA_SKILLS/living_room_tv/README.md).
@@ -83,7 +114,8 @@ AMD RX 6650 XT with 8 GB.
 9. **Server.** Install `antigua-server.service`. `curl localhost:9393/health`
    shows the model and MCP status.
 10. **Retention.** Install `server/antigua.logrotate` as
-    `/etc/logrotate.d/antigua` (render it like a unit), plus
+    `/etc/logrotate.d/antigua` (render it like a unit; includes a `maxsize 50M`
+    safety ceiling and 7-day retention), plus
     `kitchen-mic/bridge/captures-prune.{service,timer}`.
 
 ## Kitchen mic (reSpeaker Lite)
@@ -104,6 +136,22 @@ AMD RX 6650 XT with 8 GB.
    and `wake_cue_url`.
 4. Install `kitchen-mic/bridge/kitchen-bridge.service`. The bridge log shows
    `Listening for 'alexa'...` once it's connected.
+
+**Rotating the Noise key** (if it ever leaks; done 2026-10-16). The device and
+both bridges must change together, or the mic drops until they match:
+
+1. Back up `secrets.yaml` and the bridge's `config.yaml`. Put a new key in
+   `api_encryption_key` (`python3 -c 'import os,base64;print(base64.b64encode(os.urandom(32)).decode())'`).
+2. `esphome compile`, then `esphome upload --device kitchen-mic.local`. OTA
+   uses `ota_password`, not the API key, so it works across the change.
+3. Put the same key in `noise_psk` in `kitchen-mic/bridge/config.yaml` and
+   restart `kitchen-bridge`. Wait for `Connected to kitchen-mic`.
+4. Update the backup's standby bridge too (re-run `deploy_fallback.sh`, which
+   regenerates its config from this one).
+
+If you back out before flashing, restore the old `secrets.yaml` *and*
+`esphome compile` again. Otherwise the cached `firmware.bin` still carries
+the unused key, and a later bare `esphome upload` would flash it.
 
 More detail: [kitchen-mic/README.md](../kitchen-mic/README.md).
 
@@ -148,7 +196,7 @@ changes. On the primary, add a cron job that copies memories and lists every
 ```
 
 Then point `tts.fallback_url` (on the primary) and `server.fallback_host` (on
-the satellite) at the backup.
+the satellite) at the backup, using its wg0 address once the mesh is up.
 
 ## Network
 
@@ -169,9 +217,12 @@ Then switch the configs to the `wg0` addresses. See
 | Task | Command |
 |---|---|
 | Logs | `tail -f logs/server.log`, `logs/kitchen-bridge.log`, `logs/tts_server.log`, `logs/whisper_server.log`; on the Pi, `journalctl -fu antigua-satellite` |
+| Check log sizes & disk | `ls -lh logs/*.log && df -h / /tmp` |
+| Force log rotation | `sudo logrotate -f /etc/logrotate.d/antigua` |
 | Restart after a code change | `sudo systemctl restart antigua-server` (and `kitchen-bridge` / `antigua-tts` if you touched those) |
-| Ask the LLM without speaking | `curl -X POST localhost:9393/ask -d '{"text":"tell me a fun fact"}'` (LLM only, skips skills, plays nothing) |
-| Run a full turn from text | `curl -X POST localhost:9393/pipeline_text -d '{"text":"what is 12 times 13"}'` (skills included; the reply plays on the speakers) |
+| Ask without speaking | `curl -X POST localhost:9393/pipeline_text -d '{"text":"tell me a fun fact"}'` (the full turn, skills included; silent unless `"quiet": false`) |
+| Run a full turn out loud | `curl -X POST localhost:9393/pipeline_text -d '{"text":"what is 12 times 13","quiet":false}'` (skills included; the reply plays on the speakers) |
 | Run the tests | `for t in tests/test_*.py; do venv/bin/python $t || echo "FAIL $t"; done` |
 | Lint | `ruff check .` |
 | Alerts | `server/scripts/health_alerts.py` from cron every 5 min: TTS fallback use, disk space. It sends through a `hermes send` command; swap in your own notifier |
+| Security drift | `server/scripts/security_check.py` from cron Mondays 9:00, same notifier, quiet unless something changed: pip-audit on every venv, Ollama/Music Assistant behind a minor release, SearXNG pin over 60 days old, a public tunnel hostname added or pointed at the dashboard, a guard not loaded, a new LAN listener on the primary, red CI on `main`. `--dry-run` prints without sending. State: `data/security_check_state.json` (delete it to re-baseline) |

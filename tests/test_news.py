@@ -81,6 +81,29 @@ def _check_no_headlines_message():
     return failed
 
 
+def _check_one_refresh_per_stale_source():
+    """Two reads of a stale cache (one news turn does that) fetch once."""
+    import threading
+    nc = NewsCache(sources=[{"name": "a", "url": "http://x"}], ttl=60, max_items=5)
+    nc._cache["a"] = ([_item("a", 0)], time.time() - 120)
+    fetches, release = [], threading.Event()
+
+    def slow_fetch(name, url):
+        fetches.append(name)
+        release.wait(2)
+        return [_item(name, 1)]
+    nc._fetch = slow_fetch
+    nc.get()
+    nc.get()                       # still refreshing: must not start a second fetch
+    release.set()
+    deadline = time.time() + 2
+    while nc._refreshing and time.time() < deadline:
+        time.sleep(0.01)
+    ok = fetches == ["a"] and not nc._refreshing
+    print(f"[{'ok' if ok else 'FAIL'}] stale source refreshed once: {fetches}")
+    return 0 if ok else 1
+
+
 # ── pipeline._handle_news: no-hallucination guard ───────────────────────────
 
 class _FakeSearx:
@@ -231,6 +254,7 @@ def run():
     failed = 0
     failed += _check_interleaving()
     failed += _check_no_headlines_message()
+    failed += _check_one_refresh_per_stale_source()
     failed += _check_hallucination_guard()
 
     if failed:

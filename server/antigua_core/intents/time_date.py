@@ -18,3 +18,9 @@ _DATE_QUERY_RE = re.compile(
     r"what\s+(?:day|month|year)\s+is\s+(?:it|today))\b",
     re.IGNORECASE,
 )
+
+
+def is_time_date_query(transcript: str) -> bool:
+    """True when the time_date skill (antigua_core.time_date) can answer it."""
+    from ..time_date import parse   # lazy: that module imports this one
+    return parse(transcript) is not None

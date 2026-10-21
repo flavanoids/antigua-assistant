@@ -1,6 +1,6 @@
 services:
   searxng:
-    image: searxng/searxng:latest
+    image: searxng/searxng:2026.10.11-ad46ebd7d   # pinned; bump deliberately (rolling daily builds)
     container_name: antigua-searxng
     ports:
       - "127.0.0.1:8080:8080"

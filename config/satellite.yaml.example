@@ -12,6 +12,9 @@ server:
 
 satellite:
   antigua_volume_pct: 70        # Antigua speaking level 0-100; independent of the AirPlay sink volume
+  # night_volume_pct: 30        # Quiet hours speaking level (0-100)
+  # night_hours: "22:30-07:00"  # Quiet hours window; "" to disable night mode
+  # alarm_volume_pct: 75        # Alarm ring level (always audible, even during quiet hours)
   # alarm_ring_seconds: 5.0     # bell length per ring (short: the mic hears the wake word between rings)
   # alarm_repeat_seconds: 30.0  # a timer/alarm/reminder rings again this often until "stop" / the wake word
   # alarm_max_seconds: 300.0    # ...for at most this long

@@ -9,9 +9,11 @@
 ## What It Does
 
 Drives [PinedaDisplay Web](https://github.com/flavanoids/PinedaDisplay), the
-dashboard on the airplaypi kiosk screen. pineda-web runs on noegpu01 next to
-Antigua (`:8090`), so this is plain HTTP to localhost; the restart and reboot
-endpoints reach airplaypi over SSH themselves.
+dashboard on the airplaypi kiosk screen. pineda-web runs on primary-server next to
+Antigua (`:8090`, LAN-only by rule: `pineda-web-guard` keeps it off the
+internet and away from tunnels; see `network/README.md`), so this is plain
+HTTP to localhost; the restart and reboot endpoints reach airplaypi over SSH
+themselves.
 
 | Ask | Does | pineda-web call |
 |---|---|---|
@@ -73,6 +75,11 @@ the recipe session (`_handle_recipe_display`).
   theme, so `POST /api/themes/apply` would change nothing visible. Night twins
   (`ocean_night` …) aren't offered by name; each light theme switches to its
   twin at sundown by itself.
+- **Themes made in the menu work by voice too.** They come back from
+  `GET /api/themes` with `custom: true`, matched by label like the rest, so
+  "switch to the Sunday Morning theme" (or "… to Sunday", if no other theme
+  has that word) needs nothing new here. One can carry a `font`; the screen
+  shows it unless the profile has its own `font` set, which wins.
 - **"This photo" / "this quote".** The slideshow and the quote rotation run in
   the browser, so the cards report every swap to `POST /api/now-showing`.
   With `pineda.device` unset Antigua takes the most recent report from any

@@ -10,9 +10,10 @@ input labels), route_search_with_llm() (Ollama), and the format_* builders.
 
 import re
 
-from . import settings
+from . import household_memory, settings
 from . import sports as _sports
 from .music_intents import parse_music
+from . import announce, presence
 from .podcast import parse_podcast
 
 # Intent parsers live in intents/, one module per skill; re-exported here so
@@ -25,6 +26,22 @@ from .intents.calc import (  # noqa: F401 — re-exported
     is_calc_request,
 )
 from .intents.funny_sound import is_funny_sound_request  # noqa: F401 — re-exported
+from .intents.climate import parse_climate_request  # noqa: F401 — re-exported
+from .intents.live import (  # noqa: F401 — re-exported
+    parse_air_request,
+    parse_hours_request,
+    parse_market_request,
+)
+from .intents.utility import (  # noqa: F401 — re-exported
+    is_help_request,
+    is_repeat_request,
+    parse_mute,
+    parse_random,
+    parse_spell,
+    parse_stopwatch,
+    parse_volume_level,
+    unsupported_reply,
+)
 from .intents.govee import (  # noqa: F401 — re-exported
     _GOVEE_ALL_DEVICES,
     _GOVEE_BARE_POWER_MAX_WORDS,
@@ -139,6 +156,7 @@ from .intents.substitution import (  # noqa: F401 — re-exported
 from .intents.time_date import (  # noqa: F401 — re-exported
     _DATE_QUERY_RE,
     _TIME_QUERY_RE,
+    is_time_date_query,
 )
 from .intents.timers import (  # noqa: F401 — re-exported
     TimerRef,
@@ -218,6 +236,7 @@ from .intents.transcript import (  # noqa: F401 — re-exported
     strip_wake_prefix,
 )
 from .intents.security import parse_security_request  # noqa: F401 — re-exported
+from .intents.sysinfo import parse_sysinfo_request  # noqa: F401 — re-exported
 from .intents.tv import (  # noqa: F401 — re-exported
     _HDMI_NUM_RE,
     _TV,
@@ -250,6 +269,29 @@ from .intents.weather import (  # noqa: F401 — re-exported
 # function and not scattered through the pipeline.
 ROUTE_ORDER = [
     "garbage",
+    # Small fixed-phrase requests (intents/utility.py), each narrow enough to
+    # go first: "start a stopwatch", "how do you spell...", "flip a coin",
+    # "what can you do", "repeat that".
+    "stopwatch",
+    "spell",
+    "random",
+    "help",
+    "repeat",
+    # "Tell the bedroom dinner's ready", "announce that we're leaving": needs
+    # announce/tell plus a room from server.yaml's announce: block (or a bare
+    # "announce ..."), so "tell me a joke" never gets here.
+    "announce",
+    # "Who's home?", "is Alex home yet?": ahead of knowledge, which would look
+    # up "who's home" on Wikipedia.
+    "presence",
+    # "Remind me to take out the trash when I get home", "tell Alex to check the
+    # mail when he gets home": a reminder for an arrival, not a time. Ahead of
+    # memory ("tell...") and reminder_set, which would ask "what time?".
+    "arrival_reminder",
+    # "Is the internet down?", "why?", "how's the server?", "disk space":
+    # each pattern names the internet or the server, so chat stays chat.
+    # Ahead of climate/weather ("CPU temperature") and search.
+    "sysinfo",
     # Cameras and the front door lock: narrow regexes (a camera or door
     # mention plus a show/lock verb), ahead of Govee so "show me the porch"
     # isn't a light; "the porch light" itself stays Govee's.
@@ -263,6 +305,8 @@ ROUTE_ORDER = [
     # Pi, quote, phrase or photo mention, and leave "play the ... theme" alone.
     "pineda",
     "tv",
+    # Bare "mute" / "unmute": the TV's own regex needs a TV mention.
+    "mute",
     # Before podcast/music, which would search Apple Music for "a funny sound".
     "funny_sound",
     # Music before volume so "turn the music up" drives the music player;
@@ -270,10 +314,20 @@ ROUTE_ORDER = [
     # Podcasts first: "play Apple News today" isn't an Apple Music search.
     "podcast",
     "music",
+    # "Volume to 3": after music, which owns "music volume 30".
+    "volume_set",
     "volume",
+    # Inside the house (the thermostat), and outside air: before weather,
+    # whose temperature regex would answer "temperature inside" with outdoors.
+    "climate",
+    "air",
+    # "What time does H-E-B close" — before time_date's "what time".
+    "hours",
     "time_date",
     "weather",
     "display",
+    "memory_household",
+    "memory_pref",
     "memory_save",
     "memory_forget_content",
     "memory_forget_last",
@@ -300,12 +354,17 @@ ROUTE_ORDER = [
     # block, which owns "how long is left on the pasta timer".
     "commute",
     "sports",
+    # "What's bitcoin at", "how's Apple stock": before calc ("how much is").
+    "market",
     "calc",
     "news",
     # "How do I make cheesecake" — before search, which has "recipe for" and
     # "how to make" but would answer with one squashed paragraph.
     "recipe",
     "substitution",
+    # A command nothing above can do ("text Mom", "set the thermostat to 70"):
+    # an honest "I can't do that yet" instead of the model saying "Got it".
+    "unsupported",
     # People, history and events — before search, which would otherwise take
     # "who was X" with a one-sentence snippet answer. Role and time-sensitive
     # questions ("who is the CEO of…", "latest…") are left to search.
@@ -349,6 +408,25 @@ def classify(transcript: str, *, search_enabled: bool | None = None) -> str:
     if not transcript or is_garbage_transcript(transcript):
         return "garbage"
 
+    if parse_stopwatch(transcript):
+        return "stopwatch"
+    if parse_spell(transcript):
+        return "spell"
+    if parse_random(transcript):
+        return "random"
+    if is_help_request(transcript):
+        return "help"
+    if is_repeat_request(transcript):
+        return "repeat"
+    if announce.parse(transcript):
+        return "announce"
+    if presence.parse_presence_query(transcript):
+        return "presence"
+    if presence.parse_arrival_reminder(transcript, None):
+        return "arrival_reminder"
+
+    if parse_sysinfo_request(transcript):
+        return "sysinfo"
     if parse_security_request(transcript):
         return "security"
     # Govee before the TV so "tv bar" / "tv lights" aren't swallowed by the TV
@@ -360,6 +438,8 @@ def classify(transcript: str, *, search_enabled: bool | None = None) -> str:
     if (_TV_APP_RE.search(transcript) or _TV_INPUT_RE.search(transcript)
             or _TV_RE.search(transcript)):
         return "tv"
+    if parse_mute(transcript):
+        return "mute"
 
     if is_funny_sound_request(transcript):
         return "funny_sound"
@@ -367,10 +447,19 @@ def classify(transcript: str, *, search_enabled: bool | None = None) -> str:
         return "podcast"
     if parse_music(transcript):
         return "music"
+    if parse_volume_level(transcript) is not None:
+        return "volume_set"
     if parse_volume_request(transcript):
         return "volume"
 
-    if _TIME_QUERY_RE.search(transcript) or _DATE_QUERY_RE.search(transcript):
+    if settings.CLIMATE_URL and parse_climate_request(transcript):
+        return "climate"
+    if settings.LIVE_ENABLED and parse_air_request(transcript):
+        return "air"
+    if settings.HOURS_ENABLED and settings.COMMUTE_ENABLED and parse_hours_request(transcript):
+        return "hours"
+
+    if is_time_date_query(transcript):
         return "time_date"
 
     if _WEATHER_SIMPLE_RE.search(transcript):
@@ -386,6 +475,10 @@ def classify(transcript: str, *, search_enabled: bool | None = None) -> str:
             r"\b(?:alarm|timer|reminder)s?\b", transcript, re.IGNORECASE):
         return "timer_status"
 
+    if household_memory.is_household_query(transcript):
+        return "memory_household"
+    if household_memory.parse_lasting_pref(transcript):
+        return "memory_pref"
     if parse_remember_request(transcript):
         return "memory_save"
     if parse_forget_content(transcript):
@@ -454,6 +547,9 @@ def classify(transcript: str, *, search_enabled: bool | None = None) -> str:
     if _sports.is_sports_query(transcript):
         return "sports"
 
+    if settings.LIVE_ENABLED and parse_market_request(transcript):
+        return "market"
+
     # Arithmetic / unit / temperature conversion — deterministic, offline, and
     # answered by calc.answer(). After weather/timers/memory so "add 5 minutes"
     # and "colder than yesterday" are already claimed; a miss here falls to the
@@ -477,6 +573,8 @@ def classify(transcript: str, *, search_enabled: bool | None = None) -> str:
     swap = parse_swap_question(transcript)
     if swap and table_swap(*swap):
         return "substitution"
+    if unsupported_reply(transcript):
+        return "unsupported"
     if settings.KNOWLEDGE_ENABLED and parse_knowledge_request(transcript):
         return "knowledge"
     if search_enabled:

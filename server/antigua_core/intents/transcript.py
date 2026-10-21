@@ -6,6 +6,7 @@ import re
 from .. import household, settings
 from ..music_intents import parse_music
 from .timers import parse_snooze_request
+from .utility import is_help_request, parse_mute
 from .volume import parse_volume_request
 
 log = logging.getLogger("antigua_core")
@@ -92,6 +93,6 @@ def is_garbage_transcript(text: str) -> bool:
         return False
     # One-word skill triggers ("louder", "snooze") are commands, not noise
     if words and (parse_volume_request(stripped) or parse_snooze_request(stripped)
-                  or parse_music(stripped)):
+                  or parse_music(stripped) or parse_mute(stripped) or is_help_request(stripped)):
         return False
     return True

@@ -45,6 +45,7 @@ class TimerSpec:
     minute: int = 0
     message: str | None = None   # reminder payload ("call the dentist"); spoken
                                  # on fire and echoed in the confirmation
+    speak: bool = True           # False: only the display shows it (set from the phone)
 
     def __post_init__(self):
         if self.duration_s is None:
@@ -158,7 +159,15 @@ class _Entry:
     paused_left: float | None = None   # a paused timer: seconds it had left
     skip: list = field(default_factory=list)   # ISO dates a repeating alarm sits out
     created_at: float = field(default_factory=time.time)
+    speak: bool = True           # False: Antigua stays quiet; the display still shows it
     thread: object = None
+
+
+def _next_clock(hour: int, minute: int) -> float:
+    """The next time the clock reads hour:minute — today if still ahead."""
+    now = datetime.now()
+    t = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return (t if t > now else t + timedelta(days=1)).timestamp()
 
 
 # An alarm counts as rung by the primary if it was still answering this long
@@ -169,9 +178,69 @@ _PRIMARY_FIRE_MARGIN_S = 2.0
 _MISSED_GRACE_S = 600
 
 
+_REPEAT_RE = re.compile(r"^(?:daily|weekdays|weekends|[0-6](?:,[0-6])*)$")
+
+
+def phone_spec(body: dict) -> TimerSpec:
+    """An alarm or reminder set from the phone menu (pineda-web) → TimerSpec.
+
+    body: kind "alarm" | "reminder"; time "HH:MM"; date "YYYY-MM-DD" (one-time,
+    default the next time the clock reads that) or repeat (daily, weekdays,
+    weekends or weekday indices "0,2,4", Monday = 0); name (alarms);
+    message (reminders: "call mom"); speak (default True). ValueError on a
+    bad body or a one-time moment already past."""
+    kind = body.get("kind")
+    if kind not in ("alarm", "reminder"):
+        raise ValueError("kind must be alarm or reminder")
+    try:
+        hour, minute = (int(x) for x in str(body.get("time", "")).split(":"))
+        datetime(2000, 1, 1, hour, minute)
+    except ValueError:
+        raise ValueError("time must be HH:MM") from None
+    repeat = body.get("repeat") or None
+    if repeat is not None and not _REPEAT_RE.match(repeat):
+        raise ValueError("bad repeat")
+    now = datetime.now()
+    today = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if repeat:
+        fires_at = today.timestamp()
+        if today <= now or not _repeat_matches(repeat, today):
+            fires_at = _next_future(repeat, fires_at)
+    elif body.get("date"):
+        try:
+            day = datetime.strptime(body["date"], "%Y-%m-%d")
+        except ValueError:
+            raise ValueError("date must be YYYY-MM-DD") from None
+        at = day.replace(hour=hour, minute=minute)
+        if at <= now:
+            raise ValueError("that time has already passed")
+        fires_at = at.timestamp()
+    else:
+        fires_at = _next_clock(hour, minute)
+    name = (body.get("name") or "").strip()[:40] or None
+    message = (body.get("message") or "").strip()[:120] or None
+    if kind == "reminder" and not message:
+        raise ValueError("a reminder needs something to remind you of")
+    spec = TimerSpec(
+        seconds=fires_at - time.time(), label=message or "reminder", kind=kind,
+        name=name if kind == "alarm" else None, repeat=repeat, hour=hour, minute=minute,
+        message=message if kind == "reminder" else None, speak=bool(body.get("speak", True)),
+        duration_s=0,
+    )
+    if kind == "alarm":
+        spec.label = alarm_label(spec)
+    return spec
+
+
 class TimerManager:
     def __init__(self, on_fire=None, on_change=None):
         self._timers: dict[str, _Entry] = {}
+        # Switched off from the phone: kept (and persisted) but not armed.
+        self._off: dict[str, _Entry] = {}
+        # Bumped on every real change (set, cancel, ring, switch...), not on
+        # adopt/drop: the fallback compares it to know whether it has
+        # anything to hand back to the primary.
+        self.revision = 0
         self._lock = Lock()
         # Injected: what to do when a timer fires (synthesize + publish alarm).
         # A backend concern — the primary and fallback announce differently.
@@ -199,6 +268,7 @@ class TimerManager:
             minute=spec.minute,
             message=spec.message,
             set_s=0.0 if spec.kind == "alarm" else float(spec.duration_s or spec.seconds),
+            speak=spec.speak,
         )
         self._arm(entry)
         settings.mqtt_publish(
@@ -215,7 +285,7 @@ class TimerManager:
         def _run():
             while True:
                 if entry.paused_left is not None:
-                    if tid not in self._timers:
+                    if self._timers.get(tid) is not entry:
                         return       # cancelled while paused
                     time.sleep(0.5)
                     continue
@@ -224,16 +294,20 @@ class TimerManager:
                     break
                 time.sleep(min(remaining, 1.0))
             with self._lock:
-                still_active = tid in self._timers
-                self._timers.pop(tid, None)
+                # Identity, not just the id: switched off and on again, the
+                # entry is re-armed under the same id with a new thread.
+                still_active = self._timers.get(tid) is entry
+                if still_active:
+                    self._timers.pop(tid)
             if not still_active:
-                return  # cancelled / reset before its natural fire time
+                return  # cancelled / reset / switched off before its fire time
             log.info("%s fired: %s", entry.kind.capitalize(), entry.label)
             if not entry.repeat:
                 # Drop it from disk now: the fallback mirrors this file, and a
                 # stale copy of a rung alarm could ring again after a failover.
                 self._persist()
-            self._on_fire(entry.label, entry.kind, entry.message)
+            if entry.speak:
+                self._on_fire(entry.label, entry.kind, entry.message)
             if entry.repeat:
                 today = datetime.now().date().isoformat()
                 skip = [d for d in entry.skip if d >= today]
@@ -282,9 +356,70 @@ class TimerManager:
                     "set_s": e.set_s,
                     "created_at": e.created_at,
                     "skip": list(e.skip),
+                    "speak": e.speak,
+                    "enabled": True,
                 }
                 for e in sorted(self._timers.values(), key=lambda x: x.fires_at)
             ]
+
+    def list_all(self, kinds=("alarm", "reminder")) -> list[dict]:
+        """Alarms and reminders for the phone: running ones, then the ones
+        switched off (with "enabled": False), each by when it goes off."""
+        self._prune_off()
+        with self._lock:
+            off = [
+                {"id": e.tid, "label": e.label, "kind": e.kind, "name": e.name,
+                 "repeat": e.repeat, "message": e.message, "hour": e.hour,
+                 "minute": e.minute, "fires_at": e.fires_at, "speak": e.speak,
+                 "enabled": False}
+                for e in self._off.values()
+            ]
+        rows = [t for t in self.list_active() if t["kind"] in kinds]
+        rows += [t for t in off if t["kind"] in kinds]
+        return sorted(rows, key=lambda t: (not t["enabled"], t["fires_at"]))
+
+    def _prune_off(self) -> None:
+        """A switched-off one-time reminder whose time has passed is gone: it
+        can't come back. A one-time alarm keeps its clock time, so switching
+        it back on sets it for the next time the clock reads that."""
+        now = time.time()
+        with self._lock:
+            gone = [tid for tid, e in self._off.items()
+                    if not e.repeat and e.fires_at <= now
+                    and not (e.kind == "alarm" and e.hour is not None)]
+            for tid in gone:
+                self._off.pop(tid)
+        if gone:
+            self._persist()
+
+    def set_enabled(self, tid: str, on: bool) -> dict | None:
+        """Switch an alarm or reminder off (kept, not armed) or back on.
+        Returns its row, or None when there's no such entry or it can't come
+        back (a one-time reminder already past)."""
+        with self._lock:
+            if on:
+                e = self._off.pop(tid, None)
+            else:
+                e = self._timers.pop(tid, None)
+                if e is not None:
+                    e.thread = None
+                    self._off[tid] = e
+        if e is None:
+            return next((t for t in self.list_all() if t["id"] == tid), None)
+        if on:
+            if e.fires_at <= time.time():
+                if e.repeat:
+                    e.fires_at = _next_future(e.repeat, e.fires_at, e.skip)
+                elif e.kind == "alarm" and e.hour is not None:
+                    e.fires_at = _next_clock(e.hour, e.minute)
+                else:
+                    self._persist()
+                    return None
+            if e.kind == "alarm":
+                e.label = alarm_label(e)
+            self._arm(e)
+        self._persist()
+        return next((t for t in self.list_all() if t["id"] == tid), None)
 
     def find(self, substring: str) -> list[dict]:
         """Active entries whose label or name contains `substring` (case-
@@ -353,9 +488,11 @@ class TimerManager:
         return result
 
     def cancel_ids(self, tids) -> list[str]:
-        """Cancel specific entries (ids from list_active); returns their labels."""
+        """Cancel specific entries (ids from list_active or list_all, on or
+        off); returns their labels."""
         with self._lock:
             cancelled = [self._timers.pop(t).label for t in tids if t in self._timers]
+            cancelled += [self._off.pop(t).label for t in tids if t in self._off]
         if cancelled:
             log.info("Cancelled: %s", cancelled)
             self._persist()
@@ -439,6 +576,9 @@ class TimerManager:
         with self._lock:
             gone = [t for t, e in self._timers.items() if kind is None or e.kind == kind]
             cancelled = [self._timers.pop(t).label for t in gone]
+            # "Cancel all my alarms" takes the switched-off ones too.
+            off = [t for t, e in self._off.items() if kind is None or e.kind == kind]
+            cancelled += [self._off.pop(t).label for t in off]
         if cancelled:
             log.info("Cancelled all: %s", cancelled)
             self._persist()
@@ -447,10 +587,51 @@ class TimerManager:
     # ── failover (fallback adopts the primary's alarms while it's down) ─────
 
     def snapshot(self) -> list[dict]:
-        """This box's own timers in their on-disk form — served to the
-        fallback so it can take them over if this box goes down."""
+        """This box's own timers in their on-disk form (switched-off ones
+        marked "off") — what's saved, and what the fallback copies so it can
+        take them over if this box goes down."""
         with self._lock:
-            return [_entry_to_dict(e) for e in self._timers.values() if e.origin == "local"]
+            return ([_entry_to_dict(e) for e in self._timers.values() if e.origin == "local"]
+                    + [{**_entry_to_dict(e), "off": True}
+                       for e in self._off.values() if e.origin == "local"])
+
+    def export_all(self) -> list[dict]:
+        """Everything here, adopted or not, on or off, in snapshot form — what
+        the fallback hands back to the primary when it returns."""
+        with self._lock:
+            return ([_entry_to_dict(e) for e in self._timers.values()]
+                    + [{**_entry_to_dict(e), "off": True} for e in self._off.values()])
+
+    def take_handoff(self, entries: list[dict]) -> int:
+        """Replace everything here with the fallback's list (primary only):
+        while this box was down the fallback owned them, so what it has is
+        right — alarms set, changed, switched or deleted there. One-time ones
+        that came due there already rang. Returns how many are running."""
+        now = time.time()
+        with self._lock:
+            # Their threads see they no longer own their entries and exit.
+            self._timers.clear()
+            self._off.clear()
+        armed = 0
+        for d in entries:
+            e = _entry_from_dict(d, fires_at=d["fires_at"])
+            if d.get("off"):
+                with self._lock:
+                    self._off[e.tid] = e
+                continue
+            if d.get("paused_left") is not None:
+                e.fires_at = now + d["paused_left"]
+            elif e.fires_at <= now:
+                if not e.repeat:
+                    continue
+                e.fires_at = _next_future(e.repeat, e.fires_at, e.skip)
+            if e.kind == "alarm":
+                e.label = alarm_label(e)
+            self._arm(e)
+            armed += 1
+        log.info("Took %d entr(ies) back from the fallback (%d running)", len(entries), armed)
+        self._persist()
+        return armed
 
     def adopt(self, entries: list[dict], primary_alive_until: float,
               grace_s: float = 300) -> int:
@@ -464,6 +645,10 @@ class TimerManager:
         for d in entries:
             e = _entry_from_dict(d, fires_at=d["fires_at"])
             e.origin = "primary"
+            if d.get("off"):
+                with self._lock:
+                    self._off[e.tid] = e   # listed here too, still off
+                continue
             if e.fires_at <= now:
                 rung = e.fires_at + _PRIMARY_FIRE_MARGIN_S <= primary_alive_until
                 if not rung and now - e.fires_at <= grace_s:
@@ -485,11 +670,34 @@ class TimerManager:
             gone = [tid for tid, e in self._timers.items() if e.origin == "primary"]
             for tid in gone:
                 self._timers.pop(tid)
+            off = [tid for tid, e in self._off.items() if e.origin == "primary"]
+            for tid in off:
+                self._off.pop(tid)
         if gone:
             log.info("Dropped %d adopted timer(s)/alarm(s) — primary owns them again", len(gone))
         return len(gone)
 
-    # ── persistence ────────────────────────────────────────────────────────
+    def publish_schedule(self):
+        """Publish the active alarms and timers to MQTT for satellite offline backup."""
+        now = time.time()
+        with self._lock:
+            active = [
+                {
+                    "id": e.tid,
+                    "label": e.label,
+                    "kind": e.kind,
+                    "fires_at": e.fires_at,
+                    "repeat": e.repeat,
+                    "paused": e.paused_left is not None,
+                    "message": e.message,
+                }
+                for e in sorted(self._timers.values(), key=lambda x: x.fires_at)
+                if e.paused_left is None and e.fires_at > now - 60
+            ]
+        settings.mqtt_publish(
+            "antigua/alarm_schedule",
+            {"alarms": active, "timestamp": now, "revision": self.revision},
+        )
 
     def _persist(self):
         try:
@@ -499,7 +707,9 @@ class TimerManager:
                 json.dump(data, f)
         except Exception as e:
             log.warning("Timer persist failed: %s", e)
+        self.revision += 1
         self._on_change()
+        self.publish_schedule()
 
     def _load(self):
         if not settings.TIMER_STORE_PATH.exists():
@@ -516,6 +726,11 @@ class TimerManager:
             kind = entry.get("kind", "timer")
             repeat = entry.get("repeat")
             fires_at = entry["fires_at"]
+            if entry.get("off"):
+                e = _entry_from_dict(entry, fires_at=fires_at)
+                with self._lock:
+                    self._off[e.tid] = e
+                continue
             if entry.get("paused_left") is not None:
                 fires_at = now + entry["paused_left"]
             elif fires_at <= now and now - fires_at <= _MISSED_GRACE_S:
@@ -538,7 +753,7 @@ def _entry_to_dict(e: _Entry) -> dict:
             "duration_s": e.duration_s, "name": e.name, "repeat": e.repeat,
             "wake": e.wake, "hour": e.hour, "minute": e.minute,
             "message": e.message, "set_s": e.set_s, "created_at": e.created_at,
-            "paused_left": e.paused_left, "skip": list(e.skip)}
+            "paused_left": e.paused_left, "skip": list(e.skip), "speak": e.speak}
 
 
 def _entry_from_dict(d: dict, fires_at: float) -> _Entry:
@@ -554,6 +769,7 @@ def _entry_from_dict(d: dict, fires_at: float) -> _Entry:
         created_at=d.get("created_at", time.time()),
         paused_left=d.get("paused_left"),
         skip=list(d.get("skip") or []),
+        speak=d.get("speak", True),
     )
 
 
@@ -653,6 +869,21 @@ class MemoryStore:
             self._path.write_text(json.dumps({"memories": self._entries}, indent=2))
         except Exception as e:
             log.error("MemoryStore: save failed: %s", e)
+
+    # Failover: the fallback reloads the primary's copy when it takes over and
+    # hands back what it has when the primary returns (if it changed).
+    def export(self) -> list[dict]:
+        with self._lock:
+            return json.loads(json.dumps(self._entries))
+
+    def replace(self, entries: list[dict]) -> None:
+        with self._lock:
+            self._entries = list(entries)
+            self._save()
+
+    def reload(self) -> None:
+        with self._lock:
+            self._load()
 
     def _expire(self):
         cutoff = (datetime.now() - timedelta(days=self._ttl_days)).isoformat()
@@ -912,6 +1143,16 @@ class ListStore:
             self._path.write_text(json.dumps({"lists": self._lists}, indent=2))
         except Exception as e:
             log.error("ListStore: save failed: %s", e)
+
+    def replace(self, lists: dict[str, list[str]]) -> None:
+        """Failover: the fallback's lists, handed back (see MemoryStore.replace)."""
+        with self._lock:
+            self._lists = {k: list(v) for k, v in lists.items()}
+            self._save()
+
+    def reload(self) -> None:
+        with self._lock:
+            self._load()
 
     def add(self, list_name: str, items: list[str]) -> list[str]:
         """Append items, skipping case-insensitive duplicates already present.

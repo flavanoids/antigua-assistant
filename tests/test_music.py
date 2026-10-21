@@ -180,9 +180,21 @@ def main():
     pm = mc.ma.last("player_queues/play_media")
     assert pm["media"] == "am://al/lem" and pm["radio_mode"] is False, pm
 
-    # A song continues with radio, like Alexa
+    # A song continues with radio, like Alexa — the song starts alone, then
+    # its Endless Mix is appended (MA builds the mix first otherwise: ~35s)
+    seen = []
+    mc.progress = seen.append
     assert say(mc, "play Halo by Beyonce") == "Playing Halo by Beyoncé."
-    assert mc.ma.last("player_queues/play_media")["radio_mode"] is True
+    song, mix = [a for c, a in mc.ma.calls if c == "player_queues/play_media"][-2:]
+    assert song["radio_mode"] is False and song["option"] == "replace", song
+    assert mix["media"] == f"radio_playlist://playlist/{song['media']}" and mix["option"] == "add", mix
+    # …and the kitchen display hears how it's going
+    assert [p["stage"] for p in seen] == ["finding", "starting"], seen
+    assert seen[1]["title"] == "Halo" and seen[1]["artist"] == "Beyoncé", seen
+    seen.clear()
+    assert say(mc, "play Halo on the soundbar") == "Playing Halo by Beyoncé on the soundbar."
+    assert seen == [], seen                   # not the display's speaker
+    mc.progress = lambda p: None
     # "Stand by Me" survives being parsed as "Stand" by "Me"
     assert say(mc, "play Stand by Me") == "Playing Stand by Me by Ben E. King."
 

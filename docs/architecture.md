@@ -23,7 +23,7 @@ to them by role.
                                                                     ▼
              ┌─────────────────────────── primary ─────────────────────────────┐
              │ whisper.cpp server :8178 (GPU) ─► antigua_server :9393          │
-             │ Ollama :11434 (GPU)  ◄───────────  antigua_core.pipeline        │
+             │ Ollama 127.0.0.1:11434 (GPU) ◄──── antigua_core.pipeline        │
              │ Kokoro TTS :5500     ◄───────────  (skills, routing, grounding) │
              │ SearXNG :8080 · Music Assistant :8095 · MCP servers (stdio)     │
              └──────────────────────────────┬──────────────────────────────────┘
@@ -52,8 +52,11 @@ a firewall guard keeps Antigua's ports off the LAN. See
 3. **Transcribe.** `antigua_server` sends the WAV to whisper.cpp
    (large-v3-turbo, Vulkan, ~0.3 s). If that server is down, faster-whisper
    `small.en` runs on the CPU. A short transcript that matches no skill while
-   music plays gets a second opinion from `medium.en`. Spanish is used only
-   when the detector is confident (see
+   music plays gets a second opinion from `medium.en`. Spanish detection
+   (`whisper.detect_language`) costs a second Whisper pass, ~0.3 s; with it
+   off every turn is English, and a household `reply_language` preference
+   still answers in Spanish. With it on, Spanish is used only when the
+   detector is confident (see
    [spanish_support_plan.md](spanish_support_plan.md)).
 4. **Correct.** `classify.correct_transcript()` fixes known mishearings
    ("tired" → "timer", "routers" → "reuters", household names from
@@ -101,12 +104,15 @@ must reach `music` before `volume`. Each route has a handler in
 `pipeline._HANDLERS` and fixtures in `tests/fixtures/routing.yaml`.
 
 ```text
-garbage · govee · tv · music · volume · time_date · weather · display
+garbage · stopwatch · spell · random · help · repeat · security · govee · pineda
+tv · mute · funny_sound · podcast · music · volume_set · volume · climate · air
+hours · time_date · weather · display
 memory_save · memory_forget_content · memory_forget_last · medicine_query
 memory_query · list_add · list_query · list_remove · timer_add · alarm_skip
 timer_cancel · alarm_change · timer_pause · timer_reset · timer_status · snooze
 reminder_set · alarm_set · timer_set
-sports · calc · news · substitution · search · llm
+commute · sports · market · calc · news · recipe · substitution · unsupported
+knowledge · search · llm
 ```
 
 Per-skill details live in [ANTIGUA_SKILLS/](../ANTIGUA_SKILLS/README.md). The
@@ -138,7 +144,6 @@ Primary, on port 9393:
 | GET | `/memories`, `/lists`, `/timers` | Current state (JSON) |
 | POST | `/pipeline` | WAV in → full turn (the bridge uses this) |
 | POST | `/pipeline_text` | Text in → full turn, skipping STT |
-| POST | `/ask` | Text in → LLM reply + audio URL. It skips the skills and publishes nothing to MQTT, so nothing plays |
 | POST | `/stt` | WAV in → transcript |
 
 Backup, on port 9394: `/health`, `/memories`, `/lists`, `/pipeline`,
@@ -175,28 +180,49 @@ Two independent paths:
 - **The primary's TTS fails** (the process is up but Kokoro is unreachable):
   `synthesize()` retries on `tts.fallback_url` (the backup's Kokoro, same voice
   blend). `server/scripts/health_alerts.py` alerts if this keeps happening.
+  It also alerts (Telegram, every 5 min from cron) when antigua-server,
+  whisper.cpp, the loaded voice model, the kitchen bridge, the Pi's
+  satellite or the backup stop answering.
 - **The primary is down.**
-  1. The satellite polls `/health` every 20 s. On failure it POSTs
-     `/activate` to the backup, which loads its 2B model and starts its MCP
-     servers.
+  1. The backup polls the primary's `/health` itself every 5 s and takes
+     over after 2 misses (~10 s): it loads its 2B model and starts its MCP
+     servers. The satellite is a second, slower path: it polls every 20 s
+     and POSTs `/activate` after 3 misses in a row (one Wi-Fi blip is not an
+     outage). Drill 2026-10-15: primary stopped 57 s, backup active in 8 s,
+     a spoken turn answered by it in 1.1 s, back on the primary 11 s after
+     it returned, timers and lists intact.
   2. The backup's standby bridge sees the primary stop answering and takes
      over the reSpeaker. ESPHome allows only one client, so the two bridges
      never listen at the same time.
   3. If only `antigua-server` is down (the host is up), the primary's bridge
-     sends turns straight to the backup's `/pipeline`.
-  4. When the primary returns, the satellite sends `/deactivate`, and the
-     standby bridge lets go.
+     sends turns straight to the backup's `/pipeline` (2 s connect timeout).
+     If neither answers, the satellite plays `trouble.wav` ("Sorry, I can't
+     reach my server right now"), which it caches at startup.
+  4. When the primary returns (2 good checks in a row), the satellite sends
+     `/deactivate`, and the standby bridge lets go.
 
-Memories and lists are copied to the backup every 5 minutes by a cron `rsync`
-on the primary. Timers are not synced, because both servers would fire them.
+Memories, lists and the household file are copied to the backup every 5
+minutes by a cron `rsync` on the primary (errors in `logs/fallback_sync.log`). Timers are not synced, because both servers would fire them.
 The backup runs the same internet-backed skills as the primary (Open-Meteo
 weather, currency, sports, recipes) and its own SearXNG, so search and recipes
 keep working. Its display skill talks to the standby pineda-web on the same
 box, which is the server the kiosk fails over to (PinedaDisplay_web,
 docs/OPERATIONS.md#standby-server). What the backup can't do: Music
-Assistant needs the primary box up; speaker ID, Spanish and the careful
-second STT pass are primary-only; and its 2B model is a weaker talker than
-the primary's.
+Assistant needs the primary box up; speaker ID, Spanish, the security skill
+(cameras and the front door lock need the primary's Home Assistant) and the
+careful second STT pass are primary-only; and its 2B model is a weaker
+talker than the primary's.
+
+## PinedaDisplay Integration & Voice-Guided Image Search
+
+Antigua communicates with the PinedaDisplay kiosk (`pineda-web`) via an internal MCP client (`server/antigua_core/pineda.py`) targeting `http://127.0.0.1:8090/mcp/` (and standby failover at `http://10.77.0.3:8090/mcp/`).
+
+- **Keyless Image Search**: When users ask *"Show me pictures of [query]"*, Antigua queries the local SearXNG engine (`categories=images`), returning rich image metadata (thumbnails, high-res direct URLs, source domains, snippets, and aspect ratios) without requiring proprietary Google API keys.
+- **Interlocking Bento Mosaic**: Antigua calls `P.show_image_collage(query, images, seconds=120)`. Pineda mounts an `ImageSearchTakeover` card packed via CSS Grid dense packing with prominent letter badges (`[A]`, `[B]`, `[C]`, etc.).
+- **Screen as Single Source of Truth**: On follow-up questions (*"tell me more about picture B"* / *"what is the second picture"*), Antigua queries `P.takeover()` first to inspect the live screen state. This ensures robust grounding across conversational turns, random turn IDs, and restarts.
+- **Spotlight Highlighting**: Antigua calls `P.highlight_image(letter)`, triggering a golden glow, scale-up, and frosted context card on the kiosk display while speaking grounded details synthesized by Kokoro TTS.
+- **Graceful Session Auto-Restore**: If the 120-second kiosk timer has expired back to the dashboard, a 5-minute in-memory session cache restores the collage with the requested tile spotlighted.
+- **Conversational Parsing**: Handles letters (`A`-`H`), digits (`1`-`8`), number words (`one`, `two`), ordinals (`first`, `second`), polite variations (*"can you show me photos of cats please"*), and clean dismissal (*"stop the display"*, *"go back to normal"*).
 
 ## Data and retention
 
@@ -204,10 +230,24 @@ the primary's.
 |---|---|---|
 | Memories | `data/memories.json` | 14 days (`memory.ttl_days`) unless marked permanent |
 | Lists, timers | `data/lists.json`, `data/timers.json` | Until removed; timers survive restarts |
-| Speaker profiles | `data/speaker_profiles.json` | Until re-enrolled (none enrolled yet) |
+| Speaker profiles (voiceprints) | `data/speaker_profiles.json` | Until re-enrolled |
+| Speaker enrollment clips | `audio_in/speakers/<name>/` | None kept: deleted 2026-10-16. Biometric; delete them once `enroll_speaker.py` has built the profile |
 | Mic captures | `kitchen-mic/bridge/captures/` | 7 days (`captures-prune.timer`) |
-| Logs (they contain transcripts) | `logs/` | 7 days (`antigua.logrotate`) |
+| Logs (they contain transcripts) | `logs/` | 7 days; rotated daily with 50 MB maxsize ceiling (`antigua.logrotate`) |
+| MCP tool-call log (holds the turn's transcript) | `data/tool_calls.db` | 7 days, pruned at startup and hourly |
+| Camera and lock events | `data/security_events.db` | 30 days, pruned at startup and daily |
 | Reply audio | `audio_out/` | Minutes; the TTS cache 7 days from last use, capped at 200 MB |
 
+## Logging Strategy & Observability
+
+Antigua uses modular, decoupled logging across its daemons (`antigua-server`, `antigua-tts`, `antigua-whisper`, and `kitchen-bridge`):
+- **Decoupled Log Streams**: Each subsystem writes to its own log under `logs/<service>.log` with `UMask=0077` and private file modes.
+- **Size-Bounded Retention**: `/etc/logrotate.d/antigua` rotates daily and enforces a `maxsize 50M` ceiling with `rotate 6` and `maxage 7`. This prevents rapid speech loops, reconnect storms, or model errors from overflowing `/` or `/home`.
+- **Cross-Service Traceability with PinedaDisplay**: When Antigua calls PinedaDisplay (`POST http://127.0.0.1:8090/mcp/`), it forwards W3C trace metadata in `_meta.traceparent`. Pineda's `mcp_audit.db` logs this trace, matching spoken turns to visual card and camera actions.
+- **Health Monitoring & Alerts**: `server/scripts/health_alerts.py` runs every 5 minutes from cron, ensuring local Kokoro TTS, whisper.cpp, Ollama, mic bridge, and satellite audio playback remain healthy, while verifying `/tmp` and `/` remain below 80% capacity.
+
 Nothing in `data/`, `logs/` or `captures/` is ever committed. The pre-commit
-hook enforces this.
+hook enforces this. On disk all of it is private: the directories are 700,
+and the services run with `UMask=0077` (`server/30-hardening.conf`), so
+nothing they write is readable by other accounts. The disks themselves
+aren't encrypted, so someone who takes a box can read it.
