@@ -85,7 +85,7 @@ Goal: talk to her in Spanish and she answers in Spanish, in her own voice. Estim
 
 No English clip scored above 0.06 for Spanish.
 
-**Deviation from the plan: STT latency.** whisper-server computes language probabilities with a separate encoder pass, and each pass costs about 0.29s on the RX 6650 XT:
+**Deviation from the plan: STT latency.** whisper-server computes language probabilities with a separate encoder pass, and each pass costs about 0.29s on the primary's 8 GB GPU:
 
 | Request | Time |
 |---|---|

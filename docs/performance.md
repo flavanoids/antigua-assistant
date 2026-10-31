@@ -15,7 +15,7 @@ they weren't tested.
 
 | | 8 GB mid-range GPU | 4 GB entry or older GPU |
 |---|---|---|
-| Cards in this class (last ~5 years) | Radeon RX 6600 / 6650 XT / 7600, GeForce RTX 3060 8 GB / 4060, Arc A750 | GeForce GTX 1650, Radeon RX 6400 / 6500 XT, and similar laptop GPUs |
+| Cards in this class (last ~5 years) | Radeon RX 6600 / 6600 XT / 7600, GeForce RTX 3060 8 GB / 4060, Arc A750 | GeForce GTX 1650, Radeon RX 6400 / 6500 XT, and similar laptop GPUs |
 | CPU it was paired with | recent 6-performance-core desktop CPU | older 4-core laptop-class CPU |
 | What fits on the GPU | the 4B LLM (3.3 GB) **and** speech-to-text (whisper large-v3-turbo, ~2 GB) | the 4B LLM only; speech-to-text runs on the CPU (small.en) |
 | **Skills** ("set a timer", weather, TV) | **0.69 s** | **2.54 s** (p90 5.7 s) |
