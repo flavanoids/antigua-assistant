@@ -22,7 +22,12 @@ jobs:
           cache-dependency-path: |
             server/requirements.txt
             server/requirements-tts.txt
-      - run: sudo apt-get install -y --no-install-recommends espeak-ng   # phonemizer's backend
-      - run: pip install -r server/requirements.txt -r server/requirements-tts.txt pytest ruff   # test_tts_voice imports the TTS server
+      - run: pip install -r server/requirements.txt pytest ruff
+      # The TTS server (numpy>=2.5) runs on the primary and backup, not on the
+      # 3.11 satellite: install it and run its voice suite on 3.13 only.
+      - if: matrix.python != '3.11'
+        run: |
+          sudo apt-get install -y --no-install-recommends espeak-ng
+          pip install -r server/requirements-tts.txt
       - run: ruff check .
-      - run: pytest -v
+      - run: pytest -v ${{ matrix.python == '3.11' && '--ignore=tests/test_tts_voice.py' || '' }}
