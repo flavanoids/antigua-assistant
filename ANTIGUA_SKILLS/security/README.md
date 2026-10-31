@@ -17,13 +17,17 @@ A doorbell ring puts the front door camera on the display by itself. Motion
 and person detections are logged, and can optionally trigger spoken announcements
 over Antigua's satellite speakers with configurable cooldown (`motion_cooldown_seconds`)
 and quiet hours (`motion_hours`).
+A busy door doesn't hear the sentence all day: the first visit speaks, a
+second within `repeat_window_minutes` (5) plays a short chime instead
+(`static_audio/door_chime.wav`), and more than `repeat_limit` (2) in that
+window chimes until the door has been quiet `repeat_cooldown_minutes` (20).
 
 The visitor announcement framework supports natural phrasing for identified people:
 - Unknown visitor: `"Somebody is at the front door."`
-- Single visitor: `"Alex's at the front door."` (or `"James is at the front door."`)
-- Dual visitors: `"Maria is at the front door with Vivicca."`
-- Multiple visitors: `"Alex, Jordan, and Maria are at the front door."`
-- Known visitor with guest: `"Alex is at the front door with a guest."`
+- Single visitor: `"Dana's at the front door."` (or `"James is at the front door."`)
+- Dual visitors: `"Jordan is at the front door with Riley."`
+- Multiple visitors: `"Dana, Sam, and Jordan are at the front door."`
+- Known visitor with guest: `"Dana is at the front door with a guest."`
 
 Visitor identity can be supplied via:
 1. **Home Assistant Sensors / Attributes**: Eufy BionicMind (`person_name`), Frigate (`sub_label`), or Double Take entity attributes.

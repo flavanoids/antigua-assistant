@@ -27,6 +27,40 @@ _TV_RE = re.compile(
     re.IGNORECASE,
 )
 
+# "What's on the TV", "is the TV on", "what am I watching". Checked before
+# _TV_RE, whose "tv on" would otherwise turn the TV on. "what's on tv" (no
+# "the") is left alone: it usually means listings.
+_TV_STATUS_RE = re.compile(
+    r"\b(?:"
+    rf"what(?:'s|\s+is)\s+(?:on|playing\s+on|showing\s+on)\s+(?:the\s+){_TV}|"
+    rf"what(?:'s|\s+is)\s+playing\s+on\s+{_TV}|"
+    rf"what(?:'s|\s+is)\s+the\s+{_TV}\s+(?:playing|showing)|"
+    r"what\s+(?:am\s+i|are\s+we)\s+watching(?:\s+(?:right\s+)?now)?\s*[?.!]*$|"
+    rf"(?:is|are)\s+(?:the\s+)?{_TV}\s+(?:still\s+)?(?:on|off)|"
+    r"how\s+(?:much\s+(?:time\s+|longer\s+)?(?:is\s+)?(?:left\s+)?(?:in|on|of)|long\s+is\s+left\s+(?:in|on|of))\s+"
+    rf"(?:this|the)\s+(?:show|movie|episode|film|{_TV})"
+    r")",
+    re.IGNORECASE,
+)
+
+# Skipping within what's playing. The TV must be named somewhere (_TV_NAMED),
+# since bare "skip ahead 30 seconds" is the music/podcast seek. "go back"
+# needs a duration, so "go back on the tv" stays the Back button.
+_N = r"(?:\d|a\b|an\b|half|one|two|three|four|five|six|seven|eight|nine|ten|fifteen|twenty|thirty|forty|sixty|ninety)"
+_TV_SEEK_RE = re.compile(
+    r"\b(?:"
+    r"(?P<fwd>(?:skip|jump|move)\s+(?:ahead|forward)|go\s+(?:ahead|forward)|fast[\s-]?forward)|"
+    rf"(?P<back>(?:skip|jump|move)\s+back(?:wards?)?|go\s+back\s+(?={_N})|rewind)|"
+    r"(?P<restart>(?:start|play)\s+(?:it|this|the\s+(?:show|movie|episode|film))\s+(?:over|from\s+the\s+(?:start|beginning))|"
+    r"restart\s+(?:it|this|the\s+(?:show|movie|episode|film))|"
+    r"(?:go\s+)?back\s+to\s+the\s+(?:start|beginning))"
+    r")",
+    re.IGNORECASE,
+)
+_TV_NAMED = re.compile(rf"\b{_TV}\b", re.IGNORECASE)
+_SEEK_AMOUNT_RE = re.compile(
+    rf"\b({_N}[\w\s]*?\s*(?:seconds?|secs?|minutes?|mins?))\b", re.IGNORECASE)
+
 # Matches input-switching phrases and captures the target name/label.
 _TV_INPUT_RE = re.compile(
     r"\b(?:"

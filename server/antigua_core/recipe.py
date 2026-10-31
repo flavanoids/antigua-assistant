@@ -9,6 +9,7 @@ recipe, find() returns [] and Antigua says so (hard rule, see
 ANTIGUA_SKILLS/recipes/README.md).
 """
 
+import copy
 import html as _html
 import json
 import logging
@@ -18,8 +19,9 @@ import time
 import unicodedata
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
+import httpx
 import requests
 
 from . import settings
@@ -35,6 +37,12 @@ _HEADERS = {
     "Upgrade-Insecure-Requests": "1",
     "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "none", "Sec-Fetch-User": "?1",
+}
+# What pineda-web's image proxy sends for a picture (image_proxy._HEADERS).
+_PROXY_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/131.0 Safari/537.36",
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
 }
 # Pages that never carry a recipe's structured data.
 _SKIP_HOSTS = re.compile(r"(?:^|\.)(?:youtube|youtu|pinterest|reddit|tiktok|facebook|instagram|"
@@ -102,6 +110,8 @@ class Recipe:
     amounts: list = field(default_factory=list)   # parse_amount per ingredient line
     kind: str = "recipe"                  # "howto": a household guide (howto.py), supplies as ingredients
     caution: str = ""                     # howto: the fixed caution line, "" when nothing's risky
+    images: list | None = None            # the dish's photos on its page, best first;
+                                          # None = not looked for yet (cached before 2026-10-25)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -726,7 +736,112 @@ def parse_recipe_html(page: str, url: str) -> Recipe | None:
         rating=stars, rating_count=count, equipment=equipment[:3], wait=wait_phrase,
         yield_n=yield_n, yield_hi=yield_hi, yield_unit=yield_unit,
         amounts=[parse_amount(i) for i in ingredients],
+        images=page_images(page, url, data),
     )
+
+
+# ── Photos ───────────────────────────────────────────────────────────────────
+# For choosing between recipes on the kiosk (2026-10-25): the recipe's own
+# photo from its JSON-LD, then other big pictures on the page whose file
+# name is this dish ("Apple-Pie-3.jpg" for "Old-Fashioned Apple Pie"). The
+# related-recipe tiles are small, or named for another dish.
+
+_IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.I)
+_IMG_SRC_RES = [re.compile(a + r"""=["']([^"']+)["']""", re.I)
+                for a in (r"\bdata-lazy-src", r"\bdata-src", r"\bdata-pin-media", r"\bsrc")]
+_IMG_SRCSET_RE = re.compile(r"""\b(?:data-lazy-|data-)?srcset=["']([^"']+)["']""", re.I)
+_IMG_WIDTH_RE = re.compile(r"""\bwidth=["']?(\d+)""", re.I)
+_IMG_DIMS_RE = re.compile(r"(?:^|[/_-])(\d{2,4})x(\d{1,4})(?=[/._-]|$)")
+_IMG_JUNK_RE = re.compile(r"logo|avatar|author|headshot|byline|profile|icon|badge|sprite|banner|"
+                          r"placeholder|pixel|button|stars?[-_.]|rating|signature|cookbook|"
+                          r"pinterest|facebook|instagram|\.svg|\.gif", re.I)
+# Step and ingredient shots go after the finished dish.
+_IMG_LATER_RE = re.compile(r"method|step|process|collage|how-to|howto|ingredient|prep", re.I)
+_IMG_FILLER = {"recipe", "homemade", "easy", "best", "the", "and", "with", "old", "fashioned",
+               "classic", "simple", "quick", "perfect", "ultimate", "grandma", "mom", "authentic",
+               "traditional", "from", "scratch", "world", "famou", "favorite", "for", "how", "make"}
+_IMG_MIN_WIDTH = 480
+_IMG_KEEP = 4
+
+
+def _jsonld_images(value) -> list:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return _jsonld_images(value.get("url") or value.get("contentUrl") or "")
+    if isinstance(value, list):
+        return [u for v in value for u in _jsonld_images(v)]
+    return []
+
+
+def _img_name(url: str) -> str:
+    """The picture behind a URL, whatever size it's served at:
+    'Apple-Pie-2-1200x800.jpg' and 'Apple-Pie-2.jpg' are one photo."""
+    name = urlparse(url).path.rsplit("/", 1)[-1].lower()
+    name = re.sub(r"\.(?:jpe?g|png|webp|avif)$", "", name)
+    return re.sub(r"[-_]\d{2,4}x\d{1,4}$|[-_](?:scaled|e\d{6,})$", "", name)
+
+
+def _img_width(url: str, tag: str = "") -> int:
+    m = _IMG_DIMS_RE.search(urlparse(url).path)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"[?&](?:w|width)=(\d+)", url)
+    if m:
+        return int(m.group(1))
+    m = _IMG_WIDTH_RE.search(tag)
+    return int(m.group(1)) if m else 0
+
+
+def _srcset_best(srcset: str) -> tuple:
+    """The largest candidate up to 1600 px wide: (url, width)."""
+    best = ("", 0)
+    for part in srcset.split(","):
+        bits = part.strip().split()
+        if not bits:
+            continue
+        w = bits[1][:-1] if len(bits) > 1 and bits[1].endswith("w") else ""
+        w = int(w) if w.isdigit() else 0
+        if w <= 1600 and (w >= best[1] or not best[0]):
+            best = (bits[0], w)
+    return best
+
+
+def page_images(page: str, url: str, data: dict | None = None, keep: int = _IMG_KEEP) -> list:
+    """Up to `keep` photo URLs of the recipe on `page`, best first."""
+    title = _text((data or {}).get("name"))
+    want = _words(spoken_title(title)) - _IMG_FILLER if title else set()
+    need = min(2, len(want))
+    found, seen = [], set()
+
+    def add(src: str, width: int, own: bool):
+        src = urljoin(url, _html.unescape(src.strip()))
+        if not src.startswith("http") or _IMG_JUNK_RE.search(urlparse(src).path):
+            return
+        name = _img_name(src)
+        if not name or name in seen:
+            return
+        if not own:
+            if width and width < _IMG_MIN_WIDTH:
+                return
+            if need and len(_words(re.sub(r"[-_]", " ", name)) & want) < need:
+                return
+        seen.add(name)
+        found.append((0 if own else 2 if _IMG_LATER_RE.search(name) else 1, len(found), src))
+
+    for src in _jsonld_images((data or {}).get("image")):
+        add(src, 0, True)
+    for m in _IMG_TAG_RE.finditer(page):
+        tag = m.group(0)
+        srcset = _IMG_SRCSET_RE.search(tag)
+        src, width = _srcset_best(srcset.group(1)) if srcset else ("", 0)
+        if not src:
+            src = next((x.group(1) for r in _IMG_SRC_RES for x in [r.search(tag)]
+                        if x and not x.group(1).startswith("data:")), "")
+        if src and not src.startswith("data:"):
+            add(src, width or _img_width(src, tag), False)
+    found.sort()
+    return [u for _, _, u in found[:keep]]
 
 
 def spoken_title(title: str) -> str:
@@ -967,6 +1082,96 @@ class RecipeFinder:
         pool.shutdown(wait=False, cancel_futures=True)
         # Search order, so rank() can still favor what the engines put first.
         return [f.result() for f in futures if f.done() and f.result() is not None]
+
+    def with_photos(self, dish: str, recipes: list, want: int = 3, look: int = 6) -> list:
+        """The first `want` of `recipes` (ranked) that have photos, for the
+        kiosk to choose from. A recipe cached before photos were kept
+        (images None) has its page fetched again, in parallel with the
+        others, and what's found is written back to the cookbook and the
+        search cache so it's looked for once."""
+        todo = [r for r in recipes[:look] if r.images is None and r.url and r.kind == "recipe"]
+        if todo:
+            pool = ThreadPoolExecutor(max_workers=len(todo))
+            futures = {pool.submit(self._fetch_one, r.url): r for r in todo}
+            _done, _late = wait(futures, timeout=settings.RECIPE_FETCH_TIMEOUT + 1)
+            pool.shutdown(wait=False, cancel_futures=True)
+            for f, r in futures.items():
+                if f.done():
+                    page = f.result()
+                    r.images = page.images if page is not None else []
+            self._keep_photos(dish, [r for r in todo if r.images is not None])
+        # Some sites' image servers refuse anyone but a browser on their
+        # own pages (Food Network's CDN: 403); the kiosk's proxy fetches
+        # from here too, so a photo that fails here would be a blank tile.
+        out = []
+        for r in self._loadable([r for r in recipes[:look] if r.images]):
+            out.append(r)
+            if len(out) == want:
+                break
+        return out
+
+    def _loadable(self, recipes: list) -> list:
+        """Copies of `recipes` keeping only the photos that load, best first;
+        a recipe none of whose photos load is left out."""
+        urls = list(dict.fromkeys(u for r in recipes for u in r.images))
+        if not urls:
+            return []
+
+        # httpx with the proxy's headers, as pineda-web's image_proxy asks:
+        # some CDNs serve python-requests and still refuse it (Food
+        # Network's, 2026-10-25).
+        client = httpx.Client(headers=_PROXY_HEADERS, timeout=2.5, follow_redirects=True)
+
+        def ok(url):
+            try:
+                with client.stream("GET", url) as resp:
+                    return resp.is_success and resp.headers.get("content-type", "").startswith("image/")
+            except httpx.HTTPError:
+                return False
+        pool = ThreadPoolExecutor(max_workers=min(len(urls), 16))
+        futures = {u: pool.submit(ok, u) for u in urls}
+        wait(futures.values(), timeout=4)
+        pool.shutdown(wait=False, cancel_futures=True)
+        client.close()
+        good = {u for u, f in futures.items() if f.done() and f.result()}
+        out = []
+        for r in recipes:
+            keep = [u for u in r.images if u in good]
+            if keep:
+                if len(keep) < len(r.images):
+                    log.info("Recipe photos: %d of %d from %s don't load", len(r.images) - len(keep),
+                             len(r.images), r.source)
+                r = copy.copy(r)
+                r.images = keep
+                out.append(r)
+        return out
+
+    def _keep_photos(self, dish: str, recipes: list) -> None:
+        photos = {r.url: r.images for r in recipes}
+        if not photos:
+            return
+        key = self.cookbook._load_index().get(dish_key(dish))
+        paths = [self._cache_path(dish)] + ([self.cookbook._dir / f"{key}.json"] if key else [])
+        for path in paths:
+            try:
+                d = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            for r in d.get("recipes", []):
+                if r.get("url") in photos:
+                    r["images"] = photos[r["url"]]
+            try:
+                path.write_text(json.dumps(d))
+            except OSError as e:
+                log.warning("Recipe photos not kept in %s: %s", path, e)
+
+    def searched(self, dish: str) -> bool:
+        """search() would answer from its cache, without the web."""
+        try:
+            d = json.loads(self._cache_path(dish).read_text())
+            return time.time() - d["fetched"] < self._cache_s and bool(d["recipes"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
 
     def cached(self, dish: str) -> bool:
         if self.cookbook.has(dish):

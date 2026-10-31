@@ -206,11 +206,12 @@ each skill works inside, see [ANTIGUA_SKILLS/](ANTIGUA_SKILLS/README.md).
 - "Tell me more about picture B" / "What is photo C?" / "Tell me about picture 2"
 - "Change the theme to ocean" / "Switch to the groovy theme" / "Random theme" / "What themes are there?"
 - "Restart the display" / "Reboot the Pi" (she asks you to say yes first)
+- "Turn the screen tall" / "Put the display in landscape" / "Flip the screen over" / "Rotate the screen"
 - "Who said this quote?" / "Read the quote" / "Tell me more about this quote"
 - "Say the Spanish phrase" / "What's the word of the day?"
 - "When was this photo taken?"
 
-**Behavior**: Theme changes stick until you change them again, and each light theme still turns to its night version at sundown. The Spanish phrase plays in the Spanish voice, then the meaning in English, then the Spanish again. Running timers show in the display's small moon card. Image searches display an interlocking mosaic collage with identifier badges (A, B, C...) on screen; asking about any picture spotlights the tile and speaks details grounded in the search results.
+**Behavior**: Theme changes stick until you change them again, and each light theme still turns to its night version at sundown. The Spanish phrase plays in the Spanish voice, then the meaning in English, then the Spanish again. Running timers show in the display's small moon card. Image searches fill the display with up to six pictures lettered A, B, C... (ranked, with local cues like "downtown" pinned to the home city); "show me A" (or "make A bigger", or asking about one) opens it full screen and speaks its details, "next" / "previous" step through them, and "no, go back" returns to all of them. A collage stays up 30 seconds, and each picture opened gets another 30.
 
 **Limits**: Only the primary server can reach the display. Photos without a camera date (screenshots, edited images) can't be dated. A reboot takes music and her voice away for about a minute.
 
@@ -255,11 +256,13 @@ each skill works inside, see [ANTIGUA_SKILLS/](ANTIGUA_SKILLS/README.md).
 - "Turn on the TV" / "Turn the Apple TV off"
 - "TV volume up" / "Mute the TV"
 - "Pause the TV" / "Resume the TV"
+- "What's on the TV?" / "What am I watching?" / "Is the TV on?" / "How much is left in this episode?"
+- "Skip ahead 2 minutes on the TV" / "Rewind the TV" / "Restart the movie on the TV"
 - "TV home" / "Go back on the TV"
 - "Open Netflix" / "Put on YouTube on the TV" / "Open Plex"
 - "Switch to HDMI 2" / "Switch to the PlayStation" / "Switch to live TV"
 
-**Behavior**: Confirms only after the device acknowledges. If it doesn't answer, she says "The Living Room TV did not respond". For an app that isn't installed on the Apple TV, she says so.
+**Behavior**: Confirms only after the device acknowledges. If it doesn't answer, she says "The Living Room TV did not respond". For an app that isn't installed on the Apple TV, she says so. "What's on" answers with the title, app and time left ("Playing Pots and Pans on Apple TV, about 30 minutes left."), or says the TV is off. Skipping needs the TV named; a bare "skip ahead 30 seconds" is for music and podcasts. Skipping defaults to 30 seconds ahead and 15 back.
 
 ---
 
@@ -304,6 +307,20 @@ On a timed step ("bake 45 minutes") she offers to set a timer. While a recipe is
 **Asking anything else**: "Can I use a hand mixer?", "Why a water bath?", "Can I make this the day before?" — she answers from the recipe she's reading you, plus general kitchen technique. She'll never quote an amount, time, temperature or pan size the recipe doesn't state (a code check, not just a promise); if the recipe doesn't say, she says so.
 
 **Limits**: The recipe stays open for 4 hours after the last thing you said about it. Only one recipe is open at a time, for the whole house. English only for now. The backup server can't look up recipes.
+
+---
+
+## Research
+
+**What she does**: For questions one search can't settle, she runs several searches, reads the store and article pages, and weighs them together. She says one line ("I'll look into that and get back to you"), you can keep using her meanwhile, and the answer comes in about 10–30 seconds.
+
+**How to ask**:
+- Say it outright: "Research heat pumps", "look into whether we should get solar", "dig into robot vacuums for pet hair".
+- Or ask something research-shaped: "Find the best price on a Ninja Creami", "where's the cheapest place to buy AirPods", "compare the Pixel and the iPhone", "is the Ninja Swirl worth it", "should I get an air fryer or a toaster oven", "Houston's weather patterns over the last 30 years". She may also choose research herself for a buying or comparison question.
+
+**Where the facts come from**: Prices come from the retailer pages she read, with the exact model each price is for. Climate questions use the nearest NOAA weather station's daily record since 1991, added up by decade. She never states a price, number or store that isn't on a page she read (checked in code). Ask "where's that from?" right after to hear her sources.
+
+**Limits**: English only. One research question at a time, and up to 12 an hour. The household's own model does all the thinking (nothing but the searches leaves the house), so a hard comparison gets a short, careful answer rather than a long review.
 
 ---
 
@@ -381,11 +398,19 @@ On a timed step ("bake 45 minutes") she offers to set a timer. While a recipe is
 
 ## Inside the House (thermostat)
 
-**What she knows**: The thermostat's indoor temperature, humidity and setpoint, and whether the AC is running, from the AC controller's read-only data server (`climate:` in `server.yaml`). It logs every 30 minutes; an answer more than an hour old says what time it's from.
+**What she knows**: The thermostat's indoor temperature, humidity and setpoint, and whether the AC is cooling, heating or off, from the AC controller's data server (`climate:` in `server.yaml`). It logs every 30 minutes (mode and cooling/heating every 15); an answer more than an hour old says what time it's from.
 
-**How to ask**: "What's the temperature inside?" / "How warm is it in the house?" / "Is the AC running?" / "What's the thermostat set to?" / "How humid is it inside?"
+**How to ask**: "What's the temperature inside?" / "How warm is it in the house?" / "Is the AC on?" / "Is the heat on?" / "What's the AC doing?" / "What's the thermostat set to?" / "How humid is it inside?"
 
-**Limits**: Read-only. The AC controller sets the thermostat itself every half hour, so "set the thermostat to 70" gets "I can't change the thermostat".
+**Windows open mode**: tell her you're opening the windows and the AC controller switches the system off so it doesn't cool or heat the outdoors. It comes back on by itself after an hour and a half (or "for 3 hours"; 12 at most) if nobody says the windows are closed.
+- "I'm gonna open the windows" / "We opened the windows" / "I'm opening the windows for 3 hours" / "Turn on windows mode"
+- "I'm gonna close the windows" / "I closed the windows" / "Turn off windows mode"
+- "Is windows mode on?" / "Are the windows open?"
+- While it's on, "Is the AC on?" gets "Off. Windows open mode is engaged to let fresh air into the house without running cooling or heating, until 3:45 PM."
+
+The controller acts at its next half-hourly run, so the AC goes off (or back on) within 30 minutes. She runs the controller's `windows.py` on the same host (`climate.windows_script`); without it she says she can't switch it from here. A bare "open the windows" is something she can't do, so it isn't taken as windows mode.
+
+**Limits**: The AC controller sets the thermostat itself every half hour, so "set the thermostat to 70" gets "I can't change the thermostat". Windows mode is the only switch she has.
 
 ---
 
@@ -461,9 +486,30 @@ Setup: docs/ios_shortcut.md.
 
 ---
 
+## Mesh Federation & Mac Skills
+
+When paired with an Antigua node on Mac (`antigua-mac`, see [docs/mesh.md](docs/mesh.md)), Antigua delegates Mac-specific commands to the Mac and shares household memories, personality preferences, and lists seamlessly.
+
+### macOS Shortcuts
+- "run shortcut Work Mode"
+- "trigger the mac shortcut Meeting Setup"
+- "start shortcut Coffee Break"
+
+### Apple Reminders
+- "add a mac reminder to buy sourdough bread"
+- "remind me on my Mac to submit quarterly taxes"
+
+### Delegated Smart Home from Mac
+When talking to an Antigua Mac instance, commands targeting physical house hardware (lights, TV, cameras, AC) are delegated over the mesh to the Antigua Home Server:
+- "turn off the living room lights" -> delegated to Home Server
+- "turn on the TV" -> delegated to Home Server
+- "show me the front door camera" -> delegated to Home Server
+
+---
+
 ## Not Yet Implemented
 
-- Smart home controls beyond lights, the TV and the front door lock (she can read the thermostat but not change it)
+- Smart home controls beyond lights, the TV and the front door lock (she can read the thermostat and switch windows open mode, but not change the setpoint)
 - Calendar, email, texts and calls
 - Flight and package tracking
 - A custom "Hey Antigua" wake word (the wake word is "Alexa" for now)

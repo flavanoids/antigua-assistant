@@ -66,6 +66,9 @@ eq("multi-word name", (s.label, s.name), ("banana bread timer", "banana bread"))
 s = spec("remind me in 30 seconds")
 eq("reminder kind", (s.kind, s.label), ("reminder", "reminder"))
 eq("not a timer", spec("how long is a marathon"), None)
+# Said as "Your 3 minute timer is done."
+eq("unnamed label", spec("set a timer for 3 minutes").label, "3 minute timer")
+eq("unnamed label h+m", spec("set a timer for 1 hour and 30 minutes").label, "1 hour 30 minute timer")
 
 
 # ── alarm specs ─────────────────────────────────────────────────────────────
@@ -654,6 +657,47 @@ try:
     eq("publish_schedule empty after cancel", len(schedules_after_cancel[-1]["alarms"]), 0)
 finally:
     settings.mqtt_publish = orig_pub
+
+
+# ── Daylight saving: an alarm across a clock change rings at its clock time ──
+# A spec's seconds-from-now must be real seconds, not the wall-clock gap
+# (an hour off across a change). Pinned to Central time and fixed "now"s so it
+# checks both changes whatever the date.
+import os  # noqa: E402
+
+from antigua_core.intents import timers as T  # noqa: E402
+
+_tz_before = os.environ.get("TZ")
+os.environ["TZ"] = "America/Chicago"
+time.tzset()
+_real_dt = T.datetime
+try:
+    for fake_now, text, want in (
+        # Fri night before fall-back (2026-11-01): Monday's weekday alarm
+        (datetime(2026, 10, 30, 23, 0), "set an alarm for 6:30 every weekday", datetime(2026, 11, 2, 6, 30)),
+        (datetime(2026, 10, 31, 22, 0), "set an alarm for 7 am tomorrow", datetime(2026, 11, 1, 7, 0)),
+        # Sat night before spring-forward (2027-03-14)
+        (datetime(2027, 3, 13, 22, 0), "set an alarm for 7 am tomorrow", datetime(2027, 3, 14, 7, 0)),
+        (datetime(2027, 3, 13, 22, 0), "remind me to water the plants tomorrow at 9 am",
+         datetime(2027, 3, 14, 9, 0)),
+    ):
+        class _Fixed(_real_dt):
+            fixed = fake_now
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.fixed
+        T.datetime = _Fixed
+        spec = C.parse_alarm_request(text) or C.parse_reminder_request(text)
+        eq(f"DST: {text!r} at {fake_now:%m-%d %H:%M}",
+           _real_dt.fromtimestamp(fake_now.timestamp() + spec.seconds), want)
+finally:
+    T.datetime = _real_dt
+    if _tz_before is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = _tz_before
+    time.tzset()
 
 
 if FAILS:

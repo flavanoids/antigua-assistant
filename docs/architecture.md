@@ -12,9 +12,10 @@ to them by role.
 
 | Role | Hardware | Runs |
 |---|---|---|
-| **Primary** | x86 box with an AMD RX 6650 XT (8 GB) | STT, LLM, TTS, the pipeline, the kitchen-mic bridge, SearXNG, Music Assistant, MCP servers |
+| **Primary** | x86 box with an 8 GB mid-range GPU (RX 6600 XT / RTX 3060 class) | STT, LLM, TTS, the pipeline, the kitchen-mic bridge, SearXNG, Music Assistant, MCP servers |
 | **Satellite** | Raspberry Pi 4 + HiFiBerry DAC+ | Mosquitto (MQTT), reply/alarm playback, AirPlay (shairport-sync), primary health checks |
 | **Backup** | small x86 box, CPU only | Backup TTS (always on); a complete fallback pipeline and a standby mic bridge that only start when the primary is down |
+| **Local / Mac** | Apple Silicon Mac (`antigua-mac`) | Standalone STT, LLM, TTS, mic/speaker, macOS Shortcuts/Reminders; pairs via [Mesh Federation](mesh.md) |
 | **Kitchen mic** | Seeed reSpeaker Lite (ESP32-S3, XMOS) running ESPHome | Streams microphone audio; LED ring and button driven by the bridge |
 
 ```text
@@ -75,6 +76,12 @@ a firewall guard keeps Antigua's ports off the LAN. See
      search results or headlines. `grounding.py` drops sentences that assert
      names or numbers missing from the provided context, and weather claims
      when no weather data was given.
+   - `clean.py` keeps chat replies clean around the uncensored model, and
+     never says so. Come-ons and bare innuendo bait ("make it bigger" with no
+     picture up) get a line from a small bank and never reach the model. On
+     ungrounded replies each streamed sentence is screened before TTS: a
+     suggestive first sentence becomes "Probably heard you wrong…", and a
+     later one ends the reply there. A dropped reply isn't saved to history.
 7. **Speak.** `tts_text.clean_for_tts()` turns numbers, units, dates and
    abbreviations into words and fixes pronunciations. Kokoro (a fixed blend of
    three voices) synthesizes the first sentence of an LLM reply on its own, so
@@ -124,7 +131,7 @@ user-facing list of things you can say is [SKILLS.md](../SKILLS.md).
 |---|---|
 | `server/antigua_server.py` | Primary server: config, STT/LLM/TTS backends, HTTP endpoints, MQTT, background warmers |
 | `server/antigua_fallback_server.py` | Backup server: same pipeline with CPU STT, a 2B model and local TTS; idle until `/activate` |
-| `server/antigua_core/` | Shared by both servers. `pipeline.py` (turn handling), `classify.py` (`ROUTE_ORDER` and `classify()`), `intents/` (one parser module per skill, re-exported by `classify.py`), `settings.py` (config), `server_common.py` (helpers both servers use), `household.py`, `stores.py` (memories, lists, timers, conversations), `caches.py` (weather, news, search), `tts_text.py`, `grounding.py`, `weather.py`, `sports.py`, `calc.py`, `music.py`, `home_control.py`, `mcp_client.py`, `spanish.py`, `speaker_id.py` |
+| `server/antigua_core/` | Shared by both servers. `pipeline.py` (turn handling), `classify.py` (`ROUTE_ORDER` and `classify()`), `intents/` (one parser module per skill, re-exported by `classify.py`), `settings.py` (config), `server_common.py` (helpers both servers use), `household.py`, `clean.py` (clean replies), `stores.py` (memories, lists, timers, conversations), `caches.py` (weather, news, search), `tts_text.py`, `grounding.py`, `weather.py`, `sports.py`, `calc.py`, `music.py`, `home_control.py`, `mcp_client.py`, `spanish.py`, `speaker_id.py` |
 | `server/kokoro_tts_server_flask.py` | Kokoro TTS HTTP server (`POST /tts` → WAV); the voice blend lives here |
 | `antigua_satellite.py` | Satellite on the Pi: playback queue, alarms, ducking, failover watcher |
 | `kitchen-mic/bridge/kitchen_bridge.py` | reSpeaker ↔ Antigua bridge: wake word, VAD, LEDs, button, failover |
@@ -218,9 +225,11 @@ talker than the primary's.
 Antigua communicates with the PinedaDisplay kiosk (`pineda-web`) via an internal MCP client (`server/antigua_core/pineda.py`) targeting `http://127.0.0.1:8090/mcp/` (and standby failover at `http://10.77.0.3:8090/mcp/`).
 
 - **Keyless Image Search**: When users ask *"Show me pictures of [query]"*, Antigua queries the local SearXNG engine (`categories=images`), returning rich image metadata (thumbnails, high-res direct URLs, source domains, snippets, and aspect ratios) without requiring proprietary Google API keys.
+- **Ranking** (`server/antigua_core/image_search.py`): SearXNG returns its image engines interleaved, not ranked. Results are re-scored by query-term overlap with the title and page URL plus a per-engine prior (Google first, Wikimedia Commons last), with penalties for stock-photo sites, social/video thumbnails and small images; SVGs, banners (aspect outside 0.31–3.2), sub-200px images and duplicates (same file name at another size) are dropped, and no site gets more than two tiles. Titles lose site names, emoji and boilerplate. Local cues ("downtown", "near me") pin the query to `search.home_city`.
 - **Interlocking Bento Mosaic**: Antigua calls `P.show_image_collage(query, images, seconds=120)`. Pineda mounts an `ImageSearchTakeover` card packed via CSS Grid dense packing with prominent letter badges (`[A]`, `[B]`, `[C]`, etc.).
 - **Screen as Single Source of Truth**: On follow-up questions (*"tell me more about picture B"* / *"what is the second picture"*), Antigua queries `P.takeover()` first to inspect the live screen state. This ensures robust grounding across conversational turns, random turn IDs, and restarts.
-- **Spotlight Highlighting**: Antigua calls `P.highlight_image(letter)`, triggering a golden glow, scale-up, and frosted context card on the kiosk display while speaking grounded details synthesized by Kokoro TTS.
+- **Comparisons**: "X vs Y" ("versus", "compared to/with") is split by `image_search.split_comparison` and searched as two queries at once (`search_image_comparison`, three per side, the second side skipping the first's pictures); the card's `groups` ([{label, ids}]) has the display lay them out as two labelled columns.
+- **Full screen and navigation**: a collage is up for 30 s (`_IMAGE_SECONDS`), and every picture opened, or the return to the grid, sends `seconds: 30` so it gets fresh time. Asking about a picture, or "show me A" / "make A bigger" / "blow up B" / "zoom in on C" (letters, numbers, and STT spellings like "bee"), sets `highlight` (`parse_image_nav` also tries the last sentence alone, for STT lead-ins like "What's up? Show me A."): the display zooms that picture out of its tile to full screen, whole. While a collage is up, `_handle_image_nav` (before the recipe session and music, so the bare words are the collage's only then) steps "next" / "previous" (wrapping) and takes "go back" / "no, go back" / "smaller" / "zoom out" back to the grid (`highlight: null`).
 - **Graceful Session Auto-Restore**: If the 120-second kiosk timer has expired back to the dashboard, a 5-minute in-memory session cache restores the collage with the requested tile spotlighted.
 - **Conversational Parsing**: Handles letters (`A`-`H`), digits (`1`-`8`), number words (`one`, `two`), ordinals (`first`, `second`), polite variations (*"can you show me photos of cats please"*), and clean dismissal (*"stop the display"*, *"go back to normal"*).
 

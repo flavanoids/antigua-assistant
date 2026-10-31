@@ -17,7 +17,12 @@ log = logging.getLogger("antigua_core")
 _ROUTER_PROMPT = """You route voice-assistant questions. Today is {today}.
 Reply with ONE line only.
 
-If answering needs current, local, or highly specific information from the web \
+If answering means weighing several sources together (which product or \
+option to choose, the best deal across stores, how something has changed \
+over the years), reply:
+RESEARCH
+
+Else, if answering needs current, local, or highly specific information from the web \
 (prices, ratings, reviews, schedules, results, news, store hours, availability, \
 recent events), reply:
 SEARCH: <a short keyword web query>
@@ -36,9 +41,15 @@ the user said one. Keep the user's own words for names, brands and part numbers.
 Question: {q}"""
 
 
+class Research(str):
+    """The router's RESEARCH: the transcript, for research.run rather than
+    one search. A str, so a caller that only knows queries still works."""
+
+
 def llm_route_search(transcript: str, *, ollama_host, model, timeout,
                      keep_alive="15m", num_ctx=8192, enabled=True):
-    """Ask the LLM whether this needs the web. Returns a query, or None.
+    """Ask the LLM whether this needs the web. Returns a query, a Research,
+    or None.
 
     Runs only after every skill and every regex layer has declined, so the
     ~0.5s it costs never lands on a question something faster could answer.
@@ -71,6 +82,8 @@ def llm_route_search(transcript: str, *, ollama_host, model, timeout,
         return None
 
     line = lines[0].strip() if lines else ""
+    if line.upper().startswith("RESEARCH"):
+        return Research(transcript.strip())
     if not line.upper().startswith("SEARCH") or ":" not in line:
         return None
     # Drop quotes entirely: the model reaches for phrase search on its own and

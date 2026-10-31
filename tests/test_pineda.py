@@ -17,7 +17,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "server"))
 from antigua_core import pineda, pipeline, settings  # noqa: E402
 from antigua_core import recipe_session  # noqa: E402
 from antigua_core.intents.pineda import (  # noqa: E402
-    parse_clock_mode, parse_pineda_request, parse_recipe_display)  # noqa: E402
+    parse_clock_mode, parse_pineda_request, parse_recipe_display,  # noqa: E402
+    parse_screen_turn)  # noqa: E402
 from antigua_core.recipe import Recipe  # noqa: E402
 from antigua_core.recipe_subs import step_ingredients  # noqa: E402
 from antigua_core.stores import ListStore, MemoryStore, TimerManager, TimerSpec  # noqa: E402
@@ -150,11 +151,11 @@ def test_timers_payload_and_hook():
          "paused": True},
     ]
     assert pineda.timers_payload(active) == [
-        {"id": "a1", "label": "pasta", "kind": "timer", "fires_at": "1970-01-01T00:00:00+00:00"},
-        {"id": "b2", "label": "Timer", "kind": "timer", "fires_at": "1970-01-01T00:01:00+00:00"},
-        {"id": "c3", "label": "Alarm", "kind": "alarm", "fires_at": "1970-01-01T00:01:30+00:00"},
-        {"id": "d4", "label": "gym", "kind": "alarm", "fires_at": "1970-01-01T00:02:00+00:00"},
-        {"id": "e5", "label": "call mom", "kind": "reminder",
+        {"id": "a1", "label": "pasta", "kind": "timer", "name": "pasta", "fires_at": "1970-01-01T00:00:00+00:00"},
+        {"id": "b2", "label": "Timer", "kind": "timer", "name": None, "fires_at": "1970-01-01T00:01:00+00:00"},
+        {"id": "c3", "label": "Alarm", "kind": "alarm", "name": None, "fires_at": "1970-01-01T00:01:30+00:00"},
+        {"id": "d4", "label": "gym", "kind": "alarm", "name": "gym", "fires_at": "1970-01-01T00:02:00+00:00"},
+        {"id": "e5", "label": "call mom", "kind": "reminder", "name": "call mom",
          "fires_at": "1970-01-01T00:02:30+00:00"},
     ]
 
@@ -277,11 +278,17 @@ class FakePineda:
         self.calls.append(("show", card.get("title") or card.get("query"), seconds))
         self.takeover = card
 
-    def show_image_collage(self, query, images, seconds=120):
-        self.show_takeover({"kind": "image_search", "query": query, "images": images, "highlight": None}, seconds)
+    def show_image_collage(self, query, images, seconds=120, groups=None):
+        card = {"kind": "image_search", "query": query, "images": images, "highlight": None}
+        if groups:
+            card["groups"] = groups
+        self.show_takeover(card, seconds)
 
-    def highlight_image(self, identifier):
-        self.update_takeover({"highlight": identifier.upper()})
+    def highlight_image(self, identifier, seconds=None):
+        change = {"highlight": identifier.upper()}
+        if seconds:
+            change["seconds"] = seconds
+        self.update_takeover(change)
 
     def update_takeover(self, change):
         self.calls.append(("update", change))
@@ -301,6 +308,16 @@ class FakePineda:
         self.calls.append(("hold", on))
         changed, self.held = int(self.held != on), on
         return changed
+
+    def turn_screen(self, to):
+        self.calls.append(("turn", to))
+        now = getattr(self, "rotation", "normal")
+        tall = now in ("90", "270")
+        then = {"tall": now if tall else "90", "wide": "normal" if tall else now,
+                "flip": {"normal": "180", "180": "normal", "90": "270", "270": "90"}[now],
+                "turn": "normal" if tall else "90"}[to]
+        self.rotation = then
+        return {"rotation": then, "changed": then != now}
 
 
 class DownPineda(FakePineda):
@@ -324,6 +341,15 @@ def make_backend(fake, llm_seen):
         def search_best(self, query, **kw):
             llm_seen.append({"query": query})
             return None, [], query
+
+        def search_image_comparison(self, left, right, per_side=3):
+            items = [
+                {"id": "A", "url": "https://example.com/f1.jpg", "title": "Fuji in a bowl", "source": "a.example", "snippet": ""},
+                {"id": "B", "url": "https://example.com/f2.jpg", "title": "Fuji close up", "source": "b.example", "snippet": ""},
+                {"id": "C", "url": "https://example.com/h1.jpg", "title": "Honeycrisp", "source": "c.example", "snippet": ""},
+            ]
+            return items, [{"label": left[:1].upper() + left[1:], "ids": ["A", "B"]},
+                           {"label": right[:1].upper() + right[1:], "ids": ["C"]}]
 
         def search_images(self, query, count=6):
             return [
@@ -538,8 +564,17 @@ def test_recipe_route():
     assert say("show the recipe again") == "I haven't shown a recipe yet."
     assert say("stop the display") == "The display's already back to normal."
 
-    # Opening a recipe puts it up for PINEDA_RECIPE_SECONDS.
-    say("give me a recipe for pina colada")
+    # The first ask always shows the choices, even for one recipe
+    # (user decision 2026-10-25), for 30 seconds.
+    assert say("give me a recipe for pina colada") == (
+        "I found one recipe for pina colada, from Food Network. It's on Pineda Display now. "
+        "Want to make it?")
+    _settle(fake, 1)
+    assert fake.calls == [("show", None, 30)] and fake.takeover["kind"] == "recipe_choices", fake.calls
+    assert recipe_session.current() is None
+    fake.calls.clear()
+    # Picking it opens it, up for PINEDA_RECIPE_SECONDS.
+    say("yes")
     _settle(fake, 1)
     assert fake.calls == [("show", "The Best Piña Coladas", 120)], fake.calls
 
@@ -583,6 +618,251 @@ def test_recipe_route():
 
     pipeline.init(make_backend(None, []))
     assert say("stop the display") == "I can't control the display from here."
+    recipe_session.clear()
+
+
+def test_recipe_choices_route():
+    """"Show me recipes for X": the best three go up with their photos, and
+    the answer ("B", "the one from Allrecipes", "never mind") decides."""
+    import copy
+    settings.RECIPE_ENABLED = settings.SEARCH_ENABLED = True
+    settings.PINEDA_RECIPE_SECONDS = 120
+    recipe_session.clear()
+    fake = FakePineda()
+
+    def colada(n, source, images):
+        r = copy.deepcopy(COLADA)
+        r.title, r.source, r.url, r.images = f"Piña Colada {n}", source, f"https://example.test/{n}", images
+        return r
+
+    recipes = [colada(1, "Food Network", ["https://example.test/1a.jpg", "https://example.test/1b.jpg"]),
+               colada(2, "Allrecipes", None),            # cached before photos: looked up
+               colada(3, "Natasha's Kitchen", []),       # none on its page: left out
+               colada(4, "Simply Recipes", ["https://example.test/4a.jpg"])]
+    looked = []
+
+    class Finder:
+        def cached(self, dish):
+            return True
+
+        def find(self, dish):
+            return recipes
+
+        def with_photos(self, dish, rs, want=3, look=6):
+            for r in rs:
+                if r.images is None:
+                    looked.append(r.url)
+                    r.images = ["https://example.test/2a.jpg"]
+            return [r for r in rs if r.images][:want]
+
+    backend = make_backend(fake, [])
+    backend.recipes = Finder()
+    pipeline.init(backend)
+
+    def say(text):
+        return pipeline.dispatch_text(text, conversation_id="rc", quiet=True)
+
+    r = say("show me recipes for mojito")
+    assert r["response"] == ("I've pulled up recipes for mojito. They're on Pineda Display now. "
+                             "Which one would you like? A, B, or C?"), r["response"]
+    assert not r.get("expects_reply") and recipe_session.current() is None   # wake word to answer
+    assert looked == ["https://example.test/2"]
+    _settle(fake, 1)
+    card = fake.takeover
+    assert card["kind"] == "recipe_choices" and card["dish"] == "mojito", card
+    assert [c["id"] for c in card["choices"]] == ["A", "B", "C"]
+    assert [c["source"] for c in card["choices"]] == ["Food Network", "Allrecipes", "Simply Recipes"]
+    assert card["choices"][0]["images"] == ["A1", "A2"] and card["choices"][2]["images"] == ["C1"]
+    assert [i["id"] for i in card["images"]] == ["A1", "A2", "B1", "C1"]
+    assert card["choices"][1]["title"] == "Piña Colada 2"
+
+    # Something else doesn't answer it ...
+    assert "Allrecipes" not in say("what time is it")["response"]
+    # ... "the one from Allrecipes" does: that recipe opens, and goes up.
+    n = len(fake.calls)
+    r = say("the one from Allrecipes")
+    assert r["response"].startswith("Good choice. I found a recipe for piña colada 2 from Allrecipes."), r
+    assert recipe_session.current().recipe.url == "https://example.test/2"
+    assert [x.url for x in recipe_session.current().recipes][:2] == [
+        "https://example.test/2", "https://example.test/1"]     # "another recipe" still has the rest
+    _settle(fake, n + 1)
+    assert fake.takeover.get("title") == "Piña Colada 2", fake.takeover
+    assert say("B")["response"] != r["response"]                # answered once
+
+    # "Never mind" takes the choices down.
+    recipe_session.clear()
+    say("show me some mojito recipes")
+    _settle(fake, len(fake.calls))
+    time.sleep(0.1)
+    assert fake.takeover["kind"] == "recipe_choices"
+    assert say("never mind")["response"] == "Okay."
+    assert fake.takeover is None and recipe_session.current() is None
+
+    # A letter: "C"
+    say("show me recipes for mojito")
+    time.sleep(0.1)
+    assert say("C.")["response"].startswith("Good choice. I found a recipe for piña colada 4")
+    # A lone "A" as STT hears it: "Hey." (one word, which would otherwise be dropped as noise)
+    recipe_session.clear()
+    say("show me recipes for mojito")
+    time.sleep(0.1)
+    assert say("Hey.")["response"].startswith("Good choice. I found a recipe for piña colada 1")
+
+    # A recipe open from before is closed by new choices: its "yes" and
+    # "next" mustn't answer for them.
+    recipe_session.start("old dish", [COLADA])
+    say("show me recipes for mojito")
+    assert recipe_session.current() is None
+    say("never mind")
+
+    # STT's stray lead-in ("What's up?") doesn't hide the request.
+    recipe_session.clear()
+    r = say("What's up? Show me recipes for mojito.")
+    assert r["response"].startswith("I've pulled up recipes for mojito."), r["response"]
+    say("never mind")
+
+    # No dish named: asked which, and the answer is the dish.
+    r = say("What's up? Show me recipes")
+    assert r["response"] == "Sure. Recipes for what?" and not r.get("expects_reply"), r
+    r = say("Mojito.")
+    assert r["response"].startswith("I've pulled up recipes for mojito."), r["response"]
+    say("never mind")
+    assert say("show me some recipes")["response"] == "Sure. Recipes for what?"
+    assert say("never mind")["response"] == "Okay."
+    assert recipe_session.current() is None
+
+    # The cookbook keeps fewer than three: the web tops the choices up.
+    searched = []
+
+    class Thin(Finder):
+        def find(self, dish):
+            return recipes[:1]
+
+        def searched(self, dish):
+            return False
+
+        def search(self, dish):
+            searched.append(dish)
+            return recipes
+
+    backend.recipes = Thin()
+    r = say("Can you show me a recipe for a mojito?")
+    assert searched == ["mojito"] and r["response"].startswith("I've pulled up recipes for mojito"), r
+    _settle(fake, len(fake.calls) + 1)
+    time.sleep(0.1)
+    assert [c["source"] for c in fake.takeover["choices"]][0] == "Food Network"
+    say("never mind")
+    backend.recipes = Finder()
+
+    # Few photos: still the choices, photos first, the rest without.
+    recipe_session.clear()
+    for r in recipes[1:]:
+        r.images = []
+    r = say("show me recipes for mojito")
+    assert r["response"].endswith("Which one would you like? A, B, or C?"), r["response"]
+    time.sleep(0.1)
+    assert [c["images"] for c in fake.takeover["choices"]] == [["A1", "A2"], [], []], fake.takeover
+    say("never mind")
+    recipe_session.clear()
+
+
+def test_recipe_box_route():
+    """Favorites and history by voice: "favorite this recipe", "show my
+    favorite recipes", "make my favorite X", "show my recent recipes"."""
+    import copy
+    from antigua_core import recipe_box
+    settings.RECIPE_ENABLED = settings.SEARCH_ENABLED = True
+    recipe_session.clear()
+    recipe_box._box = recipe_box.RecipeBox(Path(tempfile.mkdtemp()) / "box.json")
+    fake = FakePineda()
+
+    def dish(n, title):
+        r = copy.deepcopy(COLADA)
+        r.title, r.url, r.images = title, f"https://example.test/box{n}", [f"https://example.test/box{n}.jpg"]
+        return r
+
+    menu = {"flan": [dish(1, "Classic Flan"), dish(2, "Coconut Flan")],
+            "brownies": [dish(3, "Fudgy Brownies"), dish(4, "Cakey Brownies")],
+            "pancakes": [dish(5, "Fluffy Pancakes")], "tacos": [dish(6, "Fish Tacos")],
+            "lasagna": [dish(7, "Classic Lasagna")]}
+
+    class Finder:
+        def cached(self, d):
+            return True
+
+        def find(self, d):
+            return menu[d]
+
+        def with_photos(self, d, rs, want=3, look=6):
+            return [r for r in rs if r.images][:want]
+
+    backend = make_backend(fake, [])
+    backend.recipes = Finder()
+    pipeline.init(backend)
+
+    def say(text):
+        return pipeline.dispatch_text(text, conversation_id="rb", quiet=True)["response"]
+
+    box = recipe_box.box()
+    assert say("favorite this recipe").startswith("There's no recipe open to save.")
+    assert "don't have any favorite recipes yet" in say("show my favorite recipes")
+
+    # Picking from the choices is history; "favorite this recipe" keeps it.
+    say("show me recipes for flan")
+    say("B")
+    assert [h["title"] for h in box.api()["history"]] == ["Coconut Flan"]
+    assert say("favorite this recipe") == "Saved the coconut flan from Food Network to your favorites."
+    assert say("save this recipe to my favorites") == "That one's already a favorite."
+    say("stop the recipe")
+    for d in ("brownies", "pancakes", "tacos", "lasagna"):
+        say(f"show me recipes for {d}")
+        say("A")
+        say("favorite this recipe")               # the open one
+    say("stop the recipe")
+    assert [r.title for r in box.favorites()] == ["Classic Lasagna", "Fish Tacos", "Fluffy Pancakes",
+                                                  "Fudgy Brownies", "Coconut Flan"]
+
+    # "Show my favorite recipes": the newest four as choices, D picks.
+    r = say("show my favorite recipes")
+    assert r == ("Here are your favorite recipes. They're on Pineda Display now. Which one would you "
+                 "like? A, B, C, or D? There's 1 more in the Recipes tab on the menu."), r
+    time.sleep(0.1)
+    assert [c["title"] for c in fake.takeover["choices"]] == ["Classic Lasagna", "Fish Tacos",
+                                                             "Fluffy Pancakes", "Fudgy Brownies"]
+    assert say("D").startswith("Good choice. I found a recipe for fudgy brownies")
+    assert recipe_session.current().dish == "brownies"      # the dish it was opened for
+
+    # A favorite by name opens straight away; one not kept says so.
+    assert say("make my favorite flan").startswith("Here's your favorite. I found a recipe for coconut flan")
+    assert recipe_session.current().recipe.title == "Coconut Flan"
+    assert say("make my favorite lemon bars").startswith("You don't have a favorite lemon bars recipe yet.")
+
+    # Out of the favorites again.
+    assert say("remove this from my favorites") == \
+        "Okay, I took the coconut flan from Food Network out of your favorites."
+    assert "Coconut Flan" not in [r.title for r in box.favorites()]
+
+    # Recent: the last four opened, newest first.
+    r = say("show my recent recipes")
+    assert r.startswith("Here are the recipes you've opened lately."), r
+    time.sleep(0.1)
+    assert [c["title"] for c in fake.takeover["choices"]] == ["Coconut Flan", "Fudgy Brownies",
+                                                             "Classic Lasagna", "Fish Tacos"]
+    say("never mind")
+
+    # Read to the last step: cooked.
+    say("make my favorite tacos")
+    for _ in range(4):
+        say("next")
+    assert box.api()["history"][0]["title"] == "Fish Tacos" and box.api()["history"][0]["cooked"]
+
+    # The phone menu's "Show on display": opened, its card up.
+    rid = recipe_box.recipe_id(menu["lasagna"][0])
+    assert pipeline.open_from_menu(rid) == {"opened": rid, "shown": True}
+    _settle(fake, len(fake.calls))
+    time.sleep(0.1)
+    assert fake.takeover["title"] == "Classic Lasagna" and recipe_session.current().dish == "lasagna"
+    assert pipeline.open_from_menu("0123456789") is None
     recipe_session.clear()
 
 
@@ -644,6 +924,53 @@ def test_clock_mode_route():
     assert say("home") == "I can't reach the display right now."
     pipeline.init(make_backend(None, []))
     assert say("clock mode") == "I can't control the display from here."
+
+
+def test_screen_turn_parser():
+    cases = {
+        "turn the screen tall": "tall",
+        "Alexa, put the display in portrait mode": "tall",
+        "make the screen vertical": "tall",
+        "turn the display back to landscape": "wide",
+        "make the screen wide again": "wide",
+        "flip the screen over": "flip",
+        "turn the screen upside down": "flip",
+        "the screen is upside down": "flip",
+        "flip the display": "flip",
+        "rotate the screen": "turn",
+        "rotate the display please": "turn",
+        "turn the screen sideways": "turn",
+        # not a turn
+        "switch the display to groovy": None,
+        "switch the display to clock mode": None,
+        "turn the screen off": None,
+        "restart the display": None,
+        "turn the display": None,
+        "flip a coin": None,
+        "what's on the screen": None,
+    }
+    for text, want in cases.items():
+        assert parse_screen_turn(text) == want, (text, parse_screen_turn(text))
+    assert parse_clock_mode("turn the screen tall") is None
+    assert parse_recipe_display("turn the screen tall") is None
+
+
+def test_screen_turn_route():
+    fake = FakePineda()
+    pipeline.init(make_backend(fake, []))
+
+    def say(text):
+        return pipeline.dispatch_text(text, conversation_id="turn", quiet=True)["response"]
+
+    assert say("turn the screen tall") == "Okay, the screen's tall now."
+    assert fake.calls[-1] == ("turn", "tall") and fake.rotation == "90"
+    assert say("make the display portrait") == "The screen's already tall."
+    assert say("flip the screen over") == "Okay, I flipped it over." and fake.rotation == "270"
+    assert say("rotate the screen") == "Okay, I turned the screen." and fake.rotation == "normal"
+    pipeline.B.pineda.turn_screen = lambda to: (_ for _ in ()).throw(pineda.PinedaError("down"))
+    assert say("turn the screen tall") == "I can't reach the display right now."
+    pipeline.init(make_backend(None, []))
+    assert say("rotate the screen") == "I can't control the display from here."
 
 
 def test_timer_mirror_backs_off_a_dead_display():
@@ -710,21 +1037,21 @@ def test_image_search_and_detail_route():
 
     # 1. Search for pictures
     r1 = say("show me pictures of strawberries")
-    assert "Here are some pictures of strawberries" in r1["response"], r1
-    assert fake.calls[-1] == ("show", "strawberries", 120)
+    assert r1["response"] == "Here are two pictures of strawberries. Ask about A or B.", r1
+    assert fake.calls[-1] == ("show", "strawberries", 30)
     assert fake.takeover["kind"] == "image_search"
     assert fake.takeover["highlight"] is None
 
     # 2. Ask about picture B (letter)
     r2 = say("tell me more about picture B")
     assert "Picture B is Strawberry Tart from unsplash.com. Baked dessert." == r2["response"]
-    assert fake.calls[-1] == ("update", {"highlight": "B"})
+    assert fake.calls[-1] == ("update", {"highlight": "B", "seconds": 30})
     assert fake.takeover["highlight"] == "B"
 
     # 3. Ask about picture 1 (digit/number word)
     r3 = say("what is the first picture")
     assert "Picture A is Ripe Strawberry from wikimedia.org. Fresh red berries." == r3["response"]
-    assert fake.calls[-1] == ("update", {"highlight": "A"})
+    assert fake.calls[-1] == ("update", {"highlight": "A", "seconds": 30})
     assert fake.takeover["highlight"] == "A"
 
     # 4. Ask about an invalid picture (not in this search's results)
@@ -735,7 +1062,7 @@ def test_image_search_and_detail_route():
     fake.takeover = None
     r5 = say("tell me about picture two")
     assert "Picture B is Strawberry Tart" in r5["response"]
-    assert fake.calls[-1] == ("show", "strawberries", 120)
+    assert fake.calls[-1] == ("show", "strawberries", 30)
     assert fake.takeover["highlight"] == "B"
 
     # 6. Stop the display dismisses takeover and clears session
@@ -746,6 +1073,73 @@ def test_image_search_and_detail_route():
     # 7. Asking now returns no active image search
     r7 = say("tell me about picture A")
     assert "I don't have an active image search on the screen right now." in r7["response"]
+
+
+def test_image_nav_steps_through_the_collage():
+    settings.SEARCH_ENABLED = True
+    fake, llm_seen = FakePineda(), []
+    pipeline.init(make_backend(fake, llm_seen))
+
+    def say(text):
+        return pipeline.dispatch_text(text, conversation_id="img_nav", quiet=True)
+
+    # Nothing up: "next" isn't the display's, it goes on to the rest of routing.
+    say("next")
+    assert not any(c[0] == "update" for c in fake.calls), fake.calls
+
+    say("show me pictures of strawberries")
+    r = say("next")
+    assert r["response"].startswith("Picture A is Ripe Strawberry"), r
+    assert fake.takeover["highlight"] == "A"
+    assert say("next picture")["response"].startswith("Picture B is")
+    assert say("next")["response"].startswith("Picture A is")    # wraps around
+    assert say("previous")["response"].startswith("Picture B is")
+    r = say("go back")
+    assert r["response"] == "Here they all are.", r
+    assert fake.calls[-1] == ("update", {"highlight": None, "seconds": 30})
+    assert fake.takeover["highlight"] is None
+    assert say("back")["response"] == "That's all of them."
+    assert say("previous")["response"].startswith("Picture B is")   # from the end
+    say("no, go back")
+
+    # "Show me A" / "make A bigger" (as STT writes it, too) opens a picture
+    # full screen, even after a stray lead-in sentence.
+    for phrase, letter in (("show me B", "B"), ("Show me a.", "A"), ("Show me number 2.", "B"),
+                           ("What's up? Make A bigger.", "A"), ("Okay. Show me bee.", "B"),
+                           ("make B bigger", "B"), ("Make a bigger.", "A"),
+                           ("blow up picture 2", "B"), ("zoom in on bee", "B")):
+        r = say(phrase)
+        assert r["response"].startswith(f"Picture {letter} is"), (phrase, r)
+        assert fake.calls[-1] == ("update", {"highlight": letter, "seconds": 30}), phrase
+    assert say("make it bigger")["response"] == "That's as big as it goes."
+    assert say("smaller")["response"] == "Here they all are."
+    assert say("bigger")["response"] == "Which one? Say a letter, like show me A."
+
+    # Timed out: naming a picture brings the collage back with it open.
+    fake.takeover = None
+    say("show me B")
+    assert fake.takeover["highlight"] == "B"
+    assert fake.calls[-1] == ("show", "strawberries", 30)
+    say("stop the display")
+    assert fake.takeover is None
+    # Nothing up and no recent search: the words go on to the rest of routing.
+    assert not str(say("make it bigger").get("action", "")).startswith("pineda_image")
+
+
+def test_image_comparison_route():
+    settings.SEARCH_ENABLED = True
+    fake, llm_seen = FakePineda(), []
+    pipeline.init(make_backend(fake, llm_seen))
+    r = pipeline.dispatch_text("show me pictures of fuji vs honeycrisp apples",
+                               conversation_id="img_cmp", quiet=True)
+    assert r["response"] == ("Here are Fuji apples, A and B, and Honeycrisp apples, C."), r
+    assert fake.takeover["groups"] == [{"label": "Fuji apples", "ids": ["A", "B"]},
+                                       {"label": "Honeycrisp apples", "ids": ["C"]}]
+    # Timed out, then asked about: it comes back still split in two.
+    fake.takeover = None
+    pipeline.dispatch_text("tell me about picture C", conversation_id="img_cmp", quiet=True)
+    assert fake.takeover["highlight"] == "C" and len(fake.takeover["groups"]) == 2
+    pipeline.dispatch_text("stop the display", conversation_id="img_cmp", quiet=True)
 
 
 def main():
@@ -762,9 +1156,15 @@ def main():
     test_recipe_card_highlights()
     test_step_ingredients()
     test_recipe_route()
+    test_recipe_choices_route()
+    test_recipe_box_route()
     test_clock_mode_parser()
     test_clock_mode_route()
+    test_screen_turn_parser()
+    test_screen_turn_route()
     test_image_search_and_detail_route()
+    test_image_nav_steps_through_the_collage()
+    test_image_comparison_route()
     test_timer_mirror_backs_off_a_dead_display()
     test_timer_mirror_rides_out_a_restart()
     print("PASS — pineda display suite")

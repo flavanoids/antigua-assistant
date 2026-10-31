@@ -867,6 +867,7 @@ class MemoryStore:
     def _save(self):
         try:
             self._path.write_text(json.dumps({"memories": self._entries}, indent=2))
+            settings.mesh_notify_mutation()
         except Exception as e:
             log.error("MemoryStore: save failed: %s", e)
 
@@ -1141,6 +1142,7 @@ class ListStore:
     def _save(self):
         try:
             self._path.write_text(json.dumps({"lists": self._lists}, indent=2))
+            settings.mesh_notify_mutation()
         except Exception as e:
             log.error("ListStore: save failed: %s", e)
 

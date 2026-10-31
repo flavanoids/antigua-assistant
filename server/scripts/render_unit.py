@@ -6,6 +6,7 @@ The tracked files carry no machine paths; this renders them for one box:
     @ANTIGUA_DIR@   repo checkout on this box       (default: this repo)
     @WHISPER_DIR@   whisper.cpp build directory     (default: <repo>/../whisper.cpp)
     @OLLAMA_MODEL@  ollama.model from server.yaml   (falls back to server.example.yaml)
+    @NUM_CTX@       ollama.num_ctx from the same file (default 8192)
     @USER@, @UID@   service user and its uid        (default: whoever runs this)
 
 Install, e.g.:
@@ -27,11 +28,11 @@ import yaml
 REPO = Path(__file__).resolve().parent.parent.parent
 
 
-def ollama_model() -> str:
+def ollama_cfg() -> dict:
     for name in ("server.yaml", "server.example.yaml"):
         path = REPO / "server" / "config" / name
         if path.exists():
-            return yaml.safe_load(path.read_text())["ollama"]["model"]
+            return yaml.safe_load(path.read_text())["ollama"]
     sys.exit("render_unit: no server/config/server.yaml or server.example.yaml")
 
 
@@ -49,8 +50,9 @@ def main():
     text = text.replace("@ANTIGUA_DIR@", args.dir).replace("@WHISPER_DIR@", whisper)
     if "@USER@" in text or "@UID@" in text:
         text = text.replace("@USER@", args.user).replace("@UID@", str(pwd.getpwnam(args.user).pw_uid))
-    if "@OLLAMA_MODEL@" in text:
-        text = text.replace("@OLLAMA_MODEL@", ollama_model())
+    if "@OLLAMA_MODEL@" in text or "@NUM_CTX@" in text:
+        o = ollama_cfg()
+        text = text.replace("@OLLAMA_MODEL@", o["model"]).replace("@NUM_CTX@", str(o.get("num_ctx") or 8192))
     sys.stdout.write(text)
 
 

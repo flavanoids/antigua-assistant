@@ -113,6 +113,7 @@ from .intents.news import (  # noqa: F401 — re-exported
     is_news_request,
 )
 from .intents.recipe import (  # noqa: F401 — re-exported
+    is_bare_recipe_request,
     looks_like_food,
     parse_cook_command,
     parse_recipe_request,
@@ -235,6 +236,7 @@ from .intents.transcript import (  # noqa: F401 — re-exported
     is_garbage_transcript,
     strip_wake_prefix,
 )
+from .intents.research import parse as parse_research_request  # noqa: F401 — re-exported
 from .intents.security import parse_security_request  # noqa: F401 — re-exported
 from .intents.sysinfo import parse_sysinfo_request  # noqa: F401 — re-exported
 from .intents.tv import (  # noqa: F401 — re-exported
@@ -242,7 +244,10 @@ from .intents.tv import (  # noqa: F401 — re-exported
     _TV,
     _TV_APP_RE,
     _TV_INPUT_RE,
+    _TV_NAMED,
     _TV_RE,
+    _TV_SEEK_RE,
+    _TV_STATUS_RE,
 )
 from .intents.volume import (  # noqa: F401 — re-exported
     _VOLUME_RE,
@@ -317,6 +322,10 @@ ROUTE_ORDER = [
     # "Volume to 3": after music, which owns "music volume 30".
     "volume_set",
     "volume",
+    # "Research X", "best price on X", "Houston's weather patterns", "is X
+    # worth it": several searches, answered after a one-line ack. Before the
+    # thermostat and weather, which would take "climate" and "weather".
+    "research",
     # Inside the house (the thermostat), and outside air: before weather,
     # whose temperature regex would answer "temperature inside" with outdoors.
     "climate",
@@ -436,7 +445,8 @@ def classify(transcript: str, *, search_enabled: bool | None = None) -> str:
     if parse_pineda_request(transcript):
         return "pineda"
     if (_TV_APP_RE.search(transcript) or _TV_INPUT_RE.search(transcript)
-            or _TV_RE.search(transcript)):
+            or _TV_RE.search(transcript) or _TV_STATUS_RE.search(transcript)
+            or (_TV_SEEK_RE.search(transcript) and _TV_NAMED.search(transcript))):
         return "tv"
     if parse_mute(transcript):
         return "mute"
@@ -452,6 +462,11 @@ def classify(transcript: str, *, search_enabled: bool | None = None) -> str:
     if parse_volume_request(transcript):
         return "volume"
 
+    # "Research X", "best price on X", "Houston's weather patterns": ahead of
+    # the thermostat and weather routes, which would take "climate" and
+    # "weather" as theirs.
+    if search_enabled and settings.RESEARCH_ENABLED and parse_research_request(transcript):
+        return "research"
     if settings.CLIMATE_URL and parse_climate_request(transcript):
         return "climate"
     if settings.LIVE_ENABLED and parse_air_request(transcript):
@@ -563,7 +578,8 @@ def classify(transcript: str, *, search_enabled: bool | None = None) -> str:
             and not is_local_news_query(transcript):
         return "news"
 
-    if search_enabled and settings.RECIPE_ENABLED and parse_recipe_request(transcript):
+    if search_enabled and settings.RECIPE_ENABLED and (
+            parse_recipe_request(transcript) or is_bare_recipe_request(transcript)):
         return "recipe"
     if search_enabled:
         if is_substitution_request(transcript):

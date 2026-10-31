@@ -24,11 +24,12 @@ from . import household_memory, settings
 _JOKE_RE = re.compile(
     r"\b(?:tell|give|got|know|hear)\b.{0,20}\bjokes?\b|^(?:a\s+)?jokes?\b"
     r"|\b(?:say|tell me) something (?:funny|hilarious)\b|\bmake me (?:laugh|smile)\b"
-    r"|\bcheer me up\b|\b(?:are|r) you funny\b|\bbe funny\b|\bpun\b",
+    r"|\bcheer me up\b|\bmake me feel (?:good|better)\b|\b(?:are|r) you funny\b|\bbe funny\b|\bpun\b",
     re.I,
 )
 _JOKE_ABOUT_RE = re.compile(r"\b(?:jokes?|pun|something funny)\s+(?:about|on)\s+(.+?)[?.!]*$", re.I)
 _DAD_RE = re.compile(r"\bdad jokes?\b|\bpuns?\b", re.I)
+_ADULT_RE = re.compile(r"\b(?:dirty|adult|sex\w*|naughty|raunchy|spicy|kinky|r-rated|nsfw)\b", re.I)
 _MORE_RE = re.compile(
     r"^(?:(?:ok(?:ay)?|alright|ha(?:ha)*|lol|nice|good one)[,.!\s]+)*"
     r"(?:another(?: (?:dad |good |funny )?(?:one|joke))?|one more|tell (?:me )?another(?: one| joke)?|again|more|do another)[.!?]*$",
@@ -227,6 +228,8 @@ def direct(transcript: str, conversation_id: str = "", now: datetime | None = No
     if kind in ("joke", "encore"):
         m = _JOKE_ABOUT_RE.search(transcript)
         asked = m.group(1).strip() if m else ("dad" if _DAD_RE.search(transcript) else None)
+        if asked and _ADULT_RE.search(asked):
+            asked, m = None, None   # "a joke about sex": a clean one from the bank instead
         subject = asked if m else _pick(subjects_for(now), _recent_subjects, rng)
         devices = [d for d in DEVICES if d != "callback" or conv.turns > 2]
         device = _pick(devices, _recent_devices, rng)
@@ -240,7 +243,8 @@ def direct(transcript: str, conversation_id: str = "", now: datetime | None = No
                 f"Just the joke itself in one to three short spoken sentences, ending right on the "
                 f"punchline. No preamble, no labels, don't explain it. Very dry and deadpan. "
                 f"Never about AI, assistants or yourself, and never at anyone's expense: no "
-                f"groups of people, nobody's looks, nobody in the house.{avoid}")
+                f"groups of people, nobody's looks, nobody in the house, nothing "
+                f"suggestive.{avoid}")
         return Direction(kind, hint, temperature=0.9, max_tokens=90, subject=asked)
 
     hints = {
@@ -256,7 +260,8 @@ def direct(transcript: str, conversation_id: str = "", now: datetime | None = No
         "chat": "Casual chat. React like a friend with a quick wit — a sassy aside is welcome — one or two "
                 "sentences. Don't offer help, don't make up what happened to them.",
     }
-    return Direction(kind, f"{hints[kind]} {tone}", temperature=0.75)
+    # Sass, never flirting: the 4B model once took "make A bigger" as innuendo.
+    return Direction(kind, f"{hints[kind]} Nothing flirty or suggestive. {tone}", temperature=0.75)
 
 
 def record(direction: Direction | None, reply: str) -> None:

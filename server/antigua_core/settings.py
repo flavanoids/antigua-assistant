@@ -111,6 +111,7 @@ RECIPE_QA_MAX_TOKENS = 110         # grounded answer to a free-form cooking ques
 # ── Inside the house, store hours, markets, air ─────────────────────────────
 CLIMATE_URL = None                 # the AC controller's ac-data-server; None = no indoor answers
 CLIMATE_TIMEOUT = 3
+CLIMATE_WINDOWS_SCRIPT = None      # the controller's windows.py (same host); None = no windows mode
 HOURS_ENABLED = True               # store hours from OpenStreetMap; needs commute (the resolver)
 HOURS_OSM_API = "https://api.openstreetmap.org/api/0.6"
 HOURS_TIMEOUT = 4
@@ -136,6 +137,9 @@ SEARCH_HOME_CITY = ""
 SEARCH_CACHE_TTL = 900
 SEARCH_ROUTER_ENABLED = True
 SEARCH_ROUTER_TIMEOUT = 3
+# Several searches and pages per question, answered after a one-line ack
+# (research.py): "find the best price on X", "Houston's weather patterns".
+RESEARCH_ENABLED = True
 # Start the search router alongside the wake addressee check instead of after
 # it (its answer is dropped if the speech wasn't for her). Only a win when
 # Ollama serves two requests at once (OLLAMA_NUM_PARALLEL >= 2).
@@ -232,13 +236,19 @@ def mqtt_publish(topic, payload):  # replaced by the server at startup
     pass
 
 
-def configure(cfg: dict, *, mqtt_publish_fn=None):
+def mesh_notify_mutation():  # replaced by the server at startup when mesh is active
+    pass
+
+
+def configure(cfg: dict, *, mqtt_publish_fn=None, mesh_notify_mutation_fn=None):
     """Populate settings from a parsed server.yaml. Mirrors the defaults the
     primary server has always used, so an absent key changes nothing."""
     g = globals()
     g.update(copy.deepcopy(_DEFAULTS))
     if mqtt_publish_fn is not None:
         g["mqtt_publish"] = mqtt_publish_fn
+    if mesh_notify_mutation_fn is not None:
+        g["mesh_notify_mutation"] = mesh_notify_mutation_fn
 
     w = cfg.get("weather", {})
     g["DEFAULT_WEATHER_LOCATION"] = w.get("location", DEFAULT_WEATHER_LOCATION)
@@ -288,6 +298,7 @@ def configure(cfg: dict, *, mqtt_publish_fn=None):
     cl = cfg.get("climate", {})
     g["CLIMATE_URL"] = cl.get("url", CLIMATE_URL)
     g["CLIMATE_TIMEOUT"] = cl.get("timeout_seconds", CLIMATE_TIMEOUT)
+    g["CLIMATE_WINDOWS_SCRIPT"] = cl.get("windows_script", CLIMATE_WINDOWS_SCRIPT)
     ho = cfg.get("hours", {})
     g["HOURS_ENABLED"] = ho.get("enabled", HOURS_ENABLED)
     g["HOURS_OSM_API"] = ho.get("osm_api", HOURS_OSM_API)
@@ -336,6 +347,7 @@ def configure(cfg: dict, *, mqtt_publish_fn=None):
     g["SEARCH_ROUTER_ENABLED"] = s.get("router_enabled", SEARCH_ROUTER_ENABLED)
     g["SEARCH_ROUTER_TIMEOUT"] = s.get("router_timeout_seconds", SEARCH_ROUTER_TIMEOUT)
     g["SEARCH_ROUTER_PARALLEL"] = bool(s.get("router_parallel", SEARCH_ROUTER_PARALLEL))
+    g["RESEARCH_ENABLED"] = bool(s.get("research_enabled", RESEARCH_ENABLED))
     g["SEARCH_MAX_TOKENS_LONG"] = s.get("max_tokens_search_long", SEARCH_MAX_TOKENS_LONG)
     g["SEARCH_MAX_TOKENS"] = s.get("max_tokens_search", SEARCH_MAX_TOKENS)
     g["SEARCH_TIMEOUT"] = s.get("timeout_seconds", SEARCH_TIMEOUT)

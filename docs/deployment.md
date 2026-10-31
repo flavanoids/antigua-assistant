@@ -68,7 +68,8 @@ and `chmod 600` the configs that hold secrets (`server/config/server.yaml`,
 ## Primary
 
 Needs a GPU that Ollama and whisper.cpp (Vulkan) can use. The author runs an
-AMD RX 6650 XT with 8 GB.
+8 GB mid-range card (RX 6600 XT / RTX 3060 class); see
+[performance](performance.md) for what each GPU tier gets you.
 
 1. **Python.**
    `python3 -m venv venv && venv/bin/pip install -r server/requirements.txt -r server/requirements-tts.txt`.
@@ -95,7 +96,7 @@ AMD RX 6650 XT with 8 GB.
    threads in a drop-in, `/etc/systemd/system/antigua-tts.service.d/40-cpu.conf`
    (`[Service]` + `Environment=KOKORO_THREADS=<n>`): one per performance core.
    On a hybrid Intel CPU also pin it there with `CPUAffinity=`. The author's
-   i5-12600K uses 6 and `CPUAffinity=0 2 4 6 8 10` (0.40→0.34 s for a short
+   6-P-core desktop CPU uses 6 and `CPUAffinity=0 2 4 6 8 10` (0.40→0.34 s for a short
    reply); the 4-core backup uses 4 (1.16→0.78 s). Check it with
    `curl -X POST localhost:5500/tts -H 'Content-Type: application/json' -d '{"text":"hi"}' -o /tmp/t.wav`.
 6. **Search** (optional). Copy `searxng/searxng/settings.yml.example` to
@@ -192,11 +193,105 @@ changes. On the primary, add a cron job that copies memories and lists every
 5 minutes:
 
 ```cron
-*/5 * * * * rsync -az $ANTIGUA/data/memories.json $ANTIGUA/data/lists.json <backup>:<FALLBACK_DIR>/data/
+*/5 * * * * [ -e /etc/antigua/gpu_lent ] || rsync -az $ANTIGUA/data/memories.json $ANTIGUA/data/lists.json <backup>:<FALLBACK_DIR>/data/
 ```
+
+The flag check keeps the copy from overwriting what the backup changed while
+the primary's GPU is lent out (below).
 
 Then point `tts.fallback_url` (on the primary) and `server.fallback_host` (on
 the satellite) at the backup, using its wg0 address once the mesh is up.
+
+### Lending the primary's GPU
+
+To free the primary's GPU for other work (self-hosted coding models), run
+the whole of Antigua on the backup for a while. It's the normal failover,
+started by hand; Ollama stays up on the primary for whatever else uses it.
+
+```bash
+sudo server/scripts/gpu_lend.sh status            # who answers, who has the mic, VRAM, display build
+sudo server/scripts/gpu_lend.sh lend [--music]    # Antigua moves to the backup (and Music Assistant)
+sudo server/scripts/gpu_lend.sh reclaim           # everything comes back, then a report on the lend
+```
+
+Before anything moves, `lend` checks that the backup is healthy and has its
+`fallback.model`. `reclaim` waits until enough VRAM is free. It also brings
+back household memory, music and the display, warns if the display builds
+differ, and prints the spoken-turn stats for the lend. The table and commands
+below are what the script does, for doing it by hand.
+
+| Piece | During the lend | Why |
+|---|---|---|
+| `/etc/antigua/gpu_lent` (primary) | exists | `health_alerts.py` skips the TTS, server, whisper and voice-model checks, and the cron copy above skips, so the backup's memories and lists aren't overwritten |
+| `antigua-server`, `antigua-whisper`, `antigua-tts`, `antigua-model-warmup` (primary) | stopped and disabled | frees the VRAM; disabled so a reboot can't take it back mid-lend |
+| `40-gpu-lent.conf` drop-in on those four and `kitchen-bridge` (primary) | `ConditionPathExists=!/etc/antigua/gpu_lent` | nothing can start them while the flag exists, not even a dependency or a manual start; inert without the flag, so it can stay installed |
+| The voice model in the primary's Ollama | unloaded (`keep_alive: 0`) | it's pinned, so stopping the server alone doesn't free it |
+| `kitchen-bridge` (primary) | stopped and disabled | the backup's bridge owns the reSpeaker instead, so the primary can reboot without taking the mic |
+| `kitchen-bridge-standby` (backup) | `standby_for_host: ''` | it no longer hands the mic back while the primary is up; `deploy_fallback.sh` renders it so while the flag exists |
+| `antigua-fallback` (backup) | active | the watcher takes over after `PRIMARY_DOWN_AFTER` missed `/health` checks, loads its model whole on the GPU (the Modelfile pins `num_gpu`), and renders the waiting-cue clips |
+| `pineda-web`, `pineda-standby-sync` (primary, if the display runs there) | stopped, same drop-in | the kiosk fails over to the standby pineda-web; anything saved there is pulled back at the end |
+| Music Assistant (optional) | moved to the backup | music and ducking stay on the box that's speaking; `music.url` in both `server.yaml` files follows it |
+
+Lend, on the primary:
+
+```bash
+sudo touch /etc/antigua/gpu_lent
+sudo systemctl disable antigua-model-warmup antigua-server antigua-whisper antigua-tts
+sudo systemctl stop antigua-server antigua-whisper antigua-tts
+curl -s localhost:11434/api/generate -d '{"model":"<voice model>","keep_alive":0}'
+sudo systemctl disable --now kitchen-bridge
+server/scripts/deploy_fallback.sh   # re-renders the backup's bridge to own the mic, restarts it
+```
+
+Take it back, on the primary, once the coding models are out of VRAM:
+
+```bash
+sudo rm /etc/antigua/gpu_lent       # first: the drop-ins refuse to start anything while it exists
+sudo systemctl enable --now antigua-tts antigua-whisper antigua-model-warmup antigua-server
+# wait for "Handed back to the primary" (or nothing to hand back) in the backup's log
+server/scripts/deploy_fallback.sh   # the backup's bridge back to standby: it lets go of the mic
+sudo systemctl enable --now kitchen-bridge
+```
+
+The backup hands back timers, memories and lists through `/handoff` when
+`/health` answers again, then stands down. It hands back what it holds in
+memory, so a cron copy landing between removing the flag and the hand-back
+does no harm. Household memory isn't handed back: copy the backup's
+`data/household_memory.yaml` over by hand first if it learned anything.
+
+Then bring back the rest, in this order:
+
+1. If Music Assistant moved, run `docker compose down` on the backup, copy its
+   data dir back, start the primary's container, and set `music.url` back
+   before `antigua-server` starts. That saves a restart.
+2. Run `systemctl enable pineda-web`, then `systemctl start pineda-standby-sync`.
+   It pulls anything saved on the standby and restarts pineda-web. The
+   kiosk fails back after 3 healthy checks.
+3. Display deploys made during the lend landed on the standby only. Compare
+   the `assets/index-*.js` names that `curl -s <host>:8090/` returns on both
+   boxes. If they differ, install the standby's build on the primary.
+4. Optional: remove the `40-gpu-lent.conf` drop-ins. Keep the cron's flag
+   guard; it's harmless.
+
+The backup's log has no dates. With nothing to hand back, it logs only
+"Standing down (primary healthy)", with no "Handed back" line.
+
+**What the lend costs (first lend, 6 days in 2026-10).** The backup ran with
+no crashes, but replies were noticeably slower. These are median first-audio
+times for spoken turns:
+
+| Turn type | On the backup | On the primary |
+|---|---|---|
+| Chat | 4.45 s (p90 6.9 s) | 1.24 s |
+| Skills | 2.54 s | 0.69 s |
+
+The gap comes mostly from two things. Speech-to-text took 1.8 s with small.en
+on the CPU, against 0.3 s for large-v3-turbo on the GPU. The 4B also ran at
+24 tok/s on the backup's 4 GB GPU, against 72 tok/s on the primary.
+
+Ollama stays up during a lend, so any other local client can evict the voice
+model, which is pinned. Point coding tools at cloud models once the GPU is
+back with Antigua.
 
 ## Network
 
@@ -222,6 +317,7 @@ Then switch the configs to the `wg0` addresses. See
 | Restart after a code change | `sudo systemctl restart antigua-server` (and `kitchen-bridge` / `antigua-tts` if you touched those) |
 | Ask without speaking | `curl -X POST localhost:9393/pipeline_text -d '{"text":"tell me a fun fact"}'` (the full turn, skills included; silent unless `"quiet": false`) |
 | Run a full turn out loud | `curl -X POST localhost:9393/pipeline_text -d '{"text":"what is 12 times 13","quiet":false}'` (skills included; the reply plays on the speakers) |
+| Turn timing | `server/scripts/turn_stats.py logs/server.log logs/server.log.1` — median/p90 first audio and total per chat/skills (`--by-route` per route), stage medians, waiting-cue rate; pipe the backup's log in with `-`. On the backup the TURN lines also carry `prompt_s`, `gen_tps`, `host` and `load` |
 | Run the tests | `for t in tests/test_*.py; do venv/bin/python $t || echo "FAIL $t"; done` |
 | Lint | `ruff check .` |
 | Alerts | `server/scripts/health_alerts.py` from cron every 5 min: TTS fallback use, disk space. It sends through a `hermes send` command; swap in your own notifier |

@@ -8,6 +8,7 @@ through the dispatch table.
 Run: python3 tests/test_pipeline.py   (also works under pytest)
 """
 
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -406,6 +407,8 @@ def main():
     class _FakeHub:
         def __init__(self, roku_ok=True, atv_ok=True):
             self.calls, self.roku_ok, self.atv_ok = [], roku_ok, atv_ok
+            self.power, self.playing = "On", {"title": "Pots & Pans", "state": "Playing",
+                                              "position": 1828, "total_time": 3618, "app_name": "TV"}
 
         def get(self, name):
             return object()
@@ -422,6 +425,10 @@ def main():
                                                    ' {"name": "Disney+", "bundle_id": "com.disney.disneyplus"}]')
                 if tool == "get_volume":
                     return McpResult(ok=True, text="42.0")
+                if tool == "power_state":
+                    return McpResult(ok=True, text=self.power)
+                if tool == "now_playing":
+                    return McpResult(ok=True, text=json.dumps(self.playing))
                 return McpResult(ok=True, text="Done")
             return McpResult(ok=True, text='{"ok": true, "transport": "lan"}')
 
@@ -459,6 +466,36 @@ def main():
     r = home_run("pause the tv", hub)
     assert r["response"] == "Pausing the Living Room TV", r
     assert hub.calls == [("appletv", "pause", LR)], hub.calls
+    # Skipping, with and without an amount; restarting seeks to 0
+    hub.calls.clear()
+    r = home_run("skip ahead 2 minutes on the tv", hub)
+    assert r["response"] == "Skipping ahead 2 minutes", r
+    assert hub.calls == [("appletv", "skip_forward", {"seconds": 120, **LR})], hub.calls
+    hub.calls.clear()
+    r = home_run("rewind the tv", hub)
+    assert r["response"] == "Skipping back 15 seconds", r
+    assert hub.calls == [("appletv", "skip_backward", {"seconds": 15, **LR})], hub.calls
+    hub.calls.clear()
+    r = home_run("start the episode over on the tv", hub)
+    assert r["response"] == "Starting it over", r
+    assert hub.calls == [("appletv", "set_position", {"position": 0, **LR})], hub.calls
+    # Status: title, app and time left; "is the tv on" asks, never turns it on
+    hub.calls.clear()
+    r = home_run("is the tv on", hub)
+    assert r["response"] == "Playing Pots and Pans on Apple TV, about 30 minutes left.", r
+    assert [c[1] for c in hub.calls] == ["power_state", "now_playing"], hub.calls
+    hub.playing = {**hub.playing, "state": "Paused", "series_name": "Night Shift", "title": "The Long Night",
+                   "app_name": "TV", "position": 100, "total_time": 3300}
+    r = home_run("what am I watching", hub)
+    assert r["response"] == "Paused on Night Shift, The Long Night on Apple TV, about 53 minutes left.", r
+    hub.playing = {"title": None, "state": "Idle", "app_name": "Netflix"}
+    r = home_run("what's on the tv", hub)
+    assert r["response"] == "The Living Room TV is on Netflix, but nothing's playing.", r
+    hub.power = "Off"
+    hub.calls.clear()
+    r = home_run("what's on the tv", hub)
+    assert r["response"] == "The Living Room TV is off.", r
+    assert [c[1] for c in hub.calls] == ["power_state"], hub.calls
     # Inputs are the Roku's job
     hub.calls.clear()
     r = home_run("switch to the playstation", hub)

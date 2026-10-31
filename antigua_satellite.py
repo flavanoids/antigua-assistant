@@ -53,36 +53,13 @@ _PA_SINK = "alsa_output.platform-soc_sound.stereo-fallback"
 ANTIGUA_VOLUME_PCT = 70          # Antigua's own speaking level (0-100). Per-stream
                                  # volume, independent of the shairport-sync / AirPlay
                                  # sink volume that iOS controls.
-NIGHT_VOLUME_PCT = 30            # Quiet hours speaking level (0-100).
-NIGHT_HOURS = "22:30-07:00"      # Quiet hours window; "" or None to disable.
-ALARM_VOLUME_PCT = 75            # Alarm ring level (always audible, even during quiet hours).
-
-
-def in_hours(hours_str: str, now: time.struct_time | None = None) -> bool:
-    """True when the current local time falls within 'HH:MM-HH:MM' (inclusive start, exclusive end)."""
-    if not hours_str:
-        return False
-    try:
-        parts = hours_str.strip().split("-")
-        if len(parts) != 2:
-            return False
-        start_h, start_m = (int(x) for x in parts[0].strip().split(":"))
-        end_h, end_m = (int(x) for x in parts[1].strip().split(":"))
-        start = start_h * 60 + start_m
-        end = end_h * 60 + end_m
-    except (ValueError, IndexError):
-        return False
-    t = now or time.localtime()
-    minute = t.tm_hour * 60 + t.tm_min
-    return start <= minute < end if start <= end else (minute >= start or minute < end)
+ALARM_VOLUME_PCT = 75            # Alarm ring level (0-100).
 
 
 def current_volume_pct(kind: str = "speech") -> int:
-    """Current volume percentage (0-100) scaled by kind (speech vs alarm) and time of day."""
+    """Current volume percentage (0-100) for kind (speech vs alarm)."""
     if kind == "alarm":
         return max(0, min(100, ALARM_VOLUME_PCT))
-    if in_hours(NIGHT_HOURS):
-        return max(0, min(100, NIGHT_VOLUME_PCT))
     return max(0, min(100, ANTIGUA_VOLUME_PCT))
 
 
@@ -145,7 +122,7 @@ class PrimaryWatch:
 
 def load_config():
     global SERVER_HOST, SERVER_PORT, MQTT_BROKER, MQTT_PORT
-    global ANTIGUA_VOLUME_PCT, NIGHT_VOLUME_PCT, NIGHT_HOURS, ALARM_VOLUME_PCT
+    global ANTIGUA_VOLUME_PCT, ALARM_VOLUME_PCT
     global DISPLAY_ENABLED, _PA_SINK
     global FALLBACK_HOST, FALLBACK_PORT, _HEALTH_CHECK_INTERVAL
 
@@ -170,8 +147,6 @@ def load_config():
     if "satellite" in cfg:
         s = cfg["satellite"]
         ANTIGUA_VOLUME_PCT = s.get("antigua_volume_pct", ANTIGUA_VOLUME_PCT)
-        NIGHT_VOLUME_PCT = s.get("night_volume_pct", NIGHT_VOLUME_PCT)
-        NIGHT_HOURS = s.get("night_hours", NIGHT_HOURS)
         ALARM_VOLUME_PCT = s.get("alarm_volume_pct", ALARM_VOLUME_PCT)
         _PA_SINK = s.get("output_device", _PA_SINK)
         global _ALARM_RING_S, _ALARM_REPEAT_S, _ALARM_MAX_S
@@ -282,11 +257,15 @@ def mqtt_publish(topic: str, payload: dict):
 # transcribed "Follow us"). Shairport applies the AirPlay/MA volume inside
 # itself and leaves its sink-input at 100%, so this doesn't fight MA's level.
 DUCK_APP = "Shairport Sync"
-DUCK_PCT = 10            # % of the stream's level while ducked
+# PulseAudio volume is cubic: 10% was -60 dB, so a song or podcast started
+# mid-conversation played unheard until the duck lifted and seemed to "cut in"
+# (2026-10-22). 30% is about -31 dB: still well under a spoken command.
+DUCK_PCT = 30            # % of the stream's level while ducked
 DUCK_SAFETY_S = 60       # restore anyway if the "stopped" message is lost
 
 _duck_lock = Lock()
 _duck_restore = None     # stream volume % to restore; None = not ducked
+_duck_since = None       # epoch the current duck began; sent with antigua/unducked
 _duck_timer = None
 
 
@@ -309,13 +288,15 @@ def _duck_inputs():
 
 
 def _set_duck(active: bool):
-    global _duck_restore, _duck_timer
+    global _duck_restore, _duck_since, _duck_timer
     with _duck_lock:
         try:
             inputs = _duck_inputs()
+            since = None
             if active:
                 if _duck_restore is None:
                     _duck_restore = max((v for _, v in inputs if v), default=100)
+                    _duck_since = time.time()
                 level = f"{round(_duck_restore * DUCK_PCT / 100)}%"
                 if _duck_timer:
                     _duck_timer.cancel()
@@ -327,6 +308,7 @@ def _set_duck(active: bool):
                 # can start a new stream mid-duck, and module-stream-restore
                 # hands it the ducked level.
                 level, _duck_restore = f"{_duck_restore}%", None
+                since, _duck_since = _duck_since, None
                 if _duck_timer:
                     _duck_timer.cancel()
                     _duck_timer = None
@@ -335,6 +317,10 @@ def _set_duck(active: bool):
             for idx, _ in inputs:
                 subprocess.run(["pactl", "set-sink-input-volume", idx, level], timeout=3)
             log.info(f"Music {'ducked' if active else 'restored'} to {level} ({len(inputs)} stream(s))")
+            if since is not None:
+                # The server rewinds a podcast that started while this duck
+                # muffled it, so it's heard from the top.
+                mqtt_publish("antigua/unducked", {"since": since})
         except Exception as e:
             log.warning(f"Music duck failed: {e}")
 
@@ -552,8 +538,8 @@ _alarm_ringing_labels: set[str] = set()
 
 
 # Each ring is the spoken line plus a short bell (a soft chime first, and no
-# bell, for a reminder), and it rings again every _ALARM_REPEAT_S until the
-# wake word, "stop", or _ALARM_MAX_S. The mic sits next to the speaker, so the
+# bell, for a reminder). A timer rings once; an alarm or reminder rings again
+# every _ALARM_REPEAT_S until the wake word, "stop", or _ALARM_MAX_S. The mic sits next to the speaker, so the
 # bell stays short: the quiet between rings is when the wake word gets heard.
 _ALARM_RING_S = 5.0
 _ALARM_REPEAT_S = 30.0
@@ -590,8 +576,9 @@ def _alarm_loop(audio_url: str, label: str, kind: str = "timer", fire_id: str = 
     stop_event = Event()
     _alarm_stops[key] = stop_event
     _alarm_ringing_labels.add(label)
-    log.info(f"Alarm ringing: {label} ({kind}) — every {_ALARM_REPEAT_S:.0f}s "
-             f"for up to {_ALARM_MAX_S:.0f}s, until the wake word or 'stop'")
+    log.info(f"Alarm ringing: {label} ({kind})" + ("" if kind == "timer" else
+             f" — every {_ALARM_REPEAT_S:.0f}s for up to {_ALARM_MAX_S:.0f}s, "
+             "until the wake word or 'stop'"))
 
     speech = None
     if audio_url:
@@ -619,7 +606,7 @@ def _alarm_loop(audio_url: str, label: str, kind: str = "timer", fire_id: str = 
             else:
                 beep_alarm()
         next_at = started + rings * _ALARM_REPEAT_S
-        if next_at - started >= _ALARM_MAX_S:
+        if kind == "timer" or next_at - started >= _ALARM_MAX_S:
             break
         stop_event.wait(timeout=max(0.0, next_at - time.time()))
 
@@ -629,7 +616,7 @@ def _alarm_loop(audio_url: str, label: str, kind: str = "timer", fire_id: str = 
     if _alarm_stops.get(key) is stop_event:
         _alarm_stops.pop(key, None)
     log.info(f"Alarm stopped: {label} after {rings} ring(s)"
-             + (" (silenced)" if stop_event.is_set() else " (cap reached)"))
+             + (" (silenced)" if stop_event.is_set() else " (done)" if kind == "timer" else " (cap reached)"))
     mqtt_publish("antigua/alarm_ack", {"label": label, "id": fire_id})
 
 
@@ -817,8 +804,9 @@ def stream_and_play(audio_url: str):
 
 
 # Cues fetched at startup rather than on first use: trouble.wav is played
-# when a turn failed, which is exactly when the server may not answer.
-_PRECACHED_CUES = ("wake_cue.wav", "trouble.wav")
+# when a turn failed, which is exactly when the server may not answer, and
+# chat_end.wav would otherwise go silent while the primary is switched off.
+_PRECACHED_CUES = ("wake_cue.wav", "trouble.wav", "chat_end.wav")
 
 
 def _cache_cue(audio_url: str) -> Path:

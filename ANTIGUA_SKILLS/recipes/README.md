@@ -18,6 +18,20 @@ couldn't find one online. If you don't like a recipe, ask for another.
 
 ## What It Does
 
+0. **Choose by eye** (2026-10-25): with the kiosk, a recipe request ("show me
+   recipes for chia seed pudding", "how do I make apple pie") always first puts
+   the best three (photos first) on PinedaDisplay (`recipe_choices` card:
+   photos from each recipe's own page, rating, time, servings) and asks
+   "Which one would you like? A, B, or C?". "B", "the second one", "the one
+   from Allrecipes" opens that recipe; "never mind" takes the choices down.
+   Photos come from the page's JSON-LD image and big same-dish pictures on
+   it (`recipe.page_images`). A recipe cached before photos were kept has
+   its page fetched once (`RecipeFinder.with_photos`). Recipes without
+   photos fill the rest (a plate placeholder); a lone recipe goes up on its
+   own ("Want to make it?"). The cookbook keeps 1-3 per dish, so the search
+   tops the choices up. The choices stay up 30 seconds, then the clock; answers
+   (taken for two more minutes) need the wake word ("Alexa, B"). Without a display, or in Spanish, the best recipe
+   opens as before.
 1. **Find**: SearXNG searches "<dish> recipe". The top ~10 pages are fetched in
    parallel, and the ones with schema.org `Recipe` JSON-LD are parsed:
    ingredients, steps, times, servings, rating. They're ranked by how well the
@@ -48,10 +62,18 @@ couldn't find one online. If you don't like a recipe, ask for another.
    sentence boundaries: "Step 2 of 6, in three parts. First: …", then "Then: …".
    next/back/repeat move by part; "read the whole step" reads all of it. The
    "say Alexa, next" prompt comes only at the end of the whole step. A timed
-   part ("bake 45 minutes", 6 minutes or more) offers a timer labeled with the
-   dish. Swapped or skipped ingredients are mentioned in the parts that use them.
-   While a recipe is open, every recipe reply opens the mic's answer window
-   (`recipe_mode`), so "next" right after a reply needs no wake word.
+   part ("bake 45 minutes", 6 minutes to 12 hours) waits for its cue rather than
+   starting when it's read (2026-10-25): "When it's in the oven, say Alexa,
+   start the timer, and I'll time 45 minutes for the apple pie", or, when the
+   same step preheats, "Tell me when the oven's preheated…". Cues: "the oven's
+   preheated/ready/hot", "it's in (the oven/fridge)", "start the timer", or
+   "yes". Up to three waiting timers are kept across "next" (frosting while it
+   bakes); a cue that names the oven, fridge or freezer starts that one, else
+   the latest. Timers are named for what they time: "apple pie" (oven),
+   "chia pudding chill", "dough rise" ("Your chia pudding chill timer is done").
+   Swapped or skipped ingredients are mentioned in the parts that use them.
+   Every answer needs the wake word (2026-10-25: no answer window, no
+   `recipe_mode`); the step prompts name it.
 5. **Questions** (deterministic): "how much X" reads the ingredient line(s).
    "How long" and "what temperature" read the sentence from the current step,
    or the nearest step that has one. "Can I skip X?" / "do I need X?" uses the
@@ -97,6 +119,28 @@ couldn't find one online. If you don't like a recipe, ask for another.
    current size.
 
 ---
+
+## Recipe box: favorites and history (2026-10-25)
+
+`antigua_core/recipe_box.py`, `data/recipe_box.json`. Every recipe opened by
+voice (picked, a favorite, or from the phone menu) goes into the history,
+newest first, up to 100. An entry is marked cooked when the recipe is read
+to its last step. "Favorite this recipe", "save this recipe" or "add this to
+my favorites" keeps the open recipe, or the one opened in the last two
+hours. "Remove this from my favorites" undoes it. The whole recipe is stored
+with both lists.
+
+- "Show my favorite recipes" (or "...favorite pie recipes") puts the newest
+  four up as choices (A to D), and says how many more the menu has.
+- "Make my favorite apple pie" opens it straight away. Several matches go
+  up as choices.
+- "Show my recent recipes" or "recipe history" shows the last four opened.
+- Without a display, they're read out.
+- PinedaDisplay's /menu Recipes tab shows both lists, with the recipe
+  expanded, its original URL, a favorite heart, and "Show on the display"
+  (GET /recipes; POST/DELETE /recipes/<id>/favorite; POST
+  /recipes/<id>/show, see `recipe_http.py`). Primary only: the fallback
+  doesn't keep the box.
 
 ## State
 
@@ -152,5 +196,5 @@ answers that recipes need the main server.
   online.
 - "One at a time" reads the ingredients one by one ("got it" / "I don't have it"),
   then works through the missing ones.
-- Not built yet: display on PinedaDisplay, Spanish. The free-form Q&A
-  (Phase B) is coded on `development` but not yet deployed to primary-server.
+- Not built yet: Spanish. The free-form Q&A
+  (Phase B) is coded on `development` but not yet deployed to noegpu01.

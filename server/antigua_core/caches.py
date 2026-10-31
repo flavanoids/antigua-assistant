@@ -733,66 +733,53 @@ class SearXNGSkill:
             self._cache[cache_key] = (result, now)
         return result
 
-    def search_images(self, query: str, count: int = 6) -> list[dict]:
-        """Search for images across SearXNG image engines without an API key.
-
-        Returns a list of dicts:
-        [{'id': 'A', 'url': str, 'thumb_url': str, 'title': str, 'source': str, 'snippet': str}]
-        """
-        from urllib.parse import urlsplit
+    def _image_rows(self, query: str) -> list[dict]:
+        """SearXNG's raw image rows for `query` (pinned to the home city when
+        it sounds local), or [] when the search fails."""
+        from . import image_search
 
         base = {"format": "json", "language": "en-US", "categories": "images"}
         try:
             r = requests.get(
                 f"{settings.SEARCH_URL}/search",
-                params={"q": query, **base},
+                params={"q": image_search.localize(query), **base},
                 timeout=settings.SEARCH_TIMEOUT + 3,
             )
             r.raise_for_status()
-            data = r.json()
+            return r.json().get("results", [])
         except requests.RequestException as e:
             log.warning("SearXNG image search failed for %r: %s", query, e)
             return []
 
-        letters = ["A", "B", "C", "D", "E", "F", "G", "H"]
-        items = []
-        raw_results = data.get("results", [])
-        seen_urls: set[str] = set()
+    def search_images(self, query: str, count: int = 6) -> list[dict]:
+        """Search for images across SearXNG image engines without an API key.
 
-        for r in raw_results:
-            img_url = r.get("img_src") or r.get("thumbnail_src")
-            if not img_url or img_url in seen_urls:
-                continue
-            if "spacer.gif" in img_url or "blank.gif" in img_url:
-                continue
-            seen_urls.add(img_url)
+        Returns up to `count` ranked, cleaned display items (see
+        image_search.rank): [{'id': 'A', 'url', 'thumb_url', 'title',
+        'source', 'snippet', 'aspect_ratio'}]. A local-sounding query
+        ("downtown") is pinned to the home city first.
+        """
+        from . import image_search
 
-            source_url = r.get("url") or ""
-            source_host = ""
-            if source_url:
-                try:
-                    source_host = urlsplit(source_url).netloc.removeprefix("www.")
-                except Exception:
-                    source_host = ""
-            if not source_host and r.get("source"):
-                source_host = str(r["source"])
+        return image_search.rank(self._image_rows(query), query, count)
 
-            title = (r.get("title") or query).strip()
-            snippet = (r.get("content") or "").strip()
-            letter = letters[len(items)]
-            items.append({
-                "id": letter,
-                "url": img_url,
-                "thumb_url": r.get("thumbnail_src") or img_url,
-                "title": title,
-                "source": source_host,
-                "snippet": snippet,
-                "aspect_ratio": 1.0,
-            })
-            if len(items) >= count:
-                break
+    def search_image_comparison(self, left: str, right: str,
+                                per_side: int = 3) -> tuple[list[dict], list[dict]]:
+        """Two searches at once for a comparison: (items lettered A.. then
+        on, groups [{label, ids}]). The right side skips pictures the left
+        already has. Either side can come back empty."""
+        from concurrent.futures import ThreadPoolExecutor
 
-        return items
+        from . import image_search
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            rows_l, rows_r = pool.map(self._image_rows, (left, right))
+        items_l = image_search.rank(rows_l, left, per_side)
+        seen = {image_search.image_key(i["url"]) for i in items_l}
+        items_r = image_search.rank(rows_r, right, per_side, first=len(items_l), exclude=seen)
+        groups = [{"label": image_search.label(side), "ids": [i["id"] for i in items]}
+                  for side, items in ((left, items_l), (right, items_r)) if items]
+        return items_l + items_r, groups
 
     @staticmethod
     def _parallel_on() -> bool:

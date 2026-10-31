@@ -19,7 +19,7 @@ Three things work with the household's Apple devices:
 
 ## Ask Antigua: building the Shortcut
 
-The household key is in `/etc/antigua/phone.key` on primary-server
+The household key is in `/etc/antigua/phone.key` on noegpu01
 (`sudo cat /etc/antigua/phone.key`). Build the Shortcut once on one iPhone, then
 share it with everyone else.
 
@@ -30,7 +30,7 @@ is what you say to Siri. Then add these actions in order:
    (With Siri, this is a spoken question you answer out loud.)
 2. **Get Device Details**. Detail: Device Name.
 3. **Get Contents of URL**
-   - URL: `http://<primary-server LAN IP>:9395/ask` (the lan-ip column for primary-server in network/hosts.conf)
+   - URL: `http://<noegpu01 LAN IP>:9395/ask` (the lan-ip column for noegpu01 in network/hosts.conf)
    - Method: **POST**
    - Headers: `X-Antigua-Key` = *the key*
    - Request Body: **JSON**, with two Text fields:
@@ -83,7 +83,7 @@ household:
 
 Then restart antigua-server. Only list phones that leave with their owner:
 an iPad that stays home would make its owner always look home.
-`curl -s localhost:9393/presence` on primary-server shows what Antigua sees.
+`curl -s localhost:9393/presence` on noegpu01 shows what Antigua sees.
 
 Tuning (`presence:` in server.yaml): `away_after_minutes` (15) is how long a
 phone can go unseen before its owner counts as gone. A sleeping iPhone still

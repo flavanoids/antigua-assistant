@@ -20,7 +20,7 @@
 
 | Area | Today | What it means for Spanish |
 |---|---|---|
-| **STT** | whisper.cpp `large-v3-turbo` q8 on the RX 6650 XT (`antigua-whisper.service`, :8178), started with `-l en`. `faster-whisper small.en` on the CPU is the fallback and does hotword re-hearing. `medium.en` gives a second opinion over music. | `large-v3-turbo` is multilingual. The `.en` CPU models are English-only, so Spanish only works on the GPU path. |
+| **STT** | whisper.cpp `large-v3-turbo` q8 on the primary's 8 GB GPU (`antigua-whisper.service`, :8178), started with `-l en`. `faster-whisper small.en` on the CPU is the fallback and does hotword re-hearing. `medium.en` gives a second opinion over music. | `large-v3-turbo` is multilingual. The `.en` CPU models are English-only, so Spanish only works on the GPU path. |
 | **Language detection** | Tested `-l auto` on 8 kitchen clips. All were detected as `en`, but confidence dropped on short or noisy clips: "Pause" over music p=0.72, "So bad money" p=0.80, "Yeah" p=0.50. Clear commands scored p≥0.98. | Auto-detect works, but it needs guard rails. One-word clips must not flip language. |
 | **Routing** | Every skill parser is English regex: `music_intents.py`, `classify.py` (timers, TV, Govee, volume, time/date, weather, news, sports, calc). | Spanish commands currently fall through to the LLM, which chats about them and doesn't act. |
 | **Skill replies** | Deterministic English templates, e.g. `"Playing X"`, `"5-minute timer set."`, `_DIDNT_CATCH` in `classify.py:1486`. | They need Spanish variants. |

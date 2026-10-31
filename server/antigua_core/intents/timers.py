@@ -288,17 +288,18 @@ def parse_timer_request(text):
     elif is_reminder:
         label = "reminder"
     else:
-        label = _humanize_seconds(seconds) + " timer"
+        # "3 minute timer", not "3 minutes timer": it's said as "Your 3 minute timer is done."
+        label = _humanize_seconds(seconds, adjective=True) + " timer"
     return TimerSpec(seconds=seconds, label=label, kind=kind, name=name)
 
 
-def _humanize_seconds(seconds):
+def _humanize_seconds(seconds, adjective=False):
     s = int(round(seconds))
     parts = []
     for unit, size in (("hour", 3600), ("minute", 60), ("second", 1)):
         n, s = divmod(s, size)
         if n:
-            parts.append(f"{n} {unit}{'s' if n != 1 else ''}")
+            parts.append(f"{n} {unit}{'s' if n != 1 and not adjective else ''}")
     return " ".join(parts) or "0 seconds"
 
 
@@ -780,7 +781,7 @@ def parse_alarm_request(text):
         return None
     target, hour, minute, repeat = resolved
     spec = TimerSpec(
-        seconds=(target - now).total_seconds(), label="", kind="alarm",
+        seconds=target.timestamp() - now.timestamp(), label="", kind="alarm",
         name=name, repeat=repeat, duration_s=0, wake="wake" in text.lower(),
         hour=hour, minute=minute,
     )
@@ -886,7 +887,7 @@ def parse_reminder_request(text):
     if resolved is not None:
         target, hour, minute, repeat = resolved
         return TimerSpec(
-            seconds=(target - now).total_seconds(), label=message or "reminder",
+            seconds=target.timestamp() - now.timestamp(), label=message or "reminder",
             kind="reminder", message=message, repeat=repeat, duration_s=0,
             hour=hour, minute=minute,
         )

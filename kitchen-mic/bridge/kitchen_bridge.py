@@ -86,7 +86,7 @@ WAKE_WORD_CONFIRM_FRAMES = 3
 # No energy gate (removed 2026-10-01): it skipped frames under RMS 150, so in
 # a quiet room openWakeWord saw "Alexa" with holes in it and every quiet frame
 # reset the confirm count — a replayed "Alexa" + pause at moderate volume
-# never fired. It was a Pi CPU saver; on primary-server a frame costs ~1.5ms.
+# never fired. It was a Pi CPU saver; on noegpu01 a frame costs ~1.5ms.
 # Near-misses (2026-10-01): a score burst that peaks at NEAR_MISS_SCORE or
 # more without waking is logged and its audio saved, so misses can be tuned
 # from data — before this a missed "Alexa" left no trace at all.
@@ -294,6 +294,7 @@ class KitchenBridge:
         self._followup_deadline = 0.0
         self._followup_turns = 0  # consecutive VAD-opened follow-ups, capped (see MAX_FOLLOWUP_TURNS)
         self._expect_reply = False   # last reply was a question waiting on an answer
+        self._starts_playback = False  # last reply started music or a podcast
         self._recipe = False         # ...and a recipe is open (no 6-answer cap)
         self._speech_window = False  # this follow-up window takes plain speech
         self._speech_run_followup = 0
@@ -400,10 +401,12 @@ class KitchenBridge:
         how = ("chatting, no wake word needed" if self._chat
                else "answer, no wake word needed" if self._speech_window else "wake word")
         log.info(f"=== FOLLOW-UP WINDOW OPEN ({timeout}s, {how}) ===")
-        if not (self._chat or self._speech_window):
+        if not (self._chat or self._speech_window) or self._starts_playback:
             # Only the wake word can open the next turn, and it ducks again
             # itself — so restore the music now, not 8s later ("Playing X"
-            # then a near-silent wait read as "it's not playing").
+            # then a near-silent wait read as "it's not playing"). After a
+            # reply that started playback, restore it even with the window
+            # open: follow-up speech ducks again when recording starts.
             self._publish_listening(False)
         self._led(LED_CHAT if self._chat else LED_ANSWER if self._speech_window else LED_FOLLOWUP)
 
@@ -879,6 +882,7 @@ class KitchenBridge:
                 return
             audio_url = result.get("audio_url", "")
             self._expect_reply = bool(result.get("expects_reply"))
+            self._starts_playback = bool(result.get("starts_playback"))
             self._recipe = bool(result.get("recipe_mode"))
             was_chat, self._chat = self._chat, bool(result.get("chat_mode"))
             if self._chat and not was_chat:

@@ -678,7 +678,8 @@ def answer(text, *, now=None, geocode=None):
             sooner = target - timedelta(hours=12)
             if sooner > naive:
                 target = sooner
-        mins = max(1, round((target - naive).total_seconds() / 60))
+        # Real minutes, not wall-clock: across a DST change they differ by an hour.
+        mins = max(1, round((target.replace(tzinfo=now.tzinfo).timestamp() - now.timestamp()) / 60))
         return f"{_cap(_span_minutes(mins))} until {_clock_round(target)}."
 
     if kind == "is_weekday":

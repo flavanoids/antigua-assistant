@@ -9,7 +9,7 @@
 ## What It Does
 
 Drives [PinedaDisplay Web](https://github.com/flavanoids/PinedaDisplay), the
-dashboard on the airplaypi kiosk screen. pineda-web runs on primary-server next to
+dashboard on the airplaypi kiosk screen. pineda-web runs on noegpu01 next to
 Antigua (`:8090`, LAN-only by rule: `pineda-web-guard` keeps it off the
 internet and away from tunnels; see `network/README.md`), so this is plain
 HTTP to localhost; the restart and reboot endpoints reach airplaypi over SSH
@@ -22,6 +22,10 @@ themselves.
 | "what themes are there" / "what theme is this" | Lists / names them | `GET /api/themes`, `GET /api/profiles` |
 | "restart the display" / "refresh the screen" | Restarts cage + Chromium on airplaypi | `POST /api/control/restart-display` |
 | "reboot the pi" / "restart airplaypi" | Asks "Say yes to reboot", then reboots airplaypi 10 s later | `POST /api/control/restart-system` |
+| "turn the screen tall" / "put the display in portrait mode" | Turns the kiosk's picture tall (90°, how it's mounted); "The screen's already tall." if it is | MCP `screen_turn` (`to: "tall"`) |
+| "turn the display back to landscape" / "make the screen wide" | Turns it wide again | same (`"wide"`) |
+| "flip the screen over" / "the screen is upside down" | Turns it 180°, staying wide or tall | same (`"flip"`) |
+| "rotate the screen" / "turn the screen sideways" | Swaps wide and tall | same (`"turn"`) |
 | "who said this quote" | "That's Maya Angelou, in 1978." | `GET /api/now-showing` |
 | "read the quote" | The quote and who said it | same |
 | "tell me more about this quote" / "what does the quote mean" | Searches author + quote, then the LLM explains, grounded in both | same, then SearXNG |
@@ -65,6 +69,14 @@ recipe again" works after the recipe ends and across restarts. "Show me the
 recipe for lasagna" is a new recipe, not this; "go back" stays the previous
 step; "close the recipe" ends the recipe. These phrases are checked ahead of
 the recipe session (`_handle_recipe_display`).
+
+**Turning the screen.** The screen has to be named along with a direction
+(`parse_screen_turn`), so "turn it up", "turn the screen off" and "switch the
+display to groovy" (a theme) aren't turns. `_handle_screen_turn` runs ahead
+of clock mode and the recipe display. pineda-web reads and sets the
+direction on airplaypi over its control key; the direction is kept on the
+Pi, so it holds through restarts and either server. The phone menu's
+kiosk page has the same choices (Wide / Tall / Flip over).
 
 ---
 

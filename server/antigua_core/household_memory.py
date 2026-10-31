@@ -336,6 +336,7 @@ class HouseholdMemory:
         tmp.write_text(_HEADER + "\n" + body)
         os.replace(tmp, self.path)
         self._mtime = self.path.stat().st_mtime
+        settings.mesh_notify_mutation()
 
     def _log(self, action: str, **fields):
         if self.read_only:

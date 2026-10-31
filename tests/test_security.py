@@ -127,11 +127,11 @@ def _config():
     })
 
 
-def _security(ha=None, pineda=None, cfg=None, announce=None):
+def _security(ha=None, pineda=None, cfg=None, announce=None, chime=None):
     tmp = Path(tempfile.mkdtemp(prefix="antigua_security_"))
     return security.Security(ha or FakeHA(), cfg or _config(),
                              security.EventLog(tmp / "events.db"), pineda=pineda or FakePineda(),
-                             announce=announce)
+                             announce=announce, chime=chime)
 
 
 def test_event_log_and_poller():
@@ -255,6 +255,7 @@ def test_a_pushed_change_acts_once():
 
 def test_motion_at_the_front_door_puts_it_up():
     cfg = _config()
+    cfg.motion_hours = "00:00-24:00"  # all day, so it passes at night too
     cfg.cameras["front_door"].show_on_motion = 30
     ha, P = FakeHA(), FakePineda()
     S = _security(ha, P, cfg=cfg)
@@ -412,6 +413,7 @@ def test_motion_announcements():
     cfg.cameras["front_door"].announce_motion = True
     cfg.motion_cooldown_seconds = 60.0
     cfg.motion_hours = "00:00-24:00"  # all day for test
+    cfg.repeat_window_minutes = 0     # every visit speaks: see test_repeat_visitors_chime
     announced = []
     S = _security(ha, cfg=cfg, announce=announced.append)
 
@@ -512,28 +514,28 @@ def test_format_visitor_announcements():
     assert fmt("Front door", [], fallback_announcement="Custom alert") == "Custom alert"
 
     # 1 person
+    assert fmt("Front door", ["Dana"]) == "Dana's at the front door."
     assert fmt("Front door", ["Sam"]) == "Sam's at the front door."
-    assert fmt("Front door", ["Jordan"]) == "Jordan's at the front door."
     assert fmt("Front door", ["James"]) == "James is at the front door."
-    assert fmt("Front door", ["sam"]) == "Sam's at the front door."  # Auto capitalization
+    assert fmt("Front door", ["dana"]) == "Dana's at the front door."  # Auto capitalization
 
     # 1 person with guest / unknown
-    assert fmt("Front door", ["Sam"], has_unknown=True) == "Sam is at the front door with a guest."
-    assert fmt("Front door", ["Sam", "unknown"]) == "Sam is at the front door with a guest."
+    assert fmt("Front door", ["Dana"], has_unknown=True) == "Dana is at the front door with a guest."
+    assert fmt("Front door", ["Dana", "unknown"]) == "Dana is at the front door with a guest."
 
     # 2 people
-    assert fmt("Front door", ["Maria", "Vivicca"]) == "Maria is at the front door with Vivicca."
-    assert fmt("Front door", ["maria", "vivicca"]) == "Maria is at the front door with Vivicca."
-    assert fmt("Front door", ["Maria", "Vivicca"], has_unknown=True) == "Maria and Vivicca are at the front door with a guest."
+    assert fmt("Front door", ["Jordan", "Riley"]) == "Jordan is at the front door with Riley."
+    assert fmt("Front door", ["jordan", "riley"]) == "Jordan is at the front door with Riley."
+    assert fmt("Front door", ["Jordan", "Riley"], has_unknown=True) == "Jordan and Riley are at the front door with a guest."
 
     # 3+ people
-    assert fmt("Front door", ["Sam", "Jordan", "Maria"]) == "Sam, Jordan, and Maria are at the front door."
-    assert fmt("Front door", ["Sam", "Jordan", "Maria"], has_unknown=True) == "Sam, Jordan, and Maria are at the front door with a guest."
+    assert fmt("Front door", ["Dana", "Sam", "Jordan"]) == "Dana, Sam, and Jordan are at the front door."
+    assert fmt("Front door", ["Dana", "Sam", "Jordan"], has_unknown=True) == "Dana, Sam, and Jordan are at the front door with a guest."
 
     # Other camera titles
-    assert fmt("Garage", ["Sam"]) == "Sam's at the garage."
+    assert fmt("Garage", ["Dana"]) == "Dana's at the garage."
     assert fmt("Garage", []) == "Somebody is at the garage."
-    assert fmt("The Porch", ["Jordan"]) == "Jordan's at the porch."
+    assert fmt("The Porch", ["Sam"]) == "Sam's at the porch."
 
 
 def test_extract_people_from_state():
@@ -544,21 +546,21 @@ def test_extract_people_from_state():
     assert extract({}) == ([], False)
 
     # HA sensor state
-    assert extract({"state": "Sam", "attributes": {}}) == (["Sam"], False)
+    assert extract({"state": "Dana", "attributes": {}}) == (["Dana"], False)
     assert extract({"state": "unknown", "attributes": {}}) == ([], False)
     assert extract({"state": "on", "attributes": {}}) == ([], False)
 
     # Attributes: Eufy BionicMind person_name
-    assert extract({"state": "on", "attributes": {"person_name": "Sam"}}) == (["Sam"], False)
-    assert extract({"state": "on", "attributes": {"person_name": "Maria, Vivicca"}}) == (["Maria", "Vivicca"], False)
+    assert extract({"state": "on", "attributes": {"person_name": "Dana"}}) == (["Dana"], False)
+    assert extract({"state": "on", "attributes": {"person_name": "Jordan, Riley"}}) == (["Jordan", "Riley"], False)
     assert extract({"state": "on", "attributes": {"person_name": "unknown"}}) == ([], True)
 
     # Attributes: Frigate sub_label
-    assert extract({"state": "on", "attributes": {"sub_label": "Sam"}}) == (["Sam"], False)
-    assert extract({"state": "on", "attributes": {"sub_labels": [{"label": "Jordan"}]}}) == (["Jordan"], False)
+    assert extract({"state": "on", "attributes": {"sub_label": "Dana"}}) == (["Dana"], False)
+    assert extract({"state": "on", "attributes": {"sub_labels": [{"label": "Sam"}]}}) == (["Sam"], False)
 
     # Attributes: Double Take matched_faces
-    assert extract({"state": "on", "attributes": {"matched_faces": ["Sam", "Jordan"]}}) == (["Sam", "Jordan"], False)
+    assert extract({"state": "on", "attributes": {"matched_faces": ["Dana", "Sam"]}}) == (["Dana", "Sam"], False)
 
 
 def test_visitor_announcements_with_people():
@@ -567,32 +569,33 @@ def test_visitor_announcements_with_people():
     cfg.cameras["front_door"].announce_motion = True
     cfg.motion_hours = "00:00-24:00"
     cfg.motion_cooldown_seconds = 10.0
+    cfg.repeat_window_minutes = 0
     announced = []
     S = _security(ha, cfg=cfg, announce=announced.append)
 
     # Direct announce_visitor with 1 person
-    phrase = S.announce_visitor("front_door", ["Sam"])
-    assert phrase == "Sam's at the front door."
+    phrase = S.announce_visitor("front_door", ["Dana"])
+    assert phrase == "Dana's at the front door."
     time.sleep(0.05)
-    assert announced[-1] == "Sam's at the front door."
+    assert announced[-1] == "Dana's at the front door."
     last_event = S.events.last("front_door", ("person",))
-    assert last_event["detail"] == "Sam"
+    assert last_event["detail"] == "Dana"
 
     # Reset cooldown
     S._last_motion_announce["front_door"] -= 15
 
     # Direct announce_visitor with 2 people
-    phrase = S.announce_visitor("front_door", ["Maria", "Vivicca"])
-    assert phrase == "Maria is at the front door with Vivicca."
+    phrase = S.announce_visitor("front_door", ["Jordan", "Riley"])
+    assert phrase == "Jordan is at the front door with Riley."
     time.sleep(0.05)
-    assert announced[-1] == "Maria is at the front door with Vivicca."
+    assert announced[-1] == "Jordan is at the front door with Riley."
     last_event = S.events.last("front_door", ("person",))
-    assert last_event["detail"] == "Maria, Vivicca"
+    assert last_event["detail"] == "Jordan, Riley"
 
-    # A camera whose video goes up on motion says so
+    # A camera whose video goes up on motion doesn't say so (user decision 2026-10-25)
     S._last_motion_announce["front_door"] -= 15
     cfg.cameras["front_door"].show_on_motion = 30
-    assert S.announce_visitor("front_door", []) == "Somebody is at the front door, live on Pineda Display."
+    assert S.announce_visitor("front_door", []) == "Somebody is at the front door."
     cfg.cameras["front_door"].show_on_motion = 0
 
     # Reset cooldown and test poller reading person_name attribute
@@ -601,10 +604,45 @@ def test_visitor_announcements_with_people():
     S.poll_once(ha.states())
     ha.s["binary_sensor.doorbell_person_detected"] = "on"
     states = ha.states()
-    states["binary_sensor.doorbell_person_detected"]["attributes"] = {"person_name": "Jordan"}
+    states["binary_sensor.doorbell_person_detected"]["attributes"] = {"person_name": "Sam"}
     S.poll_once(states)
     time.sleep(0.05)
-    assert announced[-1] == "Jordan's at the front door."
+    assert announced[-1] == "Sam's at the front door."
+
+
+def test_repeat_visitors_chime():
+    """The first visit speaks, the next within 5 minutes chimes; a third in
+    5 minutes chimes until the door's been quiet 20 minutes."""
+    cfg = _config()
+    cfg.cameras["front_door"].announce_motion = True
+    cfg.motion_hours = "00:00-24:00"
+    announced, chimes = [], []
+    S = _security(cfg=cfg, announce=announced.append, chime=lambda: chimes.append(1))
+    clock = [1_000_000.0]
+    real = security.time.time
+    security.time.time = lambda: clock[0]
+    try:
+        def visit(after_s):
+            clock[0] += after_s
+            return S.announce_visitor("front_door", [])
+
+        assert visit(0) == "Somebody is at the front door."
+        assert visit(90) is None                  # 1.5 min later: chime
+        assert visit(6 * 60) is not None          # 7.5 min after the first: speaks again
+        assert visit(60) is None                  # chime
+        assert visit(60) is None                  # third in 5 min: chime, 20 min cooldown
+        assert visit(10 * 60) is None             # still cooling down (and extends it)
+        assert visit(19 * 60) is None             # 19 min after the last: still chimes
+        assert visit(21 * 60) == "Somebody is at the front door."   # quiet 21 min: speaks
+        assert visit(70) is None                  # and chimes after
+        assert visit(45) is None                  # 60 s debounce: nothing at all
+        time.sleep(0.1)
+        assert len(announced) == 3
+        assert len(chimes) == 6
+        with S.events._db() as db:                # every visit logged, chimed or said
+            assert db.execute("SELECT COUNT(*) FROM events WHERE event = 'person'").fetchone()[0] == 9
+    finally:
+        security.time.time = real
 
 
 def test_a_non_admin_user_restarts_the_bridge_with_a_button():
@@ -673,10 +711,39 @@ def test_watch_uses_state_changed_events():
     assert got == [{"lock.front_door": {"entity_id": "lock.front_door", "state": "locked"}}], got
 
 
+def test_stop_and_start_again():
+    """The fallback starts it on activation and stops it on stand-down, maybe
+    many times: one poller per run, and a fresh first look each start."""
+    import threading
+    cfg = _config()
+    cfg.poll_seconds = 0.02
+    ha = FakeHA()
+    ha.watch = lambda entities, on_state, stop: stop.wait()
+    S = _security(ha, FakePineda(), cfg=cfg)
+
+    def pollers():
+        return sum(t.name == "security-poll" and t.is_alive() for t in threading.enumerate())
+
+    for _ in range(3):
+        S.start()
+        time.sleep(0.1)
+        assert pollers() == 1, pollers()
+        assert S._seen, "the poller ran"
+        S.stop()
+        time.sleep(0.1)
+        assert pollers() == 0, pollers()
+    ha.s["binary_sensor.doorbell_motion_detected"] = "on"   # changed while stopped
+    S.start()
+    time.sleep(0.1)
+    S.stop()
+    assert not S.events.last("front_door", ("motion",)), "a change while stopped isn't news"
+
+
 def main():
     settings.configure({})
     test_parser()
     test_event_log_and_poller()
+    test_stop_and_start_again()
     test_motion_and_person_dont_take_over()
     test_motion_announcements()
     test_motion_announces_when_opted_in()
@@ -685,6 +752,7 @@ def main():
     test_format_visitor_announcements()
     test_extract_people_from_state()
     test_visitor_announcements_with_people()
+    test_repeat_visitors_chime()
     test_a_finished_charge_restarts_the_eufy_bridge()
     test_a_non_admin_user_restarts_the_bridge_with_a_button()
     test_watch_uses_state_changed_events()

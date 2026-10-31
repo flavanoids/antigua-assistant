@@ -5,10 +5,11 @@ Pipeline server activated when the primary is offline. Runs the same
 antigua_core pipeline as the primary — classify(), every skill route, the
 memory/timer/news/search stack — with a smaller backend injected:
 
-  - STT:  faster-whisper tiny (CPU) instead of whisper.cpp
-  - LLM:  qwen3.5:2b (Vulkan) — think=False, NO /no_think suffix (causes
-          artifacts), non-streaming (whole reply arrives as one chunk, split
-          by sentence). ~2s warm; 0.8b was no faster warm and padded replies.
+  - STT:  faster-whisper small.en (CPU) instead of whisper.cpp
+  - LLM:  antigua-4b-text, fallback.model, whole on the backup's GPU (Vulkan) —
+          think=False, NO /no_think suffix (causes artifacts), streamed and
+          split by sentence. ~0.55s to the first token warm, 24 tok/s.
+  - No speaker ID.
   - TTS:  http://localhost:5500/tts (same box, no LAN hop)
   - Data: <deploy dir>/data/
   - Port: 9394 | Extra endpoints: POST /activate, POST /deactivate
@@ -31,8 +32,10 @@ do these):
     process is down, and degrade to LLM-only answers when the box is.
 """
 
+import hashlib
 import json
 import logging
+import os
 import re
 import socket
 import time
@@ -47,8 +50,9 @@ import requests
 import yaml
 from faster_whisper import WhisperModel
 
-from antigua_core import household_memory, pipeline
-from antigua_core import server_common
+from antigua_core import household_memory, morning, pipeline
+from antigua_core import security as security_skill
+from antigua_core import server_common, turn_timing
 from antigua_core import settings as core_settings
 from antigua_core.caches import NewsCache, NWSAlertsCache, SearXNGSkill, WeatherCache
 from antigua_core.classify import extract_weather_location
@@ -81,7 +85,7 @@ logging.basicConfig(
     level=logging.INFO,
     # Milliseconds, like the kitchen bridge's log, so a turn's stages line up.
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
+    datefmt="%Y-%m-%d %H:%M:%S",   # dated: gpu_lend.sh reclaim counts only the lend's turns
 )
 log = logging.getLogger("antigua-fallback")
 
@@ -96,8 +100,17 @@ cfg = load_config()
 # ── Fallback-specific overrides (ignore whatever server.yaml says for these) ──
 
 FALLBACK_PORT = 9394
-OLLAMA_MODEL = "qwen3.5:2b"
-OLLAMA_NUM_CTX = 8192
+# fallback.model in server.yaml (server/scripts/use_model.sh --fallback sets
+# it): a pinned copy of a model whose Modelfile sets num_gpu 99 and num_ctx, so
+# every request (gates, routers, chat) keeps it whole on a small GPU. Ollama's
+# default split ran the 4B at 9.7 tok/s on a 4 GB card instead of 24.
+_FB = cfg.get("fallback") or {}
+OLLAMA_MODEL = _FB.get("model") or "antigua-4b-text"
+OLLAMA_NUM_CTX = int(_FB.get("num_ctx") or 8192)
+FW_MODEL = "small.en"
+# The backup GPU's runtime PM: amdgpu suspends it after 5 s idle, and waking it
+# stalls the next request ~2 s. "on" while standing in, "auto" after.
+GPU_PM_CONTROL = Path("/sys/bus/pci/devices/0000:01:00.0/power/control")
 REMOTE_TTS_URL = "http://localhost:5500/tts"          # same box on the backup
 PRIMARY_HOST = "10.77.0.1"                            # the primary over wg0
 PRIMARY_HEALTH_URL = f"http://{PRIMARY_HOST}:9393/health"
@@ -151,7 +164,7 @@ mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="antigua-f
 
 
 def _on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
-    client.subscribe([("antigua/alarm_ack", 1)])   # resubscribe on every reconnect
+    client.subscribe([("antigua/alarm_ack", 1), ("antigua/unducked", 1)])   # resubscribe on every reconnect
 
 
 def _on_mqtt_message(client, userdata, msg):
@@ -161,6 +174,13 @@ def _on_mqtt_message(client, userdata, msg):
             pipeline.note_alarm_ack(json.loads(msg.payload).get("id", ""))
         except (ValueError, AttributeError):
             pass
+    # The kitchen duck lifted: rewind a podcast that started under it.
+    elif msg.topic == "antigua/unducked" and music is not None:
+        try:
+            since = float(json.loads(msg.payload).get("since"))
+        except (ValueError, AttributeError, TypeError):
+            return
+        Thread(target=music.on_unducked, args=(since,), daemon=True, name="music-rewind").start()
 
 
 def mqtt_connect():
@@ -208,11 +228,44 @@ timers = TimerManager(
     on_change=lambda: timer_mirror and timer_mirror.push(),
 )
 # While standing in, the alarms go to both pineda-webs: this box's (the kiosk's
-# while primary-server is down) and the primary's (when only Antigua is down there).
+# while noegpu01 is down) and the primary's (when only Antigua is down there).
 timer_mirror = (TimerMirror(
     [pineda, pineda_connect(f"http://{PRIMARY_HOST}:8090", token_file=core_settings.PINEDA_TOKEN_FILE)],
     timers.list_active,
     in_charge=lambda: _active) if pineda else None)
+
+# The Eufy cameras, the door chime and the back-door good morning, as on the
+# primary (antigua_core/security.py), but only while standing in: started on
+# activation and stopped on stand-down, so the two never both announce.
+security = None
+_sec_cfg = cfg.get("security") or {}
+if _sec_cfg.get("ha_url"):
+    _ha_token = security_skill.read_token(_sec_cfg.get("token_file", "/etc/antigua/ha.env"))
+    if _ha_token:
+        security = security_skill.Security(
+            security_skill.HomeAssistant(_sec_cfg["ha_url"], _ha_token),
+            security_skill.Config.from_dict(_sec_cfg),
+            security_skill.EventLog(core_settings.DATA_DIR / "security_events.db"),
+            pineda=pineda,
+            announce=lambda text: _on_security_announce(text),
+            chime=lambda: _play_static("door_chime.wav"),
+        )
+        if (cfg.get("morning") or {}).get("door"):
+            _morning = morning.MorningGreeting(morning.Config.from_dict(cfg["morning"]),
+                                               announce=lambda text: _on_security_announce(text))
+            security.listen(_morning.cfg.door, _morning.on_state)
+
+
+def _on_security_announce(text: str) -> None:
+    wav_path = synthesize(text)
+    if wav_path:
+        mqtt_publish("antigua/play", {
+            "audio_url": f"http://{get_local_ip()}:{FALLBACK_PORT}/audio/{Path(wav_path).name}"})
+        log.info("Security: announced %r", text)
+
+
+def _play_static(name: str) -> None:
+    mqtt_publish("antigua/play", {"audio_url": f"http://{get_local_ip()}:{FALLBACK_PORT}/audio/{name}"})
 
 
 def _on_timer_fire(label: str, kind: str = "timer", message: str | None = None):
@@ -240,9 +293,11 @@ def _get_whisper():
     global _whisper_model
     with _whisper_lock:
         if _whisper_model is None:
-            log.info("Loading faster-whisper tiny model...")
-            _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
-            log.info("faster-whisper tiny ready")
+            # small.en, not tiny: 2.0 s for a 5.7 s clip on this CPU, and
+            # the bigger model for the far-field kitchen mic (2026-10-25).
+            log.info("Loading faster-whisper %s model...", FW_MODEL)
+            _whisper_model = WhisperModel(FW_MODEL, device="cpu", compute_type="int8")
+            log.info("faster-whisper %s ready", FW_MODEL)
         return _whisper_model
 
 
@@ -287,6 +342,18 @@ def _build_messages(transcript, conversation_id="", extra_context=None):
 
     log.info("LLM context: conv=%s history=%d msgs", conversation_id or "new", len(messages))
 
+    system_with_context = _system_content(transcript, extra_context)
+    if not messages or messages[0]["role"] != "system":
+        messages.insert(0, {"role": "system", "content": system_with_context})
+    else:
+        messages[0]["content"] = system_with_context
+
+    # Small qwen: clean user message — no /no_think suffix (causes literal meta-commentary)
+    messages.append({"role": "user", "content": transcript})
+    return messages
+
+
+def _system_content(transcript, extra_context=None):
     now_str = server_common.llm_now_str()
 
     if extra_context is not None:
@@ -306,16 +373,7 @@ def _build_messages(transcript, conversation_id="", extra_context=None):
     alerts_str = nws_alerts_cache.format_for_prompt()
     if alerts_str:
         system_with_context += f"\n{alerts_str}"
-    system_with_context += household_memory.store().rules_block()
-
-    if not messages or messages[0]["role"] != "system":
-        messages.insert(0, {"role": "system", "content": system_with_context})
-    else:
-        messages[0]["content"] = system_with_context
-
-    # Small qwen: clean user message — no /no_think suffix (causes literal meta-commentary)
-    messages.append({"role": "user", "content": transcript})
-    return messages
+    return system_with_context + household_memory.store().rules_block()
 
 
 def _llm_payload(messages, max_tokens_override=None, temperature_override=None, stream=False):
@@ -331,6 +389,26 @@ def _llm_payload(messages, max_tokens_override=None, temperature_override=None, 
         },
         "keep_alive": OLLAMA_KEEP_ALIVE,
     }
+
+
+def write_json(prompt: str) -> str:
+    """One non-streamed answer in JSON mode (research.py plans and answers
+    with it). Same model, context and keep-alive as the chat calls."""
+    resp = requests.post(
+        f"{OLLAMA_HOST}/api/generate",
+        json={
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "think": False,
+            "format": "json",
+            "options": {"temperature": 0.2, "num_predict": 1200, "num_ctx": OLLAMA_NUM_CTX},
+            "keep_alive": OLLAMA_KEEP_ALIVE,
+        },
+        timeout=90,
+    )
+    resp.raise_for_status()
+    return resp.json().get("response") or ""
 
 
 def _remember(conversation_id, transcript, reply):
@@ -349,8 +427,40 @@ def prime_llm():
     """Evaluate the real system prompt once so the first turn after takeover
     reuses its KV prefix (~1.9k tokens, ~4s cold here) — also fills the
     weather cache the prompt pulls from."""
-    payload = _llm_payload(_build_messages("Hello"), max_tokens_override=1)
-    requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=60).raise_for_status()
+    global _primed_system
+    messages = _build_messages("Hello")
+    requests.post(f"{OLLAMA_HOST}/api/chat", json=_llm_payload(messages, max_tokens_override=1),
+                  timeout=60).raise_for_status()
+    _primed_system = messages[0]["content"]
+
+
+# The system message changes with the hour, the weather, timers and alerts;
+# the first chat after that re-reads all of it (~174 tok/s here: 5 s for the
+# 500 tokens after the weather line). Re-priming in the background moves that
+# off the next turn. Never within a couple of minutes of a chat turn: priming
+# replaces the cache that conversation's follow-ups would reuse.
+_primed_system = ""
+_last_chat_at = 0.0
+REPRIME_QUIET_S = 120
+
+
+def _reprime_if_stale():
+    if (_llm_warm and time.time() - _last_chat_at > REPRIME_QUIET_S
+            and _system_content("Hello") != _primed_system):
+        t0 = time.time()
+        prime_llm()
+        log.info("Re-primed the LLM prompt cache (%.1fs)", time.time() - t0)
+
+
+def _note_llm_stats(msg):
+    """Ollama's own numbers for the reply, on the TURN line. prompt_tok is the
+    whole prompt, cached or not; prompt_s is the time spent on the uncached
+    tail (Ollama's log says how many tokens that was), and on this hybrid model
+    it includes restoring and saving a context checkpoint."""
+    turn_timing.note("prompt_tok", msg.get("prompt_eval_count", 0))
+    turn_timing.note("prompt_s", f"{msg.get('prompt_eval_duration', 0) / 1e9:.2f}")
+    if msg.get("eval_duration"):
+        turn_timing.note("gen_tps", f"{msg.get('eval_count', 0) / (msg['eval_duration'] / 1e9):.1f}")
 
 
 _SENTENCE_SPLIT = re.compile(r'(?<=[.!?])["\'’”)]*\s+')
@@ -365,21 +475,25 @@ def ask_llm_stream(transcript, conversation_id="", extra_context=None,
     Grounding context is folded into the prompt; the small model gets no
     separate grounding pass. `grounding_mode` is accepted for signature
     parity and ignored: there is never a recipe session here."""
-    t0 = time.time()
+    global _last_chat_at
+    t0 = _last_chat_at = time.time()
     messages = _build_messages(transcript, conversation_id, extra_context or grounding_context)
     if turn_hint:  # persona.py's stage direction; history keeps the bare transcript
         messages[-1]["content"] += "".join(f"\n({h})" for h in turn_hint.split("\n") if h)
     payload = _llm_payload(messages, max_tokens_override, temperature_override, stream=True)
     buf = full = ""
     try:
-        # (connect, first token): the CPU model is slower than the primary's,
+        # (connect, first token): this box is slower than the primary,
         # but the turn must still end inside the kitchen bridge's 60s.
         with requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=(2, 40), stream=True) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines():
                 if not line:
                     continue
-                piece = json.loads(line).get("message", {}).get("content", "")
+                msg = json.loads(line)
+                if msg.get("done"):
+                    _note_llm_stats(msg)
+                piece = msg.get("message", {}).get("content", "")
                 buf += piece
                 full += piece
                 *done, buf = _SENTENCE_SPLIT.split(buf)
@@ -426,16 +540,29 @@ def route_search_with_llm(transcript: str):
 # ── TTS ──────────────────────────────────────────────────────────────────────
 
 
+# As on the primary: replies are cached by content, so fixed ones (TV, timer
+# and music confirmations) skip Kokoro, which is 2.4x slower here. A hit
+# refreshes the file; prune_audio drops it a week after its last use.
+_TTS_CACHE_TTL = 7 * 86400  # seconds
+_TTS_CACHE_MAX_BYTES = 200 * 1024 * 1024
+
+
 def synthesize(text: str, lang: str = "en") -> str:
     """Synthesize text via Kokoro TTS on localhost. Returns path to wav file."""
     text = clean_for_tts(text, lang)
+    key = text if lang == "en" else f"{lang}:{text}"
+    out_path = AUDIO_OUT_DIR / f"cache_{hashlib.sha256(key.encode()).hexdigest()[:16]}.wav"
+    if out_path.exists() and time.time() - out_path.stat().st_mtime < _TTS_CACHE_TTL:
+        os.utime(out_path)
+        log.info("TTS cache hit: %s", out_path.name)
+        return str(out_path)
     t0 = time.time()
-    fname = f"{uuid.uuid4().hex[:12]}.wav"
-    out_path = AUDIO_OUT_DIR / fname
+    tmp = AUDIO_OUT_DIR / f"{uuid.uuid4().hex[:12]}.wav"
     try:
         resp = _tts_session.post(REMOTE_TTS_URL, json={"text": text, "lang": lang}, timeout=20)
         resp.raise_for_status()
-        out_path.write_bytes(resp.content)
+        tmp.write_bytes(resp.content)
+        tmp.replace(out_path)   # whole files only: a concurrent hit never reads a partial one
         log.info("TTS: %.2fs -> %s", time.time() - t0, out_path.name)
         return str(out_path)
     except requests.ConnectionError:
@@ -445,6 +572,10 @@ def synthesize(text: str, lang: str = "en") -> str:
     except requests.HTTPError as exc:
         log.error("TTS HTTP error: %s", exc)
     return ""
+
+
+# Jellyfin shares this box: a slow turn under a transcode shows as high load.
+turn_timing.extras = lambda: {"host": socket.gethostname(), "load": f"{os.getloadavg()[0]:.1f}"}
 
 
 # ── Network helpers ───────────────────────────────────────────────────────────
@@ -510,9 +641,11 @@ pipeline.init(pipeline.Backend(
     music=music,
     commute=commute,
     pineda=pineda,
+    security=security,
     knowledge=knowledge,
     recipes=recipes,
     remember_exchange=remember_exchange,
+    write_json=write_json,
     static_audio_dir=STATIC_AUDIO_DIR,
 ))
 
@@ -526,11 +659,13 @@ def cleanup_loop():
     while True:
         time.sleep(60)
         try:
-            removed = server_common.prune_audio(AUDIO_OUT_DIR, AUDIO_TTL)
+            removed = server_common.prune_audio(AUDIO_OUT_DIR, AUDIO_TTL, _TTS_CACHE_TTL,
+                                                _TTS_CACHE_MAX_BYTES)
             if removed:
                 log.debug("Cleaned %d old audio files", removed)
             conversations.cleanup()
             pipeline.cleanup_pending()
+            _reprime_if_stale()
         except Exception:
             log.exception("Cleanup error")
 
@@ -639,6 +774,7 @@ class FallbackHandler(AlarmRoutes, BaseHTTPRequestHandler):
             "streaming": result.get("streaming", False),
             "end_conversation": result.get("end_conversation", False),
             "expects_reply": result.get("expects_reply", False),
+            "starts_playback": result.get("starts_playback", False),
         })
 
     def _handle_pipeline_text(self):
@@ -702,6 +838,13 @@ def _ollama_load(keep_alive):
     ).raise_for_status()
 
 
+def _hold_gpu_awake(awake: bool):
+    try:
+        GPU_PM_CONTROL.write_text("on" if awake else "auto")
+    except OSError as e:
+        log.warning("GPU runtime PM %s: %s", GPU_PM_CONTROL, e)
+
+
 def _prewarm_skills():
     """The home forecast and exchange rates, so the first questions after a
     takeover don't wait on Open-Meteo / the ECB."""
@@ -733,9 +876,12 @@ def _activate(reason: str):
         timer_mirror.push()
     mcp_hub.warm()
     pipeline.B.home.warm()
+    if security is not None:
+        security.start()
     if music is not None:
         music.refresh_names()   # names STT may mishear, for re-hearing
     Thread(target=_prewarm_skills, daemon=True, name="prewarm").start()
+    _hold_gpu_awake(True)
     try:
         _get_whisper()
         _ollama_load(-1)
@@ -800,10 +946,13 @@ def _deactivate(reason: str):
     mqtt_publish("antigua/status", {"state": "primary_restored"})
     timers.drop_adopted()
     mcp_hub.close()
+    if security is not None:
+        security.stop()
     try:
         _ollama_load(0)
     except Exception as e:
         log.warning("LLM unload failed: %s", e)
+    _hold_gpu_awake(False)
     _llm_warm = False
     with _whisper_lock:
         _whisper_model = None
@@ -876,7 +1025,7 @@ def main():
     server = ThreadingHTTPServer(("0.0.0.0", FALLBACK_PORT), FallbackHandler)
     log.info("HTTP on 0.0.0.0:%d", FALLBACK_PORT)
     log.info("Mode:    TTS-only until %s is down", PRIMARY_HEALTH_URL)
-    log.info("STT:     faster-whisper tiny (CPU)")
+    log.info("STT:     faster-whisper %s (CPU)", FW_MODEL)
     log.info("Ollama:  %s @ %s", OLLAMA_MODEL, OLLAMA_HOST)
     log.info("TTS:     %s", REMOTE_TTS_URL)
     log.info("Memory:  %s", core_settings.MEMORY_STORE_PATH)

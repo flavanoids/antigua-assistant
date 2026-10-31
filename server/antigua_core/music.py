@@ -271,6 +271,7 @@ class MusicControl:
         self._duck_lock = RLock()   # _apply_listening holds it across _duck/_unduck
         self._duck_timer: Timer | None = None
         self._listening = False               # latest antigua/listening state
+        self._url_started: tuple[float, str, str] | None = None   # last play_url: (when, player, url)
 
     # ── players ──────────────────────────────────────────────────────────
 
@@ -984,7 +985,31 @@ class MusicControl:
         with self._lock:
             player = self._player_name(speaker_key)
             self._play(player, {"uri": url, "label": title})
+            self._url_started = (time.time(), player, url)
             return self._where(player)
+
+    REWIND_WITHIN = 120        # seconds after a podcast starts that a duck lifting rewinds it
+
+    def on_unducked(self, since: float):
+        """The kitchen's duck (from `since`) just lifted. A podcast that started
+        under it was near-silent so far: start it again from the top."""
+        if not self._url_started:
+            return
+        at, player, url = self._url_started
+        if not since - 1 <= at or time.time() - at > self.REWIND_WITHIN:
+            return
+        self._url_started = None
+        try:
+            pid = self._player_id(player)
+            q = self.ma.cmd("player_queues/get", queue_id=pid, timeout=3) or {}
+            uri = ((q.get("current_item") or {}).get("media_item") or {}).get("uri") or ""
+            if q.get("state") != "playing" or not uri.endswith(url):   # builtin://sound_effect/<url>
+                return
+            self.ma.cmd("player_queues/seek", queue_id=pid, position=0)
+            log.info("Podcast: rewound to the start after the duck lifted (%.0fs in)",
+                     q.get("elapsed_time") or 0)
+        except MusicError as e:
+            log.warning("Podcast: rewind failed: %s", e)
 
     # ── corrections ("no, the Adele one") ─────────────────────────────────
 

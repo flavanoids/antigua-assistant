@@ -54,6 +54,9 @@ from antigua_core.music_router import llm_route_music
 from antigua_core.router import llm_route_search
 from antigua_core.speaker_id import SpeakerProfiles
 from antigua_core.alarm_http import AlarmRoutes
+from antigua_core.recipe_http import RecipeRoutes
+from antigua_core.mesh import MeshAuth, MeshIdentity, MeshSkillsRouter, MeshSync, MeshWorker, PeerRegistry
+from antigua_core.mesh.http_api import MeshRoutes
 from antigua_core import announce as announce_mod
 from antigua_core import phone_http
 from antigua_core import presence as presence_mod
@@ -232,6 +235,7 @@ if _sec_cfg.get("ha_url"):
             security_skill.EventLog(core_settings.DATA_DIR / "security_events.db"),
             pineda=pineda,
             announce=lambda text: _on_security_announce(text),
+            chime=lambda: _play_static("door_chime.wav"),
         )
         # Weekday "good morning" when the first trip out the back door comes
         # back in (antigua_core/morning.py); rides the same HA connection.
@@ -265,6 +269,12 @@ def _speak_unprompted(text: str) -> bool:
         )
         mqtt_publish("antigua/play", {"audio_url": audio_url})
     return bool(wav_path)
+
+
+def _play_static(name: str) -> None:
+    """A sound from static_audio on the satellite, unprompted."""
+    mqtt_publish("antigua/play", {
+        "audio_url": f"http://{get_local_ip()}:{cfg['server']['port']}/audio/{name}"})
 
 
 def _on_security_announce(text: str) -> None:
@@ -325,6 +335,20 @@ def _on_timer_fire(label: str, kind: str = "timer", message: str | None = None):
 memory_store = MemoryStore()
 list_store = ListStore()
 speaker_profiles = SpeakerProfiles()
+
+mesh_identity = MeshIdentity()
+mesh_peers = PeerRegistry()
+mesh_auth = MeshAuth()
+mesh_sync = MeshSync(memory_store=memory_store, list_store=list_store, node_id=mesh_identity.node_id)
+mesh_worker = MeshWorker(identity=mesh_identity, peers=mesh_peers, sync=mesh_sync)
+core_settings.mesh_notify_mutation = mesh_worker.notify_mutation
+mesh_router = MeshSkillsRouter(
+    identity=mesh_identity,
+    peers=mesh_peers,
+    local_dispatcher=lambda text, spk, conv: pipeline.dispatch_text(
+        text, conversation_id=conv or "", speaker=spk, quiet=True
+    ),
+)
 
 
 def route_music_with_llm(transcript: str):
@@ -414,6 +438,7 @@ def _on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
     # Resubscribe on every (re)connect — paho doesn't restore subscriptions.
     topics = [
         ("antigua/listening", 1),
+        ("antigua/unducked", 1),
         ("antigua/stop", 1),
         ("antigua/alarm_ack", 1),
         ("antigua/alarm_sync_request", 1),
@@ -501,6 +526,13 @@ def _on_mqtt_message(client, userdata, msg):
         "frigate/events",
     ):
         _handle_security_mqtt(msg.topic, msg.payload)
+        return
+    if music is not None and msg.topic == "antigua/unducked":
+        try:
+            since = float(json.loads(msg.payload).get("since"))
+        except (ValueError, AttributeError, TypeError):
+            return
+        Thread(target=music.on_unducked, args=(since,), daemon=True, name="music-rewind").start()
         return
     if music is None or msg.topic != "antigua/listening":
         return
@@ -1087,6 +1119,7 @@ pipeline.init(pipeline.Backend(
     presence=presence if presence.enabled else None,
     arrivals=arrivals,
     announcer=announcer,
+    mesh_router=mesh_router,
 ))
 
 run_pipeline = pipeline.run_pipeline
@@ -1112,8 +1145,16 @@ def cleanup_loop():
 # ── HTTP Server ──────────────────────────────────────────────────────────────
 
 
-class AntiguaHandler(AlarmRoutes, BaseHTTPRequestHandler):
+class AntiguaHandler(AlarmRoutes, RecipeRoutes, MeshRoutes, BaseHTTPRequestHandler):
     alarm_timers = timers
+    mesh_identity = mesh_identity
+    mesh_peers = mesh_peers
+    mesh_auth = mesh_auth
+    mesh_sync = mesh_sync
+    mesh_router = mesh_router
+
+    def recipe_show(self, rid):
+        return pipeline.open_from_menu(rid)
 
     def log_message(self, fmt, *args):
         log.debug("HTTP: %s", fmt % args)
@@ -1150,7 +1191,7 @@ class AntiguaHandler(AlarmRoutes, BaseHTTPRequestHandler):
             # Mirrored by the fallback on the backup, which rings these if this
             # box is down when they're due.
             self._json(200, {"timers": timers.snapshot()})
-        elif self.route_alarms("GET"):
+        elif self.route_alarms("GET") or self.route_recipes("GET") or self.route_mesh("GET"):
             pass
         else:
             self._json(404, {"error": "not found"})
@@ -1165,7 +1206,7 @@ class AntiguaHandler(AlarmRoutes, BaseHTTPRequestHandler):
             self._handle_pipeline_text()
         elif parsed.path == "/handoff":
             self._handle_handoff()
-        elif self.route_alarms("POST"):
+        elif self.route_alarms("POST") or self.route_recipes("POST") or self.route_mesh("POST"):
             pass
         else:
             self._json(404, {"error": "not found"})
@@ -1175,7 +1216,7 @@ class AntiguaHandler(AlarmRoutes, BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def do_DELETE(self):
-        if not self.route_alarms("DELETE"):
+        if not (self.route_alarms("DELETE") or self.route_recipes("DELETE") or self.route_mesh("DELETE")):
             self._json(404, {"error": "not found"})
 
     def _handle_handoff(self):
@@ -1289,6 +1330,7 @@ class AntiguaHandler(AlarmRoutes, BaseHTTPRequestHandler):
                 "expects_reply": result.get("expects_reply", False),
                 "chat_mode": result.get("chat_mode", False),
                 "recipe_mode": result.get("recipe_mode", False),
+                "starts_playback": result.get("starts_playback", False),
             },
         )
 
@@ -1412,6 +1454,7 @@ def main():
     netstatus.monitor.start()
 
     presence.start()
+    mesh_worker.start()
     # The Ask Antigua shortcut on the household's phones (LAN port + key).
     phone_http.start(cfg, lambda text, conv, person: pipeline.dispatch_text(
         text, conversation_id=conv, follow_up=True, quiet=True, speaker=person,

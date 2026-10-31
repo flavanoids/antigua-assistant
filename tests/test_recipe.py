@@ -31,11 +31,11 @@ settings.configure({"household": [{"name": "Alex"}]})
 from antigua_core import pipeline, recipe_session  # noqa: E402
 from antigua_core.classify import classify  # noqa: E402
 from antigua_core.grounding import recipe_claims_ok  # noqa: E402
-from antigua_core.intents.recipe import (parse_cook_command, parse_recipe_request,  # noqa: E402
-                                         requested_servings)
+from antigua_core.intents.recipe import (parse_cook_command, parse_recipe_pick,  # noqa: E402
+                                         parse_recipe_request, requested_servings)
 from antigua_core.recipe import (Recipe, fmt_qty, parse_amount, parse_recipe_html, parse_yield,  # noqa: E402
                                  rank, scale_line, scale_step_text, spoken_title, step_parts)
-from antigua_core.recipe_session import CookSession, timer_minutes  # noqa: E402
+from antigua_core.recipe_session import CookSession, step_timer, timer_minutes  # noqa: E402
 from antigua_core.recipe_subs import core_name, match_ingredient  # noqa: E402
 from antigua_core.stores import ListStore, MemoryStore, TimerManager  # noqa: E402
 
@@ -129,6 +129,15 @@ def _load(name):
 
 
 REQUEST_CASES = [
+    # Several to choose from on the kiosk (2026-10-25)
+    ("What's up? Show me recipes for chia seed pudding.", "chia seed pudding"),
+    ("What's up? Show me recipes", None),
+    ("show me recipes", None),
+    ("Show me recipes for chia seed pudding", "chia seed pudding"),
+    ("pull up some recipes for apple pie", "apple pie"),
+    ("can you show me a few recipes for tacos", "tacos"),
+    ("show me some chia pudding recipes", "chia pudding"),
+    ("what are some recipes for chili", "chili"),
     ("how do I make cheesecake", "cheesecake"),
     ("How do you make chicken noodle soup?", "chicken noodle soup"),
     ("give me a recipe for banana bread", "banana bread"),
@@ -521,7 +530,7 @@ def _check_dialogue():
                  "serves 12", "For the crust:", "For the filling:", "a 9-inch springform pan",
                  "Do you have everything?")
     assert "Heads up: it needs to chill at least 6 hours" in got, got
-    assert asked[0], "a recipe question takes its answer without the wake word"
+    assert not asked[0], "answers wait for the wake word (user decision 2026-10-25)"
 
     expect("no, I don't have sour cream",
            "Instead of the sour cream, you can use the same amount of plain Greek yogurt")
@@ -537,7 +546,7 @@ def _check_dialogue():
     assert any(a.startswith("Step 1 of 8.") for a in recipe_session.likely_next()), \
         recipe_session.likely_next()
     expect("yes", "Step 1 of 8.", "Preheat the oven to 350 degrees", "say Alexa, next")
-    assert asked[0], "while a recipe is open, a step takes the next word without the wake word"
+    assert not asked[0], "the mic doesn't open after a step: the prompt names the wake word"
     # "Okay" / "not yet" to the step prompt: acknowledged, no move, no "didn't catch that".
     expect("okay", "Okay.")
     expect("not yet", "take your time")
@@ -555,10 +564,17 @@ def _check_dialogue():
     expect("how much sour cream was it", "1/2 cup sour cream", "using plain yogurt instead")
     expect("what temperature is the oven", "350 degrees")
     expect("how many steps are left", "step 2 of 8", "6 more")
-    expect("go to step 7", "Step 7 of 8.", "Want me to set a timer for 30 minutes?")
-    expect("yes", "Timer set")
+    # A timed step's timer starts on a cue, named for what it times.
+    expect("go to step 7", "Step 7 of 8.",
+           "When it's in the oven, say Alexa, start the timer, and I'll time 30 minutes for the cheesecake.")
+    assert not timers.list_active(), "reading the step doesn't start it"
+    # Moved on while it bakes: step 8's chill waits too, and "in the oven"
+    # still starts the bake, not the chill.
+    expect("next", "Step 8 of 8, the last one.", "I'll time 6 hours for the cheesecake chill.")
+    expect("okay it's in the oven", "Okay, 30 minutes on the cheesecake timer.")
     active = timers.list_active()
     assert any("cheesecake" in (r.get("label") or "") for r in active), active
+    expect("go to step 7", "Step 7 of 8.")
     expect("how long in the oven again", "Bake for 30 minutes at 325 degrees")
 
     # Other skills still work mid-recipe.
@@ -617,6 +633,39 @@ def _check_dialogue():
     recipe_session._session = None
     expect("repeat that", "Step 2 of 8.")
     recipe_session.clear()
+    return 0
+
+
+def _check_step_timers():
+    """Timed steps: found, named for the step, started on a cue."""
+    assert step_timer("Preheat the oven to 350 degrees and bake for 20 minutes.") == (20, "bake", True)
+    assert step_timer("Bake 25 to 30 minutes, until golden.") == (25, "bake", False)
+    assert step_timer("Bake in the preheated oven for 15 minutes.") == (15, "bake", False)
+    assert step_timer("Cover and refrigerate for 4 hours.") == (240, "refrigerate", False)
+    assert step_timer("Let it rest for 10 minutes before slicing.") == (10, "rest", False)
+    assert step_timer("Simmer 3 minutes.") is None                  # watched, not timed
+    assert step_timer("Preheat the oven to 400 degrees.") is None   # no time to set
+    assert step_timer("Stir in 20 grams of sugar.") is None
+
+    cake = _load("cheesecake")
+    cake.steps = ["Preheat the oven to 350 degrees and bake the crust for 20 minutes.",
+                  "Chill for 2 hours.", "Serve."]
+    s = CookSession("cheesecake", [cake])
+    got = s._say_step(0).text
+    assert "Tell me when the oven's preheated, and I'll time 20 minutes for the cheesecake." in got, got
+    got = s._say_step(1).text
+    assert "When it's in the fridge, say" in got and "2 hours for the cheesecake chill" in got, got
+    r = s.handle("the oven's preheated")                 # the bake, though the chill came later
+    assert (r.timer_minutes, r.timer_label) == (20, "cheesecake"), r
+    r = s.handle("start the timer")
+    assert (r.timer_minutes, r.timer_label) == (120, "cheesecake chill"), r
+    r = s.handle("start the timer")                      # nothing waiting: the step that's up
+    assert r.timer_minutes == 120, r
+    s._say_step(1)
+    r = s.handle("no")
+    assert not s.timers and r.timer_minutes == 0, (s.timers, r)
+    r = s.handle("it's in the fridge")                   # the step that's up, asked again
+    assert r.timer_minutes == 120, r
     return 0
 
 
@@ -1005,6 +1054,104 @@ def _check_swaps_and_parts():
     return 0
 
 
+PHOTO_PAGE = """<html><head>
+<script type="application/ld+json">{"@type": "Recipe", "name": "The Best Old-Fashioned Apple Pie",
+ "image": [{"url": "https://pie.example/wp-content/uploads/Apple-Pie-Hero.jpg"},
+           "https://pie.example/wp-content/uploads/Apple-Pie-Hero-1200x800.jpg"],
+ "recipeIngredient": ["6 apples", "1 cup sugar", "1 pie crust"],
+ "recipeInstructions": ["Fill the crust.", "Bake for 50 minutes."]}</script></head><body>
+<img src="/wp-content/themes/x/logo.png" width="300">
+<img data-src="https://pie.example/wp-content/uploads/Apple-Pie-Hero-768x512.jpg" src="data:image/gif;base64,R0">
+<img src="https://pie.example/wp-content/uploads/apple-pie-step-2.jpg" width="1200">
+<img srcset="https://pie.example/wp-content/uploads/Apple-Pie-3-300x200.jpg 300w,
+             https://pie.example/wp-content/uploads/Apple-Pie-3-1024x683.jpg 1024w,
+             https://pie.example/wp-content/uploads/Apple-Pie-3-2048x1365.jpg 2048w">
+<img src="https://pie.example/wp-content/uploads/Dutch-Apple-Crumble.jpg" width="1200">
+<img src="https://pie.example/wp-content/uploads/Blueberry-Pie-360x240.jpg">
+<img src="https://pie.example/wp-content/uploads/Apple-Pie-4-360x240.jpg">
+<img src="https://pie.example/wp-content/uploads/author-headshot-apple-pie.jpg" width="800">
+</body></html>"""
+
+
+def _check_photos():
+    """The recipe's own photos for the kiosk's choices, and the answer to
+    "which one would you like?"."""
+    r = parse_recipe_html(PHOTO_PAGE, "https://pie.example/apple-pie/")
+    assert r.images == [
+        "https://pie.example/wp-content/uploads/Apple-Pie-Hero.jpg",          # its JSON-LD photo, once
+        "https://pie.example/wp-content/uploads/Apple-Pie-3-1024x683.jpg",    # biggest srcset under 1600
+        "https://pie.example/wp-content/uploads/apple-pie-step-2.jpg",        # steps after the dish
+    ], r.images                     # not the logo, another dish, small tiles or the author
+    assert Recipe.from_dict({k: v for k, v in r.to_dict().items() if k != "images"}).images is None
+
+    sources = ["Allrecipes", "Natasha's Kitchen", "Minimalist Baker"]
+    for text, want in [("B", ("pick", 1)), ("Bee.", ("pick", 1)), ("see", ("pick", 2)),
+                       ("Let's do C.", ("pick", 2)), ("I'll take the second one", ("pick", 1)),
+                       ("the last one", ("pick", 2)), ("option A please", ("pick", 0)),
+                       ("B looks good", ("pick", 1)), ("the one from Allrecipes", ("pick", 0)),
+                       ("Natasha's", ("pick", 1)), ("never mind", ("cancel", None)),
+                       ("none of them", ("cancel", None)), ("D", None), ("I'll take a look", None),
+                       ("next", None), ("yes", None), ("kitchen", None), ("what time is it", None),
+                       # Live 2026-10-25: STT heard a lone "A" as "Hey.", and kept a lead-in.
+                       ("Hey.", ("pick", 0)), ("- Hey.", ("pick", 0)), ("Eh.", ("pick", 0)),
+                       ("She.", ("pick", 2)), ("What's up? Show me A.", ("pick", 0)),
+                       ("hey there", None), ("Hey, what time is it?", None)]:
+        got = parse_recipe_pick(text, 3, sources)
+        assert got == want, (text, got, want)
+    assert parse_recipe_pick("C", 2, sources[:2]) is None
+
+    # Recipes cached before photos get their page fetched once; the
+    # cookbook and the search cache keep what's found.
+    from antigua_core.recipe import Cookbook, RecipeFinder
+    with tempfile.TemporaryDirectory() as tmp:
+        finder = RecipeFinder(cookbook=Cookbook(Path(tmp) / "book"))
+        finder._dir = Path(tmp) / "cache"
+        finder._dir.mkdir()
+        old = [Recipe.from_dict({**r.to_dict(), "url": f"https://pie.example/{n}", "images": None})
+               for n in range(3)]
+        finder._cache_path("apple pie").write_text(json.dumps(
+            {"fetched": 9e9, "dish": "apple pie", "recipes": [x.to_dict() for x in old]}))
+        fetched = []
+
+        def fetch(url):
+            fetched.append(url)
+            return None if url.endswith("/1") else r          # page 1 has no photos now
+        finder._fetch_one = fetch
+        finder._loadable = lambda rs: rs                       # no network here
+        got = finder.with_photos("apple pie", old, want=3)
+        assert [x.url for x in got] == ["https://pie.example/0", "https://pie.example/2"], got
+        assert sorted(fetched) == [x.url for x in old]
+        kept = json.loads(finder._cache_path("apple pie").read_text())["recipes"]
+        assert [k["images"] for k in kept] == [r.images, [], r.images]
+        fetched.clear()
+        again = [Recipe.from_dict(k) for k in kept]
+        assert len(finder.with_photos("apple pie", again)) == 2 and fetched == []
+
+    # A photo the site's image server refuses (Food Network's CDN: 403) is
+    # dropped before it reaches the kiosk; a recipe with none left is skipped.
+    from antigua_core import recipe as recipe_mod
+
+    def _serve(request):
+        url = str(request.url)
+        return recipe_mod.httpx.Response(
+            403 if "blocked" in url else 200,
+            headers={"content-type": "text/html" if url.endswith(".html") else "image/jpeg"})
+    real_client = recipe_mod.httpx.Client
+    recipe_mod.httpx.Client = lambda **kw: real_client(transport=recipe_mod.httpx.MockTransport(_serve), **kw)
+    try:
+        a, b, c = (Recipe.from_dict({**r.to_dict(), "url": f"https://x.example/{n}"}) for n in "abc")
+        a.images = ["https://ok.example/1.jpg", "https://blocked.example/2.jpg"]
+        b.images = ["https://blocked.example/3.jpg"]
+        c.images = ["https://ok.example/page.html", "https://ok.example/4.jpg"]
+        got = RecipeFinder(cookbook=Cookbook(Path(tempfile.mkdtemp()))).with_photos("pie", [a, b, c])
+        assert [(x.url[-1], x.images) for x in got] == [
+            ("a", ["https://ok.example/1.jpg"]), ("c", ["https://ok.example/4.jpg"])], got
+        assert a.images[1].startswith("https://blocked")         # the finder's own copy untouched
+    finally:
+        recipe_mod.httpx.Client = real_client
+    return 0
+
+
 def _check_cookbook():
     """The offline cookbook: only popular recipes, found by name or alias,
     and a hit needs no network."""
@@ -1045,7 +1192,8 @@ def _check_cookbook():
 if __name__ == "__main__":
     failed = (_check_parsers() + _check_amounts() + _check_pages() + _check_session_math()
               + _check_claims() + _check_routing() + _check_dialogue() + _check_scaling()
-              + _check_questions() + _check_spoken() + _check_swaps_and_parts() + _check_cookbook())
+              + _check_questions() + _check_spoken() + _check_swaps_and_parts() + _check_cookbook()
+              + _check_photos() + _check_step_timers())
     if failed:
         print(f"{failed} failure(s)")
         sys.exit(1)

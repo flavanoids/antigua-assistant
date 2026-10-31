@@ -8,7 +8,7 @@ whisper:
   # 16 kitchen clips it got every "pause" and "play Bad Bunny" base garbled
   # ("Come on, let's go", "It's like bad money"), for ~0.66s vs ~0.4s.
   fw_model: small.en            # CPU fallback + hotword re-hearing
-  # Primary STT: whisper.cpp large-v3-turbo on the RX 6650 XT (Vulkan),
+  # Primary STT: whisper.cpp large-v3-turbo on the GPU (Vulkan),
   # antigua-whisper.service. ~0.30s vs small.en's ~0.68s, and it gets
   # "Pause"/"Play Bad Bunny" over music that small.en garbles.
   gpu_url: http://127.0.0.1:8178/inference
@@ -40,6 +40,9 @@ ollama:
   interaction_keep_alive: -1  # never unload — speed matters more than the
                                # idle VRAM cost; a warmup unit also loads it
                                # at boot / ollama restart before any request
+fallback:              # the backup box's own model (antigua_fallback_server.py)
+  model: antigua-fallback-llm  # a pinned copy: server/scripts/use_model.sh --fallback <model>
+  num_ctx: 8192
 tts:
   # Speak a first LLM sentence longer than this in two parts, split at a comma:
   # audio starts ~0.5-0.9s sooner, at the cost of a seam. 0 = off.
@@ -60,6 +63,9 @@ display:
 # data server (Honeywell_SmartAC ac-data-server). Remove to turn it off.
 climate:
   url: http://127.0.0.1:8321
+  # Windows-open mode by voice ("I'm gonna open the windows"): runs the AC
+  # controller's windows.py on this host. Leave out where the controller isn't local.
+  windows_script: /root/.hermes/skills/smart-home/resideo-smart-cooling/scripts/windows.py
 
 sysinfo:                # "is everything running?" also checks these boxes answer (antigua_core/sysinfo.py)
   peers: []
@@ -89,6 +95,12 @@ security:              # Eufy cameras + front door lock via Home Assistant (anti
   # eufy_restart_button: input_button.antigua_restart_eufy_bridge
   motion_cooldown_seconds: 60          # minimum time between spoken motion announcements
   motion_hours: "07:00-23:00"          # hours when motion is announced unprompted
+  # A door that's in and out: the first visit speaks, the next within the
+  # window chimes (static_audio/door_chime.wav); more than repeat_limit in
+  # the window chimes until the door's been quiet repeat_cooldown_minutes.
+  # repeat_window_minutes: 5
+  # repeat_limit: 2
+  # repeat_cooldown_minutes: 20
   cameras:
     front_door:
       entity: camera.doorbell
@@ -138,12 +150,11 @@ household:                             # who memories are kept for
   - name: Alex
   - name: Katherine
     nicknames: [kat]                   # also accepted as this person
-  - name: Alex
-    say_as: Al-ex                      # phonetic respelling for Kokoro TTS if needed
+  - name: Sean
+    say_as: Shawn                      # how Kokoro should say it
     devices: []                        # phone MACs for presence: ["aa:bb:cc:dd:ee:ff"]
   - name: Jordan
-  - name: Maria
-  - name: Vivicca
+  - name: Riley
 # Who's home: each household member's phones, by MAC, under `devices:` above
 # (iPhone: Settings > Wi-Fi > (i) next to this network > Private Wi-Fi Address,
 # with "Rotate Wi-Fi Address" off). antigua_core/presence.py ARP-scans for them;

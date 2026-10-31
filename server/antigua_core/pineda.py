@@ -1,6 +1,6 @@
 """PinedaDisplay Web — the dashboard on the airplaypi kiosk screen.
 
-pineda-web runs on this box (primary-server) and drives the kiosk's Chromium; the
+pineda-web runs on this box (noegpu01) and drives the kiosk's Chromium; the
 restart/reboot tools reach airplaypi over SSH on their own (see
 PinedaDisplay_Web docs/OPERATIONS.md#split-host-control). Antigua talks to it
 over MCP (pineda-web's /mcp, a bearer token per client) — never its open
@@ -98,25 +98,38 @@ class PinedaClient:
     def clear_takeover(self) -> None:
         self._tool("takeover_clear")
 
-    def show_image_collage(self, query: str, images: list[dict], seconds: float = 120) -> None:
-        """Put up a full-screen image search collage on the kiosk display."""
+    def show_image_collage(self, query: str, images: list[dict], seconds: float = 30,
+                           groups: list[dict] | None = None) -> None:
+        """Put up a full-screen image search collage on the kiosk display;
+        `groups` ([{label, ids}]) splits a comparison into labelled sides."""
         card = {
             "kind": "image_search",
             "query": query,
             "images": images,
             "highlight": None,
         }
+        if groups:
+            card["groups"] = groups
         self.show_takeover(card, seconds)
 
-    def highlight_image(self, identifier: str) -> None:
-        """Highlight an image ('A', 'B', '1', '2'...) on the active collage."""
-        self.update_takeover({"highlight": identifier.upper()})
+    def highlight_image(self, identifier: str, seconds: float | None = None) -> None:
+        """Open an image ('A', 'B'...) full screen on the collage that's up;
+        `seconds` gives the card that long from now."""
+        change: dict = {"highlight": identifier.upper()}
+        if seconds:
+            change["seconds"] = seconds
+        self.update_takeover(change)
 
     def hold_clock(self, on: bool) -> int:
         """Clock only on the live screens (the Clock only style each screen
         has picked: plain or photos), or back to the dashboard. How many
         screens changed; 0 when they were all that way already."""
         return self._tool("clock_mode", on=on)["changed"]
+
+    def turn_screen(self, to: str) -> dict:
+        """Turn the kiosk's screen "wide", "tall", "flip" it over, or "turn"
+        it between the two: {rotation, changed}."""
+        return self._tool("screen_turn", to=to)
 
     # ── cameras: pineda-web starts and stops the livestream with the card ──
 
@@ -163,16 +176,20 @@ def timers_payload(active: list[dict]) -> list[dict]:
         kind = e.get("kind", "timer")
         if e.get("paused"):
             continue
+        # The name the user gave (a reminder's is what to do), shown beside
+        # its time on the clock; None for "3 minute timer" and the like.
+        name = (e.get("message") if kind == "reminder" else e.get("name")) or None
         if kind == "alarm":
-            label = e.get("name") or "Alarm"
+            label = name or "Alarm"
         elif kind == "reminder":
-            label = e.get("message") or "Reminder"
+            label = name or "Reminder"
         else:
-            label = e.get("name") or e["label"]
+            label = name or e["label"]
         out.append({
             "id": e["id"],
             "label": label,
             "kind": kind,
+            "name": name,
             "fires_at": datetime.fromtimestamp(e["fires_at"], timezone.utc).isoformat(),
         })
     return out
@@ -318,6 +335,24 @@ def recipe_card(recipe, line=None, step: int | None = None, *, stage: str | None
     }
 
 
+def recipe_choices_card(dish: str, recipes: list) -> dict:
+    """Recipes to choose between → pineda-web's RecipeChoicesTakeover: one
+    column per recipe, lettered A, B, C, with its photos ("A1", "A2"...)."""
+    images, choices = [], []
+    for n, r in enumerate(recipes):
+        letter = chr(ord("A") + n)
+        ids = []
+        for k, url in enumerate(r.images or [], 1):
+            ids.append(f"{letter}{k}")
+            images.append({"id": ids[-1], "url": url, "title": display_title(r.title),
+                           "source": r.source})
+        choices.append({"id": letter, "title": display_title(r.title), "source": r.source,
+                        "rating": round(r.rating, 1) if r.rating_count else 0,
+                        "rating_count": r.rating_count, "total_min": r.total_min,
+                        "servings": r.servings, "images": ids})
+    return {"kind": "recipe_choices", "dish": dish, "images": images, "choices": choices}
+
+
 def _live(card: dict) -> dict:
     return {k: card.get(k) for k in LIVE_FIELDS}
 
@@ -371,6 +406,13 @@ class RecipeDisplay:
             self._path.write_text(json.dumps(card))
         except OSError as e:
             log.warning("Pineda: couldn't keep the recipe card: %s", e)
+
+    def show_choices(self, card: dict, seconds: float | None = None) -> None:
+        """The recipes to choose between (recipe_choices_card), in the same
+        queue as the recipe card. Not kept for "show the recipe again"; the
+        recipe picked then goes up whole, not as an update."""
+        self._shown = None
+        self._background(lambda: self._client.show_takeover(card, seconds or self.seconds))
 
     def show(self, card: dict | None = None) -> bool:
         """Put `card` (or the last one) up again. False when there's none."""

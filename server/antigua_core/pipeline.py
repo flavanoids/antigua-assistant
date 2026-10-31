@@ -14,6 +14,7 @@ memory_query and a timer fired both. Dispatching on classify() resolves that:
 the first matching route wins, as the fixtures assert.
 """
 
+import copy
 import logging
 import os
 import random
@@ -26,8 +27,11 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Thread
 from typing import Callable, Iterator, Optional
 
-from . import chat, household, household_memory, jokes, persona, settings, turn_timing
+from num2words import num2words
+
+from . import chat, clean, household, household_memory, jokes, persona, settings, turn_timing
 from .caches import pin_year
+from .router import Research
 from .classify import (
     _EVENT_WHEN_RE,
     _FOLLOWUP_RE,
@@ -91,17 +95,25 @@ from .classify import (
     parse_volume_request,
     strip_wake_prefix,
 )
+from .home_control import spoken_seconds
 from .music import MusicError
 from .music_intents import MusicIntent, parse_correction, parse_music
-from .recipe import _EQUIPMENT_RE as _RECIPE_EQUIPMENT_RE
-from .intents.pineda import parse_clock_mode, parse_recipe_display
-from .intents.recipe import parse_swap_question
+from .recipe import _EQUIPMENT_RE as _RECIPE_EQUIPMENT_RE, spoken_title
+from .intents.pineda import (
+    parse_clock_mode,
+    parse_image_nav,
+    parse_recipe_display,
+    parse_screen_turn,
+)
+from .intents.recipe import (is_bare_recipe_request, parse_dish_answer, parse_recipe_box, parse_recipe_pick,
+                             parse_swap_question)
 from .recipe_subs import core_name as _recipe_core_name, step_ingredients, table_swap
 from .spanish import reply_in_spanish, to_english_command
 from .stores import _MEMORY_TAGS, TimerSpec as _TimerSpec, _interval_s, _repeat_matches, _repeat_phrase
 from . import calc as calc_skill
 from .intents.commute import parse_commute_request
-from . import howto, mcp_client, podcast
+from . import howto, mcp_client, podcast, recipe_box, research
+from . import image_search
 from . import pineda as pineda_skill
 from . import security as security_skill
 from . import climate as climate_skill
@@ -206,6 +218,8 @@ class Backend:
     arrivals: object = None
     # Speaking on other rooms' speakers (announce.Announcer); None = none set up.
     announcer: object = None
+    # Distributed mesh skills router: delegates turns across paired Antigua nodes
+    mesh_router: object = None
 
 
 B: Backend = None  # set by init()
@@ -866,7 +880,9 @@ def _handle_music(t, intent=None):
     if not reply:
         return _resp(t, "", None, action=action)   # transport controls are silent
     # "Want me to play one?" / "What would you like to hear?"
-    return _speak(t, reply, action=action, expects_reply=_asks(reply))
+    asks = _asks(reply)
+    return _speak(t, reply, action=action, expects_reply=asks,
+                  starts_playback=intent.kind == "play" and not asks)
 
 
 def _handle_music_fallback(t):
@@ -925,7 +941,8 @@ def _play_podcast(t, ep, speaker, now, lead=""):
     except MusicError as e:
         log.warning("Podcast: play failed: %s", e)
         return _speak(t, "I couldn't reach the music server.")
-    return _speak(t, podcast.playing_reply(ep, now, where, lead), action="podcast_play")
+    return _speak(t, podcast.playing_reply(ep, now, where, lead), action="podcast_play",
+                  starts_playback=True)
 
 
 def _handle_pending_podcast(t):
@@ -996,6 +1013,7 @@ _TV_REPLIES = {
     "tv_back": "Going back on the Living Room TV",
     "tv_play": "Resuming the Living Room TV",
     "tv_pause": "Pausing the Living Room TV",
+    "tv_restart": "Starting it over",
 }
 
 
@@ -1007,8 +1025,13 @@ def _handle_tv(t):
         return None  # TV regex matched but no recognizable command — LLM tail
     action, arg = parsed
     result = B.home.tv(action, arg)
-    if result == "ok":
-        if action == "tv_app":
+    if result not in ("ok", "no_app", "failed"):
+        reply = result                  # tv_status: the sentence itself
+    elif result == "ok":
+        if action in ("tv_skip_forward", "tv_skip_back"):
+            way = "ahead" if action == "tv_skip_forward" else "back"
+            reply = f"Skipping {way} {spoken_seconds(int(arg))}"
+        elif action == "tv_app":
             reply = f"Opening {B.home.spoken_target(action, arg)}"
         elif action == "tv_input":
             reply = f"Switching to {B.home.spoken_target(action, arg)}"
@@ -1162,6 +1185,33 @@ def _session_card():
     return pineda_skill.recipe_card(
         r, session.line, step, stage="steps" if cooking else "ingredients",
         lit=lit, checked=checked, skipped=session.skipped, swaps=session.swaps)
+
+
+_TURNED = {"tall": "Okay, the screen's tall now.", "wide": "Okay, the screen's wide now.",
+           "flip": "Okay, I flipped it over.", "turn": "Okay, I turned the screen."}
+
+
+def _handle_screen_turn(t):
+    """"Turn the screen tall" / "rotate the screen" / "flip the screen
+    over": which way the kiosk's picture stands. Ahead of the clock and the
+    recipe display, whose "switch the display to ..." it would otherwise reach."""
+    to = parse_screen_turn(t.transcript)
+    if to is None:
+        return None
+    P = B.pineda
+    if P is None:
+        return _speak(t, "I can't control the display from here.")
+    log.info("Pineda: turn %s", to)
+    try:
+        r = P.turn_screen(to)
+    except pineda_skill.PinedaError as e:
+        log.warning("Pineda: turn %s failed: %s", to, e)
+        return _speak(t, _PINEDA_DOWN)
+    if r.get("changed"):
+        reply = _TURNED[to]
+    else:
+        reply = "The screen's already " + ("tall." if to == "tall" else "wide.")
+    return _speak(t, reply, action="pineda_turn")
 
 
 def _handle_clock_mode(t):
@@ -1383,8 +1433,15 @@ def _current_pineda_takeover(P):
 def _pineda_image_search(t, P, query: str):
     if B.searxng is None:
         return _speak(t, "Search is currently unavailable.")
+    groups = []
     try:
-        images = B.searxng.search_images(query, count=6)
+        sides = image_search.split_comparison(query)
+        if sides:
+            images, groups = B.searxng.search_image_comparison(*sides)
+            if len(groups) < 2:   # one side found nothing: a plain collage
+                groups = []
+        else:
+            images = B.searxng.search_images(query, count=6)
     except Exception as e:
         log.warning("Image search failed: %s", e)
         return _speak(t, f"I couldn't find pictures of {query}.")
@@ -1395,6 +1452,7 @@ def _pineda_image_search(t, P, query: str):
     entry = {
         "query": query,
         "images": {img["id"].upper(): img for img in images},
+        "groups": groups,
         "expires": time.time() + 300,
     }
     _active_image_searches["latest"] = entry
@@ -1402,13 +1460,34 @@ def _pineda_image_search(t, P, query: str):
         _active_image_searches[t.conversation_id] = entry
 
     try:
-        P.show_image_collage(query, images, seconds=120)
+        P.show_image_collage(query, images, seconds=_IMAGE_SECONDS, groups=groups)
     except pineda_skill.PinedaError as e:
         log.warning("Pineda: image collage failed: %s", e)
         return _speak(t, f"Here's what I found for {query}, but I couldn't reach the display.")
 
-    letters = ", ".join(img["id"] for img in images[:min(4, len(images))])
-    return _speak(t, f"Here are some pictures of {query}. Ask about {letters}, or any of them.", action="pineda_image_search")
+    if groups:
+        sides = [f"{g['label']}, {_letter_span(g['ids'])}" for g in groups]
+        return _speak(t, f"Here are {sides[0]}, and {sides[1]}.", action="pineda_image_search")
+    return _speak(t, _image_search_reply(query, [img["id"] for img in images]), action="pineda_image_search")
+
+
+def _letter_span(ids: list[str]) -> str:
+    """'A through C', 'D and E', 'F'."""
+    if len(ids) == 1:
+        return ids[0]
+    if len(ids) == 2:
+        return f"{ids[0]} and {ids[1]}"
+    return f"{ids[0]} through {ids[-1]}"
+
+
+def _image_search_reply(query: str, ids: list[str]) -> str:
+    """'Here are six pictures of X. Ask about any of them, A through F.'"""
+    if len(ids) == 1:
+        return f"Here's a picture of {query}."
+    if len(ids) == 2:
+        return f"Here are two pictures of {query}. Ask about {ids[0]} or {ids[1]}."
+    return (f"Here are {num2words(len(ids))} pictures of {query}. "
+            f"Ask about any of them, {ids[0]} through {ids[-1]}.")
 
 
 def _pineda_image_detail(t, P, letter: str):
@@ -1449,7 +1528,7 @@ def _pineda_image_detail(t, P, letter: str):
     if P is not None:
         try:
             if is_live:
-                P.highlight_image(letter)
+                P.highlight_image(letter, seconds=_IMAGE_SECONDS)
             else:
                 card = {
                     "kind": "image_search",
@@ -1457,7 +1536,9 @@ def _pineda_image_detail(t, P, letter: str):
                     "images": list(images.values()),
                     "highlight": letter,
                 }
-                P.show_takeover(card, seconds=120)
+                if sess and sess.get("groups"):
+                    card["groups"] = sess["groups"]
+                P.show_takeover(card, seconds=_IMAGE_SECONDS)
         except pineda_skill.PinedaError as e:
             log.warning("Pineda highlight/show failed: %s", e)
 
@@ -1482,6 +1563,56 @@ def _pineda_image_detail(t, P, letter: str):
         reply = intro
 
     return _speak(t, reply, action="pineda_image_detail")
+
+
+# How long a collage stays up, and how long each picture opened from it
+# does (each one opened gets fresh time, and so does going back).
+_IMAGE_SECONDS = 30
+
+
+def _handle_image_nav(t):
+    """While an image search collage is up: "show me A" opens a picture
+    full screen, "next" / "previous" step through them, and "go back" (or
+    "no, go back", "smaller") returns to all of them. Only while one is on
+    screen, so the words still reach the recipe and the music otherwise; a
+    named picture also brings back a collage that just timed out."""
+    nav = parse_image_nav(t.transcript)
+    P = B.pineda
+    if nav is None or P is None:
+        return None
+    step, letter = nav
+    up = _current_pineda_takeover(P)
+    card = up.get("card") if isinstance(up, dict) else None
+    if not isinstance(card, dict) or card.get("kind") != "image_search":
+        recent = _active_image_searches.get(t.conversation_id) or _active_image_searches.get("latest")
+        if step == "zoom" and letter and recent and recent.get("expires", 0) > time.time():
+            return _pineda_image_detail(t, P, letter)
+        return None
+    ids = [str(i.get("id", "")).upper() for i in card.get("images", []) if isinstance(i, dict)]
+    if not ids:
+        return None
+    lit = str(card.get("highlight") or "").upper()
+    if step == "zoom":
+        if letter:
+            return _pineda_image_detail(t, P, letter)
+        if lit:
+            return _speak(t, "That's as big as it goes.", action="pineda_image_zoom")
+        return _speak(t, f"Which one? Say a letter, like show me {ids[0]}.",
+                      action="pineda_image_zoom")
+    if step == "grid":
+        if not lit:
+            return _speak(t, "That's all of them.", action="pineda_image_grid")
+        try:
+            P.update_takeover({"highlight": None, "seconds": _IMAGE_SECONDS})
+        except pineda_skill.PinedaError as e:
+            log.warning("Pineda: back to the collage failed: %s", e)
+            return _speak(t, _PINEDA_DOWN)
+        return _speak(t, "Here they all are.", action="pineda_image_grid")
+    if lit in ids:
+        at = ids.index(lit) + (1 if step == "next" else -1)
+    else:
+        at = 0 if step == "next" else len(ids) - 1
+    return _pineda_image_detail(t, P, ids[at % len(ids)])
 
 
 def _pineda_theme(t, P, action, arg):
@@ -2446,6 +2577,63 @@ def _handle_search(t):
     return None
 
 
+_research_running: dict = {}   # {"question"} while one runs; one at a time
+
+
+def _research(t, question):
+    """Research `question` (research.py): one line now, the answer spoken
+    when it's ready, ~10-30 s later (user decision 2026-10-31). A quiet or
+    phone turn waits for it instead, since there's no speaker to come back
+    to. None when it can't run, so the turn takes the quick path."""
+    if (B.write_json is None or t.language != "en" or not netstatus.online()
+            or not settings.RESEARCH_ENABLED):
+        return None
+    if _research_running:
+        return _speak(t, "I'm still looking into the last thing you asked. "
+                         "I'll tell you as soon as I have it.")
+    if not research.allowed():
+        log.info("Research: hourly cap reached; quick search for %r", question)
+        return None
+    log.info("Research: %r", question)
+
+    def work():
+        res = research.run(question, B.write_json)
+        log.info("Research: %r in %.1fs (%s) steps=%s sources=%s answer=%r", question,
+                 res.seconds, res.kind, res.steps, res.sources, res.answer)
+        if B.remember_exchange and t.conversation_id:
+            # The sources ride along in the history, for "where's that from?"
+            said = res.answer + (f" (Sources: {', '.join(res.sources)}.)" if res.sources else "")
+            B.remember_exchange(t.conversation_id, t.transcript, said)
+        return res
+
+    if t.quiet or t.source == "phone":
+        _research_running["question"] = question
+        try:
+            return _speak(t, work().answer, action="research")
+        finally:
+            _research_running.clear()
+
+    def background():
+        try:
+            _publish_audio(t, work().answer)
+        except Exception:
+            log.exception("Research reply failed for %r", question)
+        finally:
+            _research_running.clear()
+
+    _research_running["question"] = question
+    Thread(target=background, daemon=True, name="research").start()
+    return _speak(t, research.ack(question), action="research")
+
+
+def _handle_research(t):
+    question = research.parse(t.transcript)
+    result = _research(t, question) if question else None
+    if result is None and question and settings.SEARCH_ENABLED:
+        _run_search(t, question, None)   # the quick path: one search, answered now
+    return result
+
+
 def _handle_knowledge(t):
     """Who was / tell me about: an overview grounded in the Wikipedia article,
     which is kept for follow-ups. No article that fits -> plain search."""
@@ -2478,23 +2666,42 @@ def _start_recipe(t, dish, servings=0):
     """Find `dish` online and read its ingredients. Never a made-up recipe:
     no page with recipe data means saying so (see ANTIGUA_SKILLS/recipes/README.md).
     `servings` is the "for 4 people" of the request, or the target carried
-    from the recipe before it."""
+    from the recipe before it. With the kiosk, the best few go up with their
+    photos to choose from first (_offer_recipes)."""
+    offer = _recipe_display() is not None and t.language == "en"
     # A fresh search takes several seconds; say something while it runs.
     streamed = not B.recipes.cached(dish) and t.language == "en"
     if streamed:
-        _publish_audio(t, f"Let me find a good {dish} recipe.")
+        _publish_audio(t, f"Let me find some {dish} recipes." if offer
+                       else f"Let me find a good {dish} recipe.")
     try:
         recipes = B.recipes.find(dish)
     except Exception as e:
         log.warning("Recipe search failed for %r: %s", dish, e)
         recipes = []
+    if offer and 0 < len(recipes) < _PICK_COUNT and hasattr(B.recipes, "search"):
+        # The cookbook keeps 1-3 per dish; choosing wants three.
+        if not streamed and not B.recipes.searched(dish):
+            _publish_audio(t, f"Let me find some {dish} recipes.")
+            streamed = True
+        try:
+            more = B.recipes.search(dish)
+        except Exception as e:
+            log.warning("Recipe search for more %r failed: %s", dish, e)
+            more = []
+        have = {r.url for r in recipes}
+        recipes = recipes + [r for r in more if r.url not in have]
     if not recipes:
         log.info("recipe_not_found: %r", dish)
         reply = f"Sorry, I couldn't find a recipe online for {dish}."
     else:
         # The one picked or cooked last time goes first (household_memory).
         recipes, lead = household_memory.store().recall_recipe(dish, recipes)
+        offered = _offer_recipes(t, dish, recipes, servings, lead, streamed) if offer else None
+        if offered is not None:
+            return offered
         session, reply = recipe_session.start(dish, recipes, servings, lead)
+        recipe_box.box().note_opened(dish, session.recipe, t.speaker)
         log.info("Recipe: %r -> %r from %s (%d candidates)", dish, session.recipe.title,
                  session.recipe.url, len(recipes))
     if not streamed:
@@ -2504,6 +2711,236 @@ def _start_recipe(t, dish, servings=0):
         result = _resp(t, reply, None, streaming=True)
     if recipes:
         _prefetch_recipe_audio(t)
+    return _recipe_reply(result)
+
+
+# Recipes up on the kiosk to choose from (user decision 2026-10-25): people
+# eat with their eyes. "Show me recipes for chia pudding" puts the best
+# three up, each with photos from its own page, and asks which; "B" (or
+# "the second one", "the one from Allrecipes") opens that one. Household-
+# wide like the cooking session: whoever's at the screen answers.
+_recipe_pick: dict = {}
+_PICK_COUNT = 3
+# The choices are up 30 s, then the screen goes back to its clock (user
+# decision 2026-10-25). The answer needs the wake word ("Alexa, B"), so it's
+# still taken for two minutes after they've gone.
+_PICK_SECONDS = 30
+_PICK_LATE_S = 120
+
+
+def _offer_recipes(t, dish, recipes, servings, lead, streamed, count=_PICK_COUNT, say=None, dish_of=None):
+    """The kiosk's recipe choices and the question: always, the first time
+    a dish is asked for (user decision 2026-10-25), photos or not. Recipes
+    with photos come first; ones without fill the rest. A lone recipe goes
+    up on its own: "want to make it?". Favorites and history use it too:
+    `say` (letters -> reply) words the question, `dish_of` (url -> dish)
+    names what each choice is for."""
+    if not recipes:
+        return None
+    if not streamed and any(r.images is None for r in recipes[:6]):
+        _publish_audio(t, f"Let me pull up some {dish} recipes.")   # their pages, again
+        streamed = True
+    try:
+        choices = B.recipes.with_photos(dish, recipes, count)
+    except Exception as e:
+        log.warning("Recipe photos for %r failed: %s", dish, e)
+        choices = []
+    if len(choices) < count:
+        have = {r.url for r in choices}
+        for r in recipes:
+            if len(choices) == count:
+                break
+            if r.url not in have:
+                bare = copy.copy(r)
+                bare.images = []
+                choices.append(bare)
+    # A recipe still open from before (its "do you have everything?" or
+    # "next") would answer the turns meant for these.
+    old = recipe_session.current()
+    if old is not None:
+        log.info("Recipe choices for %r close the open %r", dish, old.dish)
+        recipe_session.clear()
+    _recipe_display().show_choices(pineda_skill.recipe_choices_card(dish, choices), _PICK_SECONDS)
+    _recipe_pick.clear()
+    _recipe_pick.update(dish=dish, recipes=recipes, choices=choices, servings=servings,
+                        dish_of=dish_of or {}, until=time.time() + _PICK_SECONDS + _PICK_LATE_S)
+    letters = [chr(ord("A") + i) for i in range(len(choices))]
+    if say is not None:
+        reply = say(letters, choices)
+    elif len(choices) == 1:
+        reply = (f"I found one recipe for {dish}, from {choices[0].source}. It's on Pineda Display now. "
+                 "Want to make it?")
+    else:
+        asked = " or ".join(letters) if len(letters) == 2 else ", ".join(letters[:-1]) + f", or {letters[-1]}"
+        reply = (f"I've pulled up recipes for {dish}. They're on Pineda Display now. "
+                 f"Which one would you like? {asked}?")
+    if lead and choices[0].url == recipes[0].url:
+        reply += f" A is the one you {'made' if 'you made' in lead else 'picked'} last time."
+    log.info("Recipe choices for %r: %s", dish, ", ".join(f"{letter} {r.source}" for letter, r in zip(letters, choices)))
+    if streamed:
+        _publish_audio(t, reply)
+        result = _resp(t, reply, None, streaming=True, action="recipe_choices")
+    else:
+        result = _speak(t, reply, action="recipe_choices")
+    return result
+
+
+# ── The recipe box (recipe_box.py): favorites and history ───────────────────
+# "Favorite this recipe" keeps the open one (or the one just closed);
+# "show my favorite recipes" and "show my recent recipes" put them up as
+# choices; "make my favorite apple pie" opens it straight away.
+_FAV_TARGET_S = 2 * 3600
+
+
+def _letters_said(letters):
+    return " or ".join(letters) if len(letters) == 2 else ", ".join(letters[:-1]) + f", or {letters[-1]}"
+
+
+def _box_dish(r) -> str:
+    return recipe_box.box()._dish_of(recipe_box.recipe_id(r)) or spoken_title(r.title)
+
+
+def _handle_recipe_box(t):
+    if B.recipes is None or not t.transcript:
+        return None
+    cmd = parse_recipe_box(t.transcript)
+    if cmd is None:
+        return None
+    what, dish = cmd
+    box = recipe_box.box()
+    if what in ("favorite", "unfavorite"):
+        s = recipe_session.current()
+        r = s.recipe if s is not None and s.recipe.kind == "recipe" else box.last_opened(_FAV_TARGET_S)
+        if r is None:
+            return _speak(t, "There's no recipe open to save. Open one, then say "
+                             f"{_wake_word()}, favorite this recipe.", action="recipe_box")
+        name = f"the {spoken_title(r.title)} from {r.source}"
+        if what == "favorite":
+            if not box.add_favorite(r, t.speaker):
+                return _speak(t, "That one's already a favorite.", action="recipe_box")
+            log.info("Recipe box: favorite %r (%s)", r.title, r.url)
+            return _speak(t, f"Saved {name} to your favorites.", action="recipe_box")
+        if not box.remove_favorite(r):
+            return _speak(t, "That one isn't a favorite.", action="recipe_box")
+        return _speak(t, f"Okay, I took {name} out of your favorites.", action="recipe_box")
+    if what == "open_favorite":
+        favs = box.favorites(dish)
+        if not favs:
+            return _speak(t, f"You don't have a favorite {dish} recipe yet. Say {_wake_word()}, "
+                             f"show me recipes for {dish}, to find one.", action="recipe_box")
+        if len(favs) == 1:
+            r = favs[0]
+            session, reply = recipe_session.start(_box_dish(r), [r], requested_servings(t.transcript),
+                                                  "Here's your favorite. ")
+            box.note_opened(session.dish, r, t.speaker)
+            _prefetch_recipe_audio(t)
+            return _recipe_reply(_speak(t, reply))
+        return _box_choices(t, favs, f"your favorite {dish} recipes", "favorite")
+    rows = box.favorites() if what == "favorites" else box.recent(4)
+    if what == "favorites" and dish:
+        rows = box.favorites(dish)
+    if not rows:
+        none = ("You don't have any favorite recipes yet. While one's open, say "
+                f"{_wake_word()}, favorite this recipe." if what == "favorites"
+                else "You haven't opened any recipes yet.")
+        return _speak(t, none, action="recipe_box")
+    label = ("your favorite recipes" if what == "favorites" and not dish else
+             f"your favorite {dish} recipes" if what == "favorites" else "the recipes you've opened lately")
+    return _box_choices(t, rows, label, what)
+
+
+def _box_choices(t, rows, label, what):
+    if _recipe_display() is None:            # no screen: say them
+        names = _join_and([f"the {spoken_title(r.title)}" for r in rows[:4]])
+        if what == "recent":
+            return _speak(t, f"Lately: {names}.", action="recipe_box")
+        return _speak(t, f"{label[0].upper()}{label[1:]}: {names}. Say {_wake_word()}, make my "
+                         "favorite, and the dish, to open one.", action="recipe_box")
+    more = len(rows) - 4
+
+    def say(letters, choices):
+        if len(choices) == 1:
+            return (f"Just one so far: the {spoken_title(choices[0].title)} from {choices[0].source}. "
+                    "It's on Pineda Display now. Want to make it?")
+        tail = ("" if more <= 0 else " There's 1 more in the Recipes tab on the menu." if more == 1
+                else f" There are {more} more in the Recipes tab on the menu.")
+        return (f"Here are {label}. They're on Pineda Display now. "
+                f"Which one would you like? {_letters_said(letters)}?{tail}")
+    return _offer_recipes(t, label, rows[:4], 0, "", False, count=min(4, len(rows)), say=say,
+                          dish_of={r.url: _box_dish(r) for r in rows[:4]})
+
+
+def _join_and(items):
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + f" and {items[-1]}"
+
+
+def _wake_word():
+    return (settings.WAKE_WORDS or ["Alexa"])[0].title()
+
+
+def open_from_menu(rid: str) -> dict | None:
+    """The phone menu's "Show on display": that recipe opens (silently) and
+    its card goes up, ready for "Alexa, I'm ready" or "Alexa, next"."""
+    box = recipe_box.box()
+    r = box.get(rid)
+    if r is None:
+        return None
+    dish = _box_dish(r)
+    recipe_session.start(dish, [r])
+    box.note_opened(dish, r, "menu")
+    D = _recipe_display()
+    if D is not None:
+        D.mirror(_session_card())
+    log.info("Recipe box: opened %r from the menu", r.title)
+    return {"opened": rid, "shown": D is not None}
+
+
+# "Show me recipes" with no dish: "Sure. Recipes for what?", and the next
+# turn ("chia seed pudding") is the dish.
+_recipe_ask: dict = {}
+_RECIPE_ASK_S = 60
+
+
+def _handle_recipe_dish(t):
+    if not _recipe_ask or time.time() > _recipe_ask["until"] or not t.transcript:
+        return None
+    if parse_recipe_request(t.transcript):
+        _recipe_ask.clear()
+        return None              # a whole request: the recipe route takes it
+    dish = parse_dish_answer(t.transcript)
+    if dish is None:
+        return None
+    _recipe_ask.clear()
+    if not dish:
+        return _speak(t, "Okay.", action="recipe_ask_cancel")
+    log.info("Recipe dish answer: %r -> %r", t.transcript, dish)
+    return _start_recipe(t, dish.lower(), requested_servings(t.transcript))
+
+
+def _handle_recipe_pick(t):
+    """The answer to "which one would you like? A, B, or C?" while the
+    choices are up (or just timed out): open that recipe, or "never mind"."""
+    p = dict(_recipe_pick)
+    if not p or time.time() > p["until"] or B.recipes is None or not t.transcript:
+        return None
+    got = parse_recipe_pick(t.transcript, len(p["choices"]), [r.source for r in p["choices"]])
+    if got is None:
+        return None
+    _recipe_pick.clear()
+    if got[0] == "cancel":
+        try:
+            _recipe_display().hide()
+        except pineda_skill.PinedaError as e:
+            log.warning("Pineda: taking the recipe choices down: %s", e)
+        return _speak(t, "Okay.", action="recipe_pick_cancel")
+    chosen = p["choices"][got[1]]
+    dish = p.get("dish_of", {}).get(chosen.url) or p["dish"]
+    ordered = [chosen] + [r for r in p["recipes"] if r.url != chosen.url and not p.get("dish_of")]
+    session, reply = recipe_session.start(dish, ordered, p["servings"], "Good choice. ")
+    recipe_box.box().note_opened(dish, chosen, t.speaker)
+    log.info("Recipe pick %s: %r from %s", chr(ord("A") + got[1]), chosen.title, chosen.url)
+    result = _speak(t, reply)
+    _prefetch_recipe_audio(t)
     return _recipe_reply(result)
 
 
@@ -2547,13 +2984,9 @@ def _handle_howto(t):
 
 
 def _recipe_reply(result: dict) -> dict:
-    """While a recipe is open, every reply about it takes the answer without
-    the wake word: "next", "repeat that" or "how much flour" right after a
-    step, not only the answer to a question. recipe_mode lifts the mic's
-    cap on answers in a row; the step prompts name the wake word for later,
-    since a step can take longer than the answer window."""
-    if recipe_session.current() is not None:
-        result["expects_reply"] = result["recipe_mode"] = True
+    """A recipe turn's reply. The mic doesn't open for the answer: everything
+    said while cooking starts with the wake word (user decision 2026-10-25),
+    which the step prompts name."""
     # The open recipe on the kiosk: up when it opens, rescales or changes,
     # down when it ends (pineda.RecipeDisplay.mirror).
     D = _recipe_display()
@@ -2605,7 +3038,12 @@ def _publish_audio(t, text, lang=None):
 def _handle_recipe(t):
     dish = parse_recipe_request(t.transcript)
     if not dish:
+        if B.recipes is not None and is_bare_recipe_request(t.transcript):
+            # "Show me recipes": which dish? (_handle_recipe_dish takes the answer)
+            _recipe_ask["until"] = time.time() + _RECIPE_ASK_S
+            return _speak(t, "Sure. Recipes for what?", action="recipe_ask")
         return None
+    _recipe_ask.clear()
     if B.recipes is None:
         return _speak(t, "Recipes need the main server, and I can't reach it right now.")
     session = recipe_session.current()
@@ -2633,6 +3071,8 @@ def _handle_recipe_session(t):
     if session is not None:  # the same object, moved on by handle()
         household_memory.store().note_cooking(session.dish, session.recipe, before,
                                               session.stage, t.speaker)
+        if session.stage == "finished" and before != "finished":
+            recipe_box.box().note_cooked(session.recipe)
     if reply.fetch:
         prev = recipe_session.current()
         return _start_recipe(t, reply.fetch, getattr(prev, "pending_servings", 0) if prev else 0)
@@ -2880,7 +3320,10 @@ def _handle_unsupported(t):
 
 def _handle_climate(t):
     kind = parse_climate_request(t.transcript)
-    reply = climate_skill.answer(kind)
+    if kind in ("windows_open", "windows_closed"):
+        reply = climate_skill.windows(kind, resolve_duration(t.transcript))
+    else:
+        reply = climate_skill.answer(kind)
     log.info("Climate: %s -> %r", kind, reply)
     return _speak(t, reply)
 
@@ -3018,6 +3461,7 @@ _HANDLERS = {
     "substitution": _handle_substitution,
     "knowledge": _handle_knowledge,
     "search": _handle_search,
+    "research": _handle_research,
     # "memory_query" and "llm" are handled in the LLM tail.
 }
 
@@ -3227,6 +3671,11 @@ def _llm_tail(t, route):
     # to play it (persona.py). None for anything with a factual shape.
     direction = None
     if route == "llm" and t.extra_context is None and not t.grounding:
+        # Come-ons and bare innuendo bait never reach the model (clean.py).
+        off = clean.brush_off(t.transcript, t.language)
+        if off:
+            log.info("Clean: brushed off %r", t.transcript)
+            return _speak(t, off)
         direction = persona.direct(t.transcript, t.conversation_id)
         if direction:
             log.info("Persona: %s — %s", direction.kind, direction.hint)
@@ -3255,6 +3704,13 @@ def _llm_tail(t, route):
         with turn_timing.timed("search_router"):
             routed = (t.search_route.result() if t.search_route is not None
                       else B.route_search_with_llm(t.transcript))
+        if isinstance(routed, Research):
+            # "Which robot vacuum should I buy": weighed across sources, or
+            # one search when research can't run right now.
+            result = _research(t, str(routed))
+            if result is not None:
+                return result
+            routed = t.transcript
         if routed:
             query = routed
             engines = (
@@ -3317,6 +3773,17 @@ def _llm_tail(t, route):
     ):
         if _stop_epoch != epoch:
             log.info("LLM stream cut off by an interruption")
+            break
+        if not t.grounding and clean.suggestive(sentence):
+            # Nothing suggestive is ever spoken: replace it, or end the reply here.
+            log.info("Clean: dropped %r", sentence)
+            if not first_sentence:
+                break
+            sentence = clean.MISHEARD_ES if t.language == "es" else clean.MISHEARD
+            response_parts.append(sentence)
+            first_sentence = False
+            settings.mqtt_publish("antigua/status", {"state": "speaking"})
+            _publish(sentence, "tts_first")
             break
         response_parts.append(sentence)
         if first_sentence:
@@ -3506,10 +3973,18 @@ _BEFORE_ROUTING = (
     _handle_pending_commute,       # "which Niko Niko's?": "Montrose"
     _handle_pending_reboot,        # "Reboot airplaypi?": "yes"
     _handle_pending_timer_choice,  # "which timer?": "both", "first"
+    _handle_screen_turn,           # "turn the screen tall" / "rotate the screen"
     _handle_clock_mode,            # "clock mode" / "back to the dashboard": ahead of the
                                    # recipe card and the session, which take "go back"
     _handle_recipe_display,        # "show the recipe again": ahead of the session,
                                    # which would take "go back" as a step
+    _handle_recipe_box,            # "favorite this recipe", "show my favorite recipes":
+                                   # ahead of the recipe route, which would take them as dishes
+    _handle_recipe_dish,           # "recipes for what?": "chia seed pudding"
+    _handle_recipe_pick,           # "B" / "the second one" while recipe choices are up:
+                                   # ahead of the pictures' "show me B"
+    _handle_image_nav,             # "next" / "back" while a picture collage is up:
+                                   # ahead of the recipe session and the music
     _handle_howto,                 # "walk me through ...": ahead of the session, so a
                                    # new guide replaces the open recipe or guide
     _handle_recipe_session,        # cooking: "next", "how much salt?" — before music,
@@ -3601,6 +4076,17 @@ def _dispatch_text(transcript, conversation_id="", follow_up=False, *,
             return result
         if route in _OFFLINE_TO_LLM:
             route = "llm"
+
+    # Check if this route should be delegated over the mesh
+    if B is not None and B.mesh_router is not None and getattr(B.mesh_router, "should_delegate", None):
+        if B.mesh_router.should_delegate(route):
+            peer, _ = B.mesh_router.find_peer_for_route(route)
+            if peer:
+                delegated = B.mesh_router.delegate(
+                    peer, t.transcript, route=route, speaker=t.speaker, conversation_id=t.conversation_id
+                )
+                if delegated.get("handled"):
+                    return _speak(t, delegated.get("reply", ""), action=delegated.get("action"))
 
     handler = _HANDLERS.get(route)
     if handler is not None:

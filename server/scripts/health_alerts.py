@@ -42,6 +42,9 @@ SERVER_HEALTH_URL = "http://127.0.0.1:9393/health"
 WHISPER_URL = "http://127.0.0.1:8178/"
 OLLAMA_PS_URL = "http://127.0.0.1:11434/api/ps"
 SATELLITE_SSH = "airplaypi"
+# While this exists the GPU is lent out for coding and Antigua runs on the
+# backup on purpose: TTS, server, whisper and the voice model are down here.
+GPU_LENT = Path("/etc/antigua/gpu_lent")
 BRIDGE_CRASHES_MAX = 3    # reconnects in FALLBACK_WINDOW_MIN before alerting
 DISKS = ["/tmp", "/"]
 DISK_PCT = 80
@@ -217,13 +220,15 @@ def send(text):
 def main():
     now = datetime.now()
     problems = {}
-    tts = [p for p in (check_tts_probe(), check_tts_fallbacks(now)) if p]
+    lent = GPU_LENT.exists()
+    tts = [] if lent else [p for p in (check_tts_probe(), check_tts_fallbacks(now)) if p]
     if tts:
         problems["tts"] = "; ".join(tts)
     if disk := check_disks():
         problems["disk"] = disk
-    for key, msg in (("server", check_server()), ("whisper", check_whisper()),
-                     ("ollama", check_ollama(_voice_model())), ("mic", check_mic(now)),
+    local = () if lent else (("server", check_server()), ("whisper", check_whisper()),
+                             ("ollama", check_ollama(_voice_model())))
+    for key, msg in (*local, ("mic", check_mic(now)),
                      ("satellite", check_satellite()), ("backup", check_backup())):
         if msg:
             problems[key] = msg

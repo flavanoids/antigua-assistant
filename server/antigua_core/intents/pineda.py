@@ -104,6 +104,83 @@ _IMAGE_DETAIL_SHORT_RE = re.compile(
 )
 
 
+# Stepping through a collage that's up. Bare words ("next", "back") on
+# purpose: the handler only takes them while a collage is on screen, so
+# otherwise they still reach the recipe and the music.
+_IMAGE_NAV_LEAD = (r"^(?:(?:alexa|antigua|hey|okay|ok|no|nope|nah|now|um|uh)[\s,]+)*"
+                   r"(?:(?:can|could)\s+you\s+)?(?:please\s+)?")
+_IMAGE_NAV_TAIL = r"(?:\s+please)?\s*[.?!]*$"
+_PIC = r"(?:picture|photo|pic|image|one)"
+_IMAGE_NEXT_RE = re.compile(
+    _IMAGE_NAV_LEAD + rf"(?:(?:show\s+(?:me\s+)?)?(?:the\s+)?next(?:\s+{_PIC})?|go\s+(?:on|forward))"
+    + _IMAGE_NAV_TAIL, re.IGNORECASE)
+_IMAGE_PREV_RE = re.compile(
+    _IMAGE_NAV_LEAD + rf"(?:(?:show\s+(?:me\s+)?)?(?:the\s+)?(?:previous|last)(?:\s+{_PIC})?"
+    rf"|back\s+one|the\s+one\s+before)" + _IMAGE_NAV_TAIL, re.IGNORECASE)
+_IMAGE_GRID_RE = re.compile(
+    _IMAGE_NAV_LEAD + r"(?:(?:go\s+)?back(?:\s+out)?|zoom\s+(?:back\s+)?out|smaller"
+    r"|make\s+(?:it|that|this)\s+smaller(?:\s+again)?|shrink\s+(?:it|that|this)(?:\s+down)?"
+    r"|never\s*mind|that'?s\s+enough|exit\s+full\s*screen|close\s+(?:it|that|this)"
+    r"|show\s+(?:me\s+)?(?:them\s+)?all(?:\s+of\s+them)?"
+    r"|(?:show\s+(?:me\s+)?)?all\s+(?:the\s+|of\s+the\s+)?(?:pictures|photos|images)"
+    r"|(?:go\s+)?back\s+to\s+(?:all\s+)?(?:the\s+)?(?:pictures|photos|images|grid|collage))"
+    + _IMAGE_NAV_TAIL, re.IGNORECASE)
+
+# "Show me A" / "make A bigger": a picture full screen. STT writes the letters as words
+# too ("make a bigger", "blow up bee"), and numbers count ("picture 2").
+_SPOKEN_LETTERS = {
+    "a": "A", "ay": "A", "b": "B", "be": "B", "bee": "B", "c": "C", "see": "C", "sea": "C",
+    "d": "D", "dee": "D", "e": "E", "f": "F", "ef": "F", "eff": "F", "g": "G", "gee": "G",
+    "h": "H", "aitch": "H",
+}
+_LETTER = (r"(?:(?:picture|photo|image|pic|number|letter|tile)\s+)?"
+           r"(?P<{}>ay|bee|be|see|sea|dee|eff|ef|gee|aitch|[a-h]|[1-8]|one|two|three|four|five|six|seven|eight)")
+_LETTER_AFTER_VERB = _LETTER.format("verb")
+_LETTER_FIRST = _LETTER.format("first")
+_BIGGER = r"(?:bigger|larger|big|full\s*screen|up)"
+_IMAGE_ZOOM_RE = re.compile(
+    _IMAGE_NAV_LEAD + r"(?:"
+    rf"(?:make|let\s+me\s+see|show(?:\s+me)?|blow(?:\s+up)?|zoom(?:\s+in)?(?:\s+on|\s+into)?"
+    rf"|enlarge|expand|open(?:\s+up)?|maximi[sz]e|full\s*screen)\s*,?\s+{_LETTER_AFTER_VERB}"
+    rf"(?:\s+{_BIGGER})?"
+    rf"|{_LETTER_FIRST}\s+(?:bigger|larger|full\s*screen)"
+    r")" + _IMAGE_NAV_TAIL, re.IGNORECASE)
+_IMAGE_ZOOM_BARE_RE = re.compile(
+    _IMAGE_NAV_LEAD + r"(?:(?:make\s+(?:it|that|this)\s+)?(?:bigger|larger|full\s*screen)"
+    r"|zoom\s+in|blow\s+(?:it|that|this)\s+up|enlarge\s+(?:it|that|this))" + _IMAGE_NAV_TAIL,
+    re.IGNORECASE)
+
+
+def parse_image_nav(transcript: str) -> tuple[str, str | None] | None:
+    """(step, letter): ('next'|'previous'|'grid', None), ('zoom', 'B') for a
+    picture full screen ("show me B"), ('zoom', None) for "make it bigger";
+    or None."""
+    t = (transcript or "").strip()
+    nav = _image_nav(t)
+    if nav is None:
+        # "What's up? Show me A." — STT often keeps a stray lead-in sentence.
+        last = re.split(r"(?<=[.?!])\s+", t)[-1]
+        if last != t:
+            nav = _image_nav(last)
+    return nav
+
+
+def _image_nav(t: str) -> tuple[str, str | None] | None:
+    if _IMAGE_NEXT_RE.search(t):
+        return "next", None
+    if _IMAGE_PREV_RE.search(t):
+        return "previous", None
+    if _IMAGE_GRID_RE.search(t):
+        return "grid", None
+    m = _IMAGE_ZOOM_RE.search(t)
+    if m:
+        token = (m.group("verb") or m.group("first")).lower()
+        return "zoom", _SPOKEN_LETTERS.get(token) or _NUM_WORDS.get(token) or token.upper()
+    if _IMAGE_ZOOM_BARE_RE.search(t):
+        return "zoom", None
+    return None
+
+
 def parse_pineda_request(transcript: str):
     """(action, arg) for a display request, or None.
 
@@ -232,6 +309,51 @@ def parse_clock_mode(transcript: str):
         return "home"
     if _CLOCK_ON_RE.search(t):
         return "clock"
+    return None
+
+
+# ── which way the screen stands ──────────────────────────────────────────────
+
+# "Turn the screen tall", "put the display in landscape", "rotate the screen",
+# "flip the screen over", "the screen's upside down". Needs the screen named,
+# so "turn it up" and "flip a coin" stay out; "switch the display to the
+# clock" names no direction and falls through.
+_TURN_RE = re.compile(
+    rf"\b(turn|rotate|flip|make|put|switch|set|change)\s+(?:the\s+)?{_SCREEN}\b(.*)$",
+    re.IGNORECASE,
+)
+_UPSIDE_DOWN_RE = re.compile(rf"\b{_SCREEN}(?:\s+is|'s)\s+upside\s+down\b", re.IGNORECASE)
+_TALL_RE = re.compile(r"\b(?:tall|portrait|vertical(?:ly)?|upright)\b", re.IGNORECASE)
+_WIDE_RE = re.compile(r"\b(?:wide|landscape|horizontal(?:ly)?)\b", re.IGNORECASE)
+_FLIP_RE = re.compile(r"\b(?:upside\s+down|over|around|round)\b", re.IGNORECASE)
+_SIDEWAYS_RE = re.compile(r"\bsideways\b", re.IGNORECASE)
+
+
+def parse_screen_turn(transcript: str):
+    """"tall" / "wide" / "flip" (over) / "turn" (between wide and tall) for
+    the kiosk's screen, or None."""
+    if not transcript:
+        return None
+    t = transcript.strip()
+    if _UPSIDE_DOWN_RE.search(t):
+        return "flip"
+    m = _TURN_RE.search(t)
+    if not m:
+        return None
+    verb, rest = m.group(1).lower(), m.group(2)
+    if _TALL_RE.search(rest):
+        return "tall"
+    if _WIDE_RE.search(rest):
+        return "wide"
+    if _FLIP_RE.search(rest):
+        return "flip"
+    if _SIDEWAYS_RE.search(rest):
+        return "turn"
+    bare = not rest.strip(" .!?,") or rest.strip(" .!?,").lower() in ("please", "now")
+    if bare and verb == "rotate":
+        return "turn"
+    if bare and verb == "flip":
+        return "flip"
     return None
 
 

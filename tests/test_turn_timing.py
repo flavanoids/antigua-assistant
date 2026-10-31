@@ -125,6 +125,20 @@ def test_split_long_first_sentence():
     settings.TTS_SPLIT_FIRST_OVER_CHARS = 0
 
 
+def test_notes_and_extras():
+    """note() values and the host's extras() ride on the end of the line."""
+    turn_timing.start()
+    turn_timing.set_route("weather")
+    turn_timing.audio_out()
+    turn_timing.note("gen_tps", "23.8")
+    turn_timing.extras = lambda: {"load": "0.4"}
+    try:
+        line = turn_timing.finish()
+    finally:
+        turn_timing.extras = None
+    assert line.startswith("TURN route=weather ") and line.endswith(" gen_tps=23.8 load=0.4"), line
+
+
 def main():
     settings.configure({})
     settings.SEARCH_ENABLED = False
@@ -133,6 +147,7 @@ def main():
     test_text_turn_and_dismiss()
     test_parallel_search_router()
     test_split_long_first_sentence()
+    test_notes_and_extras()
     print("PASS — turn timing suite")
 
 

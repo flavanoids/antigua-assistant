@@ -4,6 +4,96 @@ Highlights by month. Git history has the details. New entries go at the top.
 
 ## Unreleased
 
+- **Swap models and lend the GPU in one command** (2026-10-31):
+  `server/scripts/use_model.sh <model>` (or `--fallback <model>`) pulls the
+  model and refuses it unless it fits entirely in VRAM. It then updates
+  `server.yaml` and the warmup unit, sends a test turn and prints a benchmark.
+  The backup's model is now a setting (`fallback.model`, `fallback.num_ctx`).
+  `server/scripts/gpu_lend.sh status|lend|reclaim` runs the whole lend
+  runbook with preflight checks, and the reclaim ends with a report on the
+  lend. `server/scripts/bench_latency.py` times LLM, STT and TTS the way real
+  turns hit them. The backup's log lines are dated now.
+- **docs/performance.md**: what to expect for each GPU tier (8 GB mid-range:
+  skills 0.69 s, chat 1.24 s; 4 GB entry: 2.54 s and 4.45 s), how to choose
+  a model, and how to measure your own box. The docs describe hardware by
+  class instead of naming specific machines.
+
+- **GPU lend ended** (2026-10-31): Antigua, the display's primary and Music
+  Assistant are back on the primary after the first 6-day lend. The backup
+  stays the failover. docs/deployment.md has the full take-back order (music,
+  display sync, a bundle check) and the measured cost of a lend: spoken chat
+  4.45 s vs 1.24 s and skills 2.54 s vs 0.69 s (median first audio).
+
+- **Research** (2026-10-31): "research X", "find the best price on X",
+  "compare A and B", "is X worth it" and "Houston's weather patterns" get a
+  multi-step answer instead of one search. `research.py`: the local 4B plans
+  2–4 queries, then the code searches (Parallel first, sparing SearXNG's
+  rate-limited Google), reads retailer pages for prices, and sums up the
+  nearest NOAA station's record by decade for climate questions. The 4B
+  answers from that evidence, or asks for one more search first. Prices and
+  names have to be in the evidence. She says one line and speaks the answer
+  when it's ready (10–30 s). The search router can choose RESEARCH too.
+
+- **"What's on the TV?" and skipping on the Apple TV** (2026-10-30): "what's
+  on the TV", "what am I watching" and "is the TV on" answer with the title,
+  app and time left, or say the TV is off. "Is the TV on" used to turn it
+  on. "Skip ahead 2 minutes on the TV", "rewind the TV" and "restart the
+  movie on the TV" seek through mcp-pyatv. The TV must be named, so bare
+  seek commands stay with music and podcasts.
+
+- **Turn the display by voice** (2026-10-26): the kitchen screen now hangs
+  on its side, and "turn the screen tall", "put the display in landscape",
+  "flip the screen over" and "rotate the screen" turn its picture to match
+  (pineda-web's `screen_turn` tool). The screen has to be named with a
+  direction, so "turn the screen off" and theme requests are untouched.
+
+- **Clean replies, enforced in code** (2026-10-24): the chat model is
+  uncensored and played along with come-ons and double meanings in a dry-run
+  probe of 48 bait phrases. `clean.py` now answers come-ons, relationship
+  questions and bare bait from a short bank before the model, and screens
+  every chat sentence before it's spoken. Joke requests with an adult
+  subject get a clean joke instead. Nothing she says mentions any of this.
+
+- **"Show me A" opens a picture, and replies stay clean** (2026-10-24): the
+  spoken hint now says "show me A" ("make A bigger" still works), and a
+  stray lead-in sentence from STT ("What's up? Show me A.") no longer pushes
+  the request past the collage to the LLM. The persona prompt and turn notes
+  now keep every reply free of flirting and innuendo, without ever saying so.
+
+- **Pictures full screen by voice, and a shorter collage** (2026-10-24): a
+  collage stays up 30 seconds (it was 2 minutes), and each picture opened
+  gets a fresh 30, as does going back. "Make A bigger" (also "blow up B",
+  "zoom in on C", "full screen D", "make picture 2 bigger", and the way STT
+  writes them: "make a bigger", "bee") opens a picture full screen; "no, go
+  back", "smaller", "zoom out" or "never mind" returns to all of them.
+  Naming a picture within five minutes brings a timed-out collage back with
+  it open.
+
+- **Picture comparisons side by side** (2026-10-24): "show me pictures of
+  fuji vs honeycrisp apples" (also "versus", "compared to/with") runs both
+  searches at once and puts three of each in two labelled columns, A–C and
+  D–F, without repeating a picture across them ("fuji vs honeycrisp apples"
+  compares apples on both sides). One side finding nothing falls back to a
+  plain collage. The reply names the sides: "Here are Fuji apples, A
+  through C, and Honeycrisp apples, D through F."
+
+- **Step through a picture collage by voice** (2026-10-24): while one is on
+  the display, "next" and "previous" move the spotlight from picture to
+  picture (wrapping around), and "back" or "show them all" returns to the
+  whole collage. Only while a collage is up, so the same words still reach
+  the recipe and the music otherwise.
+
+- **Image search results worth looking at** (2026-10-24): SearXNG interleaves
+  its image engines round-robin, so picture B was often another engine's
+  off-topic first hit. `image_search.py` re-ranks by what the title and page
+  say, sinks watermarked stock sites and video thumbnails, drops tiny,
+  banner-shaped, SVG and duplicate images, keeps at most two per site, and
+  trims titles ("The High Line | Things To Do in ..." becomes "The High Line").
+  "Downtown", "near me" and the like are pinned to `search.home_city`.
+  Items now carry their real aspect ratio and a friendly source name
+  ("Wikipedia", "Reddit"). The reply says how many and which letters:
+  "Here are six pictures of X. Ask about any of them, A through F."
+
 - **Offline awareness** (2026-10-16), after a DNS/internet outage that
   afternoon:
   - **Is the internet down, and why**: `netstatus.py` checks every 30 s, one
@@ -130,7 +220,7 @@ Highlights by month. Git history has the details. New entries go at the top.
   threshold). Ends on "that's all"/"bye", silence, or speech not for her.
   Details in `ANTIGUA_SKILLS/conversation/README.md`.
 
-- **Less speculative work on primary-server, faster long replies** (2026-10-01):
+- **Less speculative work on noegpu01, faster long replies** (2026-10-01):
   the clock TTS pre-warm (three Kokoro syntheses a minute, ~2,950 a day
   against 0–35 real turns and 17 time questions in two weeks) is gone;
   "what time is it" synthesizes on demand in ~0.3s. The TTS cache now keeps

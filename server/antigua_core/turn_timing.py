@@ -7,6 +7,9 @@ The clock is per thread (each HTTP request runs on its own). A spoken turn
 starts it before STT; a text turn starts it in dispatch_text. first_audio is
 when the first reply chunk went out on MQTT, or, for a reply the bridge
 publishes itself, when the response was ready.
+
+note() adds values that aren't times (token counts, speeds), and a host's
+extras() whatever it wants on every line (the fallback: load average).
 """
 
 import logging
@@ -25,6 +28,10 @@ def start():
         _local.stages = {}
         _local.first_audio = None
         _local.route = ""
+        _local.notes = {}
+
+
+extras = None   # () -> {name: value} for every line, set by the host
 
 
 def add(stage: str, seconds: float):
@@ -39,6 +46,12 @@ def timed(stage: str):
         yield
     finally:
         add(stage, time.perf_counter() - t)
+
+
+def note(name: str, value):
+    """A non-time value for this turn's line, e.g. note("gen_tps", "23.8")."""
+    if getattr(_local, "t0", None) is not None:
+        _local.notes[name] = value
 
 
 def set_route(route: str):
@@ -60,6 +73,14 @@ def finish() -> str | None:
     total = time.perf_counter() - t0
     first = _local.first_audio if _local.first_audio is not None else total
     stages = " ".join(f"{k}={v:.2f}" for k, v in _local.stages.items())
+    notes = dict(_local.notes)
+    if extras is not None:
+        try:
+            notes.update(extras())
+        except Exception:
+            log.debug("turn_timing extras failed", exc_info=True)
+    if notes:
+        stages = " ".join(filter(None, (stages, " ".join(f"{k}={v}" for k, v in notes.items()))))
     line = (f"TURN route={_local.route or '-'} total={total:.2f}s first_audio={first:.2f}s"
             + (f" | {stages}" if stages else ""))
     _local.t0 = None

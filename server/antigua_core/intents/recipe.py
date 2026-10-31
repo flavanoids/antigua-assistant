@@ -15,13 +15,17 @@ import re
 # ── Starting a recipe ────────────────────────────────────────────────────────
 
 # Wording that is about cooking whatever follows: no food check needed.
+# "a recipe for", "some recipes for", "a few good recipes for".
+_A_RECIPE = (r"(?:an?\s+|the\s+|your\s+|some\s+|a\s+few\s+|a\s+couple(?:\s+of)?\s+|(?:two|three)\s+|"
+             r"different\s+|other\s+|more\s+)*(?:good\s+|easy\s+|simple\s+|great\s+)?recipes?")
 _COOK_RE = re.compile(
     r"^(?:(?:can|could|will)\s+you\s+)?(?:please\s+)?(?:"
-    r"(?:give|find|get|read|tell)\s+(?:me|us)\s+(?:an?\s+|the\s+|your\s+)?(?:good\s+|easy\s+|simple\s+)?recipe\s+(?:for|to\s+make)|"
-    r"(?:find|look\s+up|search\s+for|pull\s+up|bring\s+up|put\s+up|show|send)\s+(?:me\s+|us\s+)?(?:an?\s+|the\s+)?(?:good\s+|easy\s+)?recipe\s+(?:for|to\s+make)|"
-    r"(?:can|could|may)\s+(?:i|we)\s+(?:get|have|see)\s+(?:an?\s+|the\s+)?(?:good\s+|easy\s+)?recipe\s+(?:for|to\s+make)|"
-    r"(?:i|we)\s+(?:want|need|would\s+like)\s+(?:an?\s+|the\s+)?(?:good\s+|easy\s+)?recipe\s+(?:for|to\s+make)|"
-    r"(?:what(?:'s|\s+is)\s+)?(?:an?\s+|the\s+)?(?:good\s+|easy\s+|simple\s+)?recipe\s+for|"
+    r"(?:give|find|get|read|tell)\s+(?:me|us)\s+" + _A_RECIPE + r"\s+(?:for|to\s+make)|"
+    r"(?:find|look\s+up|search\s+for|pull\s+up|bring\s+up|put\s+up|show|send)\s+(?:me\s+|us\s+)?"
+    + _A_RECIPE + r"\s+(?:for|to\s+make)|"
+    r"(?:can|could|may)\s+(?:i|we)\s+(?:get|have|see)\s+" + _A_RECIPE + r"\s+(?:for|to\s+make)|"
+    r"(?:i|we)\s+(?:want|need|would\s+like)\s+" + _A_RECIPE + r"\s+(?:for|to\s+make)|"
+    r"(?:what(?:'s|\s+is|\s+are)\s+)?" + _A_RECIPE + r"\s+for|"
     r"how\s+(?:do|would|should|can|could)\s+(?:i|you|we|one)\s+(?:cook|bake|roast)|"
     r"how\s+to\s+(?:cook|bake|roast)|"
     r"(?:let'?s|let\s+us|i\s+want\s+to|i'?d\s+like\s+to|i'?m\s+going\s+to|we'?re\s+going\s+to|"
@@ -29,11 +33,11 @@ _COOK_RE = re.compile(
     r")\s+(?P<dish>.+)$",
     re.IGNORECASE,
 )
-# "X recipe" / "a recipe" at the end: "cheesecake recipe please".
+# "X recipe" / "a recipe" at the end: "cheesecake recipe please", "some chia pudding recipes".
 _TRAILING_RECIPE_RE = re.compile(
     r"^(?:(?:can|could)\s+you\s+)?(?:please\s+)?(?:(?:give\s+me|find\s+me|read\s+me|i\s+(?:want|need)|i'?d\s+like|get\s+me|"
     r"show\s+me|pull\s+up|bring\s+up|look\s+up|find|send\s+me)\s+)?"
-    r"(?:an?\s+|the\s+|your\s+)?(?P<dish>.+?)\s+recipe$",
+    r"(?:an?\s+|the\s+|your\s+|some\s+|a\s+few\s+|a\s+couple(?:\s+of)?\s+)?(?P<dish>.+?)\s+recipes?$",
     re.IGNORECASE,
 )
 # "make" is not always cooking ("how do I make money"): the dish must look like food.
@@ -112,8 +116,46 @@ def looks_like_food(dish: str) -> bool:
     return False
 
 
+# "Show me recipes" with no dish: asked "recipes for what?" instead.
+_BARE_RECIPES_RE = re.compile(
+    r"^(?:(?:can|could|will)\s+you\s+)?(?:please\s+)?(?:(?:show|give|find|get|send|pull\s+up|bring\s+up|"
+    r"look\s+up|search\s+for)\s+(?:me\s+|us\s+)?)?(?:some\s+|a\s+few\s+|a\s+|an\s+)?"
+    r"(?:good\s+|easy\s+|new\s+)?recipes?(?:\s+(?:please|ideas?))?$", re.IGNORECASE)
+_VERB_ONLY_RE = re.compile(r"^(?:show|give|find|get|send|pull\s+up|bring\s+up|look\s+up|search\s+for)"
+                           r"(?:\s+(?:me|us))?$", re.IGNORECASE)
+
+
+def _last_sentence(transcript: str) -> str | None:
+    """"What's up? Show me recipes for X." — STT often keeps a stray
+    lead-in sentence (a misheard wake word); the request is the last one."""
+    parts = [x for x in re.split(r"(?<=[.?!])\s+", (transcript or "").strip()) if x.strip(" .?!")]
+    return parts[-1] if len(parts) > 1 else None
+
+
+def is_bare_recipe_request(transcript: str) -> bool:
+    """"Show me some recipes" / "recipes please", with no dish named."""
+    for t in (transcript, _last_sentence(transcript)):
+        if t and _BARE_RECIPES_RE.match(_strip_lead(_norm(t))):
+            return True
+    return False
+
+
+def _strip_lead(text: str) -> str:
+    text = re.sub(r"^(?:(?:hey|ok(?:ay)?|so|um|uh|alright|antigua|alexa)[, ]+)+", "", text, flags=re.I)
+    return re.sub(r"[, ]+(?:please|antigua|thanks|thank\s+you)$", "", text, flags=re.I)
+
+
 def parse_recipe_request(transcript: str) -> str | None:
     """The dish asked for, or None when this isn't a recipe request."""
+    last = _last_sentence(transcript)
+    if last:
+        dish = _parse_recipe_request(last)
+        if dish or _BARE_RECIPES_RE.match(_strip_lead(_norm(last))):
+            return dish
+    return _parse_recipe_request(transcript)
+
+
+def _parse_recipe_request(transcript: str) -> str | None:
     text = _norm(transcript)
     text = re.sub(r"^(?:hey|ok(?:ay)?|so|um|uh|alright|antigua)[, ]+", "", text, flags=re.I)
     text = re.sub(r"[, ]+(?:please|antigua|thanks|thank\s+you)$", "", text, flags=re.I)
@@ -128,7 +170,7 @@ def parse_recipe_request(transcript: str) -> str | None:
     m = _TRAILING_RECIPE_RE.match(text)
     if m:
         dish = _clean_dish(m.group("dish"))
-        if dish and len(dish.split()) <= 6 and not re.search(
+        if dish and len(dish.split()) <= 6 and not _VERB_ONLY_RE.match(dish) and not re.search(
                 r"\b(?:another|different|other|new|next|simpler|easier|this|that)\b|^(?:an?|the|some)$",
                 dish, re.I):
             return dish
@@ -434,6 +476,21 @@ def _items(text: str) -> list:
     return out
 
 
+# The cue a timed step waits for: "the oven's preheated", "it's in the
+# oven", "start the timer". No duration: "set a timer for 10 minutes" is the
+# timers' own.
+_TIMER_GO_RE = re.compile(
+    r"^(?:ok(?:ay)?[, ]+|alright[, ]+|so[, ]+)*(?:"
+    r"(?:the\s+)?oven(?:'?s|\s+is)\s+(?:(?:all\s+)?pre-?heated|ready|hot|(?:up\s+)?to\s+temp(?:erature)?|at\s+temp(?:erature)?)|"
+    r"(?:it'?s|it\s+is|we'?re)\s+(?:pre-?heated|at\s+temp(?:erature)?)|"
+    r"(?:it'?s|it\s+is|they'?re|they\s+are|that'?s)\s+(?:in(?:\s+the\s+(?:oven|fridge|refrigerator|freezer|pot|pan))?|"
+    r"(?:in\s+)?(?:simmering|boiling|resting|chilling|baking|rising|marinating|soaking))(?:\s+now)?|"
+    r"(?:i\s+)?(?:put|popped|stuck)\s+(?:it|them)\s+in(?:\s+the\s+(?:oven|fridge|freezer))?(?:\s+now)?|"
+    r"(?:start|set|begin)\s+(?:the|a|my)\s+timer(?:\s+(?:now|for\s+(?:it|this|this\s+step|that)))?|"
+    r"start\s+timing(?:\s+(?:it|now))?"
+    r")[.!]*$", re.IGNORECASE)
+
+
 def parse_cook_command(transcript: str):
     """(command, arg) for something said while cooking, or None.
 
@@ -447,6 +504,8 @@ def parse_cook_command(transcript: str):
     """
     text = _norm(transcript).lower()
     text = _TAIL_RE.sub("", _LEAD_RE.sub("", text)).strip(" ,")
+    if _TIMER_GO_RE.match(text):
+        return ("timer_go", None)
     if not text:
         return None
     if _END_RE.match(text):
@@ -548,3 +607,148 @@ def bare_items(transcript: str) -> tuple:
     text = _TAIL_RE.sub("", _LEAD_RE.sub("", _norm(transcript).lower())).strip(" ,")
     text = re.sub(r"^(?:just|only|i\s+think|probably|maybe)\s+", "", text)
     return text, _items(text)
+
+
+# ── Choosing between recipes on the kiosk ────────────────────────────────────
+# "Which one would you like? A, B, or C?" — answered "B", "the second one",
+# "let's do C", "the one from Allrecipes", or "never mind".
+
+_PICK_RE = re.compile(
+    r"^(?:(?:i'?ll|i\s+will|we'?ll|let'?s|lets)\s+(?:go\s+with|take|do|have|try|make|pick|choose|use)|"
+    r"(?:i|we)\s+(?:want|like|choose|pick|prefer)|(?:i'?d|we'?d)\s+(?:like|prefer|go\s+with|take)|"
+    r"(?:go|going)\s+with|give\s+me|show\s+me|open|pick|choose|select|take|try|make|do|"
+    r"how\s+about|what\s+about)?\s*(?:the\s+)?(?:option|recipe|letter|number|choice)?\s*"
+    r"(?P<pick>a|ay|aye|eh|hey|hay|b|be|bee|c|see|sea|she|si|d|dee|[1-4]|one|two|three|four|first|second|third|"
+    r"fourth|middle|last)"
+    r"(?:\s+(?:one|recipe|option|please|thanks|thank\s+you|antigua|"
+    r"looks?\s+(?:good|best|great|delicious|yummy|tasty|amazing)|sounds?\s+good|is\s+good))*$",
+    re.IGNORECASE)
+# Whisper hears a lone "A" as "Hey." or "Eh.", "C" as "She." (2026-10-25).
+_PICK_WORDS = {"a": 0, "ay": 0, "aye": 0, "eh": 0, "hey": 0, "hay": 0, "1": 0, "one": 0, "first": 0,
+               "b": 1, "be": 1, "bee": 1, "2": 1, "two": 1, "second": 1, "middle": 1,
+               "c": 2, "see": 2, "sea": 2, "she": 2, "si": 2, "3": 2, "three": 2, "third": 2,
+               "d": 3, "dee": 3, "4": 3, "four": 3, "fourth": 3}
+_PICK_CANCEL_RE = re.compile(
+    r"^(?:no,?\s+)?(?:never\s*mind|none(?:\s+of\s+(?:them|those|these|the\s+above))?|neither(?:\s+one)?|"
+    r"cancel(?:\s+that)?|no\s+thanks?(?:\s+you)?|nope|forget\s+(?:it|about\s+it)|"
+    r"close\s+(?:it|that|the\s+display|them))$", re.IGNORECASE)
+_PICK_SOURCE_RE = re.compile(
+    r"^(?:(?:i'?ll\s+take|let'?s\s+do|let'?s\s+go\s+with|go\s+with|i\s+want|give\s+me)\s+)?"
+    r"(?:(?:the\s+one\s+(?:from|by|on)|the\s+recipe\s+(?:from|by|on)|the)\s+)?(?P<src>.+?)(?:\s+(?:one|recipe))?$",
+    re.IGNORECASE)
+_SOURCE_FILLER = {"the", "recipe", "recipes", "kitchen", "food", "com", "net", "www", "and", "with",
+                  "cooking", "blog", "eats", "home"}
+
+
+def _source_words(text: str) -> set:
+    return {w.rstrip("s") for w in re.findall(r"[a-z]{2,}", text.lower())}
+
+
+def parse_recipe_pick(transcript: str, count: int, sources=()) -> tuple | None:
+    """("pick", index) or ("cancel", None) while the kiosk shows `count`
+    recipes to choose from (their sites `sources`, in order); else None.
+    "What's up? Show me A." — the last sentence counts on its own."""
+    last = _last_sentence(transcript)
+    if last:
+        got = _parse_recipe_pick(last, count, sources)
+        if got:
+            return got
+    return _parse_recipe_pick(transcript, count, sources)
+
+
+def _parse_recipe_pick(transcript: str, count: int, sources=()) -> tuple | None:
+    text = _norm(transcript).lstrip(" -–")
+    text = re.sub(r"^(?:(?:hey|ok(?:ay)?|so|um|uh|alright|antigua|hmm|let'?s\s+see|i\s+think)[, ]+)+", "",
+                  text, flags=re.I)
+    text = re.sub(r"[, ]+(?:please|antigua|thanks|thank\s+you)$", "", text, flags=re.I).strip(" ,")
+    if _PICK_CANCEL_RE.match(text):
+        return ("cancel", None)
+    if count == 1 and _YES_RE.match(text):
+        return ("pick", 0)                  # "want to make it?" — "yes"
+    m = _PICK_RE.match(text)
+    if m:
+        word = m.group("pick").lower()
+        n = count - 1 if word == "last" else _PICK_WORDS.get(word)
+        if word == "middle" and count != 3:
+            return None
+        return ("pick", n) if n is not None and n < count else None
+    m = _PICK_SOURCE_RE.match(text)
+    if m:
+        said = _source_words(m.group("src")) - _SOURCE_FILLER
+        hits = [i for i, s in enumerate(sources) if said and said <= _source_words(s)]
+        if len(hits) == 1:
+            return ("pick", hits[0])
+    return None
+
+
+_NOT_A_DISH_RE = re.compile(r"^(?:never\s*mind|nothing|no(?:pe|\s+thanks?)?|cancel|forget\s+it|"
+                            r"i\s+don'?t\s+know|not\s+sure|anything|surprise\s+me|stop)$", re.IGNORECASE)
+
+
+def parse_dish_answer(transcript: str) -> str | None:
+    """The answer to "recipes for what?": "chia seed pudding", "um, tacos",
+    "how about lasagna"; "" for "never mind"; None when it isn't a dish."""
+    text = _strip_lead(_norm(transcript))
+    text = re.sub(r"^(?:how\s+about|what\s+about|maybe|let'?s\s+do|i'?m\s+thinking|for)\s+", "", text, flags=re.I)
+    if _NOT_A_DISH_RE.match(text):
+        return ""
+    dish = _clean_dish(text)
+    if not dish or len(dish.split()) > 5 or re.search(r"\?|\b(?:what|who|when|where|why|how)\b", dish, re.I):
+        return None
+    if re.match(r"(?:pause|play|stop|resume|skip|turn|set|open|close|tell|show|give|call|text|"
+                r"volume|next|previous|lights?|timer|alarm|remind|weather|is|are|can|do|does)\b", dish, re.I):
+        return None
+    return dish if looks_like_food(dish) or len(dish.split()) <= 3 else None
+
+
+# ── The recipe box: favorites and history ────────────────────────────────────
+
+_FAV = r"favou?rites?"
+_THIS = r"(?:this|that|the|this\s+one|that\s+one)(?:\s+recipe)?"
+_BOX_LEAD_RE = re.compile(r"^(?:(?:please|can\s+you|could\s+you|will\s+you)\s+)+", re.IGNORECASE)
+_FAVORITE_RE = re.compile(
+    rf"^(?:(?:favou?rite|save|bookmark|star|heart)\s+{_THIS}(?:\s+(?:to|in|as)\s+(?:my\s+|our\s+|the\s+|a\s+)?{_FAV})?|"
+    rf"(?:add|put|save)\s+{_THIS}\s+(?:to|in)\s+(?:my\s+|our\s+|the\s+)?{_FAV}|"
+    rf"(?:make|mark)\s+{_THIS}\s+(?:as\s+)?(?:a\s+|one\s+of\s+(?:my|our)\s+)?{_FAV})$", re.IGNORECASE)
+_UNFAVORITE_RE = re.compile(
+    rf"^(?:(?:remove|take|delete)\s+{_THIS}\s+(?:off|out\s+of|from)\s+(?:my\s+|our\s+|the\s+)?{_FAV}|"
+    rf"un-?favou?rite\s+{_THIS}|{_THIS}\s+(?:is|isn'?t)\s+not\s+a\s+favou?rite|"
+    rf"{_THIS}\s+isn'?t\s+a\s+favou?rite(?:\s+anymore)?)$", re.IGNORECASE)
+_SHOW_FAVS_RE = re.compile(
+    rf"^(?:(?:show|give|read|tell)\s+(?:me\s+|us\s+)?|(?:pull|bring)\s+up\s+|open\s+|what\s+are\s+|list\s+)?"
+    rf"(?:my|our|the)\s+{_FAV}(?:\s+(?P<dish>.+?))?\s+recipes(?:\s+again)?$|"
+    rf"^(?:show|pull\s+up|bring\s+up|open|list)\s+(?:me\s+)?(?:my|our)\s+{_FAV}$|"
+    rf"^(?:my|our)\s+(?:recipe\s+)?{_FAV}$", re.IGNORECASE)
+_OPEN_FAV_RE = re.compile(
+    r"^(?:(?:let'?s\s+|i\s+want\s+to\s+|i'?d\s+like\s+to\s+)?(?:make|cook|bake|do)|(?:pull|bring)\s+up|open|show\s+me|"
+    r"(?:give|get)\s+me|start)\s+(?:my|our|the)\s+favou?rite\s+(?P<dish>.+?)(?:\s+recipe)?$", re.IGNORECASE)
+_RECENT_RE = re.compile(
+    r"^(?:(?:show|give)\s+(?:me\s+|us\s+)?|(?:pull|bring)\s+up\s+|open\s+|what\s+(?:are|were)\s+)?"
+    r"(?:my\s+|our\s+|the\s+)?(?:recent|last|latest|past)\s+recipes$|"
+    r"^(?:(?:show|pull\s+up|open)\s+(?:me\s+)?)?(?:my\s+|our\s+|the\s+)?recipe\s+history$|"
+    r"^what\s+(?:did|have)\s+(?:i|we)\s+(?:cook|make|bake)(?:ed|d)?\s+(?:recently|lately)$", re.IGNORECASE)
+
+
+def parse_recipe_box(transcript: str):
+    """("favorite"|"unfavorite"|"recent", None), ("favorites", dish or ""),
+    ("open_favorite", dish), or None."""
+    for t in (transcript, _last_sentence(transcript)):
+        if not t:
+            continue
+        text = _BOX_LEAD_RE.sub("", _strip_lead(_norm(t)).lower()).strip(" ,")
+        if _FAVORITE_RE.match(text):
+            return ("favorite", None)
+        if _UNFAVORITE_RE.match(text):
+            return ("unfavorite", None)
+        if _RECENT_RE.match(text):
+            return ("recent", None)
+        m = _SHOW_FAVS_RE.match(text)
+        if m:
+            return ("favorites", _clean_dish(m.group("dish") or ""))
+        m = _OPEN_FAV_RE.match(text)
+        if m:
+            dish = _clean_dish(m.group("dish"))
+            if re.fullmatch(r"(?:one|recipes?|things?)", dish):
+                return ("favorites", "")
+            return ("open_favorite", dish) if dish else None
+    return None

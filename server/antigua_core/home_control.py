@@ -13,7 +13,9 @@ preference; the first one that's configured, not cooling down and succeeds
 wins:
 
   appletv → mcp-pyatv:          turn_on/turn_off, volume_up/down, get/set_volume,
-                                navigate, launch_app/list_apps, play/pause.
+                                navigate, launch_app/list_apps, play/pause,
+                                skip_forward/backward, set_position,
+                                power_state/now_playing.
                                 Reaches the TV itself over HDMI-CEC.
   roku    → mcp-remote-control: press_key(key), power_on, launch_app(app_name)
   govee   → govee-mcp:          set_power/set_brightness/set_color/set_color_temp,
@@ -26,7 +28,10 @@ import re
 import time
 from threading import Lock, Semaphore, Thread
 
-from .classify import _HDMI_NUM_RE, _TV_APP_RE, _TV_INPUT_RE, _TV_RE
+from .classify import (_HDMI_NUM_RE, _TV_APP_RE, _TV_INPUT_RE, _TV_NAMED, _TV_RE,
+                       _TV_SEEK_RE, _TV_STATUS_RE)
+from .intents.tv import _SEEK_AMOUNT_RE
+from .music_intents import _seconds
 
 log = logging.getLogger("antigua_core.home")
 
@@ -37,6 +42,23 @@ _NARROW_CCT = ("chandelier-", "monitor-strip")
 # Spoken HDMI number → ECP input key
 _HDMI_KEYS = {"1": "InputHDMI1", "one": "InputHDMI1", "2": "InputHDMI2", "two": "InputHDMI2",
               "3": "InputHDMI3", "three": "InputHDMI3", "4": "InputHDMI4", "four": "InputHDMI4"}
+
+
+def _spoken_minutes(seconds: float) -> str:
+    """ "about 30 minutes", "1 hour 5 minutes"."""
+    m = round(seconds / 60)
+    h, m = divmod(m, 60)
+    if not h:
+        return f"about {m} minute{'s' * (m != 1)}"
+    return f"{h} hour{'s' * (h != 1)}" + (f" {m} minute{'s' * (m != 1)}" if m else "")
+
+
+def spoken_seconds(seconds: int) -> str:
+    """ "30 seconds", "2 minutes", "90 seconds"."""
+    if seconds >= 60 and seconds % 60 == 0:
+        m = seconds // 60
+        return f"{m} minute{'s' * (m != 1)}"
+    return f"{seconds} second{'s' * (seconds != 1)}"
 
 
 def _norm(name: str) -> str:
@@ -84,7 +106,12 @@ TV_FUNCTIONS = {
     "tv_home": "navigation", "tv_back": "navigation",
     "tv_app": "apps", "tv_input": "inputs",
     "tv_play": "playback", "tv_pause": "playback",
+    "tv_skip_forward": "playback", "tv_skip_back": "playback", "tv_restart": "playback",
+    "tv_status": "playback",
 }
+
+# Seek defaults when no amount is said: a scene ahead, a line back.
+TV_SKIP_DEFAULTS = {"tv_skip_forward": 30, "tv_skip_back": 15}
 
 # Roku ECP keys. Power is discrete (PowerOn/PowerOff); mute is a toggle,
 # Roku has no discrete mute.
@@ -101,6 +128,7 @@ _APPLETV_CALLS = {
     "tv_home": ("navigate", {"direction": "home"}),
     "tv_back": ("navigate", {"direction": "menu"}),
     "tv_play": ("play", {}), "tv_pause": ("pause", {}),
+    "tv_restart": ("set_position", {"position": 0}),
 }
 
 # A result that isn't "ok": the TV is unreachable, or the command worked but
@@ -147,7 +175,18 @@ class HomeControl:
 
     def parse_tv(self, transcript: str) -> tuple[str, str] | None:
         """Return (action, arg): ("tv_app", _TV_APPS key), ("tv_input", ECP
-        key), or ("tv_power_on"|…, ""), or None if nothing actionable."""
+        key), ("tv_skip_forward"|"tv_skip_back", seconds), or
+        ("tv_power_on"|…, ""), or None if nothing actionable."""
+        if _TV_STATUS_RE.search(transcript):
+            return ("tv_status", "")
+        sm = _TV_SEEK_RE.search(transcript)
+        if sm and _TV_NAMED.search(transcript):
+            if sm.group("restart"):
+                return ("tv_restart", "")
+            action = "tv_skip_forward" if sm.group("fwd") else "tv_skip_back"
+            am = _SEEK_AMOUNT_RE.search(transcript)
+            secs = _seconds(am.group(1)) if am else None
+            return (action, str(int(secs or TV_SKIP_DEFAULTS[action])))
         am = _TV_APP_RE.search(transcript)
         if am:
             return ("tv_app", _norm(am.group(1)))
@@ -206,7 +245,8 @@ class HomeControl:
 
     def tv(self, action: str, arg: str = "") -> str:
         """Run one parsed TV action on the first provider that can do it.
-        Returns "ok", TV_NO_APP, or TV_FAILED."""
+        Returns "ok", TV_NO_APP, or TV_FAILED; "tv_status" returns the
+        sentence to say instead of "ok"."""
         result = TV_FAILED
         providers = [p for p in self.tv_providers.get(TV_FUNCTIONS[action], [])
                      if self.hub.get(p) is not None]
@@ -278,12 +318,51 @@ class HomeControl:
             ok, res = self._appletv_mute(action == "tv_mute")
         elif action == "tv_volume_set":
             ok, res = self._atv("set_volume", {"level": int(arg)})
+        elif action in TV_SKIP_DEFAULTS:
+            tool = "skip_forward" if action == "tv_skip_forward" else "skip_backward"
+            ok, res = self._atv(tool, {"seconds": int(arg)})
+        elif action == "tv_status":
+            return self._appletv_status()
         else:
             tool, args = _APPLETV_CALLS[action]
             ok, res = self._atv(tool, args)
         log.log(logging.INFO if ok else logging.WARNING,
                 "TV/appletv %s(%s): ok=%s %s", action, arg, ok, res.text[:160])
         return "ok" if ok else TV_FAILED
+
+    def _appletv_status(self):
+        """What's on, as a sentence: off, on with nothing playing, or the
+        title, app, and time left."""
+        ok, res = self._atv("power_state")
+        if not ok:
+            log.warning("TV/appletv power_state failed: %s", res.text[:160])
+            return TV_FAILED
+        if res.text.strip() == "Off":
+            return "The Living Room TV is off."
+        ok, res = self._atv("now_playing")
+        np = res.value() if ok else None
+        if not isinstance(np, dict):
+            log.warning("TV/appletv now_playing failed: %s", res.text[:160])
+            return "The Living Room TV is on."
+        log.info("TV/appletv now_playing: %s", np)
+        app = np.get("app_name")
+        app = "Apple TV" if app == "TV" else app
+        title = (np.get("title") or "").replace("&", "and").strip()
+        if not title or np.get("state") not in ("Playing", "Paused", "Loading", "Seeking"):
+            if app:
+                return f"The Living Room TV is on {app}, but nothing's playing."
+            return "The Living Room TV is on, but nothing's playing."
+        if np.get("artist"):
+            title = f"{title} by {np['artist']}"
+        if np.get("series_name"):
+            title = f"{np['series_name']}, {title}"
+        reply = f"{'Paused on' if np['state'] == 'Paused' else 'Playing'} {title}"
+        if app:
+            reply += f" on {app}"
+        pos, total = np.get("position"), np.get("total_time")
+        if pos is not None and total and total - pos >= 60:
+            reply += f", {_spoken_minutes(total - pos)} left"
+        return reply + "."
 
     def _appletv_mute(self, mute: bool):
         """The MCP has no mute: remember the level and set 0, then restore it."""

@@ -15,7 +15,6 @@ from antigua_satellite import (  # noqa: E402
     SatelliteAlarmStore,
     _antigua_vol_args,
     current_volume_pct,
-    in_hours,
 )
 
 
@@ -34,68 +33,15 @@ def test_outage_and_restore():
     assert out == [None, None, "down", None, None, None, None, "up", None], out
 
 
-def _make_time(hour: int, minute: int):
-    import time
-    return time.struct_time((2026, 10, 19, hour, minute, 0, 0, 0, -1))
-
-
-def test_in_hours():
-    # Midnight spanning window: 22:30 to 07:00
-    w = "22:30-07:00"
-    assert not in_hours(w, _make_time(22, 29))
-    assert in_hours(w, _make_time(22, 30))
-    assert in_hours(w, _make_time(23, 45))
-    assert in_hours(w, _make_time(0, 0))
-    assert in_hours(w, _make_time(4, 15))
-    assert in_hours(w, _make_time(6, 59))
-    assert not in_hours(w, _make_time(7, 0))
-    assert not in_hours(w, _make_time(12, 0))
-
-    # Same day window: 09:00 to 17:00
-    day_w = "09:00-17:00"
-    assert not in_hours(day_w, _make_time(8, 59))
-    assert in_hours(day_w, _make_time(9, 0))
-    assert in_hours(day_w, _make_time(12, 30))
-    assert in_hours(day_w, _make_time(16, 59))
-    assert not in_hours(day_w, _make_time(17, 0))
-
-    # Empty or invalid
-    assert not in_hours("", _make_time(12, 0))
-    assert not in_hours("garbage", _make_time(12, 0))
-
-
-def test_volume_scaling(monkeypatch=None):
+def test_volume_by_kind():
+    # 2026-10-30: the night-hours speaking volume is gone; speech is flat all day.
     import antigua_satellite as sat
-
-    # Simulate Daytime
-    sat.NIGHT_HOURS = "22:30-07:00"
     sat.ANTIGUA_VOLUME_PCT = 70
-    sat.NIGHT_VOLUME_PCT = 30
     sat.ALARM_VOLUME_PCT = 75
-
-    # Day time check (14:00)
-    day_time = _make_time(14, 0)
-    # Monkeypatch time.localtime to day_time
-    import time
-    orig_local = time.localtime
-    try:
-        time.localtime = lambda: day_time
-        assert current_volume_pct(kind="speech") == 70
-        assert current_volume_pct(kind="alarm") == 75
-        assert _antigua_vol_args(kind="speech") == ["--volume", "45875"]
-        assert _antigua_vol_args(kind="alarm") == ["--volume", "49152"]
-
-        # Night time check (02:00)
-        night_time = _make_time(2, 0)
-        time.localtime = lambda: night_time
-        # Speech drops to night volume (30%)
-        assert current_volume_pct(kind="speech") == 30
-        assert _antigua_vol_args(kind="speech") == ["--volume", "19661"]
-        # Alarm stays at full alarm volume (75%)
-        assert current_volume_pct(kind="alarm") == 75
-        assert _antigua_vol_args(kind="alarm") == ["--volume", "49152"]
-    finally:
-        time.localtime = orig_local
+    assert current_volume_pct(kind="speech") == 70
+    assert current_volume_pct(kind="alarm") == 75
+    assert _antigua_vol_args(kind="speech") == ["--volume", "45875"]
+    assert _antigua_vol_args(kind="alarm") == ["--volume", "49152"]
 
 
 def test_satellite_alarm_store():
@@ -140,12 +86,36 @@ def test_satellite_alarm_store():
     assert store.check_due_offline(now=t0 + 30.0) == []
 
 
+def _rings(kind: str) -> int:
+    """How many times _alarm_loop rings, with no sound and no waiting."""
+    import antigua_satellite as sat
+    played, acks = [], []
+    saved = (sat._play_until, sat.mqtt_publish, sat.ALARM_SOUND, sat._ALARM_REPEAT_S, sat._ALARM_MAX_S)
+    sat._play_until = lambda cmd, ev, limit_s=None: played.append(cmd)
+    sat.mqtt_publish = lambda topic, payload: acks.append(topic)
+    sat.ALARM_SOUND = Path(__file__)          # exists, so each ring plays it once
+    sat._ALARM_REPEAT_S, sat._ALARM_MAX_S = 0.0002, 0.001   # an alarm rings ~5 times
+    try:
+        sat._alarm_loop("", "5 minute timer", kind=kind, fire_id=f"t-{kind}")
+    finally:
+        (sat._play_until, sat.mqtt_publish, sat.ALARM_SOUND,
+         sat._ALARM_REPEAT_S, sat._ALARM_MAX_S) = saved
+    assert acks == ["antigua/alarm_ack"], acks
+    return len(played)
+
+
+def test_timer_rings_once():
+    # 2026-10-22: a finished timer rang three times before anyone said stop.
+    assert _rings("timer") == 1
+    assert _rings("alarm") > 1               # alarms keep ringing until stopped
+
+
 def main():
     test_blips_never_fail_over()
     test_outage_and_restore()
-    test_in_hours()
-    test_volume_scaling()
+    test_volume_by_kind()
     test_satellite_alarm_store()
+    test_timer_rings_once()
     print("PASS — satellite suite")
 
 

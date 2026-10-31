@@ -19,6 +19,7 @@ spoken sentence by sentence with a short gap, then given a gentle high-shelf
 cut and a fixed loudness (see _polish).
 """
 import io
+import json
 import os
 import re
 import threading
@@ -59,6 +60,11 @@ ROOM_WET = 0.0          # 0 = dry; ~0.08 adds a faint small-room tail
 # Respellings clean_for_tts makes for espeak, given exact phonemes under
 # misaki (which stresses "Antigwa" as ant-ih-GWAH). misaki's US set: O = oʊ.
 MISAKI_SAY = {"Antigwa": "æntˈiɡwə", "antigwa": "æntˈiɡwə", "No-ee": "nˈOˌi"}
+# Local additions ({"word": "misaki phonemes"}) kept out of git, e.g. names.
+SAY_FILE = os.environ.get("KOKORO_SAY_FILE", "/etc/antigua/tts_say.json")
+if os.path.exists(SAY_FILE):
+    with open(SAY_FILE) as f:
+        MISAKI_SAY.update(json.load(f))
 _MISAKI_SAY_RE = re.compile("|".join(rf"(?<![\w-]){re.escape(w)}(?![\w-])" for w in MISAKI_SAY))
 _SENTENCE_RE = re.compile(r"(?<=[.!?…])\s+(?=\S)")
 
@@ -153,7 +159,7 @@ def get_model():
         model_path = MODELS_DIR / "kokoro-v1.0.onnx"
         print(f"Loading Kokoro from {model_path}...")
         t0 = time.time()
-        # ONNX Runtime's default thread count spills onto E-cores (12600K) or
+        # ONNX Runtime's default thread count spills onto E-cores (hybrid Intel CPUs) or
         # oversubscribes small CPUs; KOKORO_THREADS is set per host in a
         # systemd drop-in (docs/deployment.md). 0/unset = runtime default.
         opts = rt.SessionOptions()

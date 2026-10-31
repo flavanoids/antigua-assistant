@@ -20,6 +20,19 @@
 
 routes:
 
+  research:
+    - research Houston's weather patterns over the last 30 years
+    - look into whether we should get a heat pump
+    - can you dig into the best robot vacuum for pet hair
+    - find the best price on a Ninja Creami
+    - where's the cheapest place to buy AirPods
+    - compare the Pixel 11 and the iPhone 18
+    - is the Ninja Swirl worth it
+    - how have Houston summers changed over the years
+    - what are the pros and cons of solar panels
+    - which is better for a small kitchen, an air fryer or a toaster oven
+    - should I get an air fryer or a toaster oven for a small kitchen
+
   volume:
     - turn it up
     - turn it down
@@ -153,6 +166,17 @@ routes:
     # Playback needs the TV named; bare "pause" stays with media
     - pause the tv
     - resume the apple tv
+    # Status (2026-10-30). "is the tv on" used to turn it on.
+    - what's on the tv
+    - what's playing on the apple tv
+    - what am I watching
+    - is the tv on
+    - how much is left in this episode
+    # Seeking needs the TV named; bare "rewind" stays with music/podcasts
+    - skip ahead 2 minutes on the tv
+    - rewind the tv 10 seconds
+    - go back 30 seconds on the tv
+    - restart the movie on the tv
 
   time_date:
     - what time is it
@@ -172,6 +196,7 @@ routes:
     - is today a holiday
 
   weather:
+    - what's the weather like this weekend
     - what's the weather
     - what is the weather
     - how hot is it outside
@@ -228,6 +253,7 @@ routes:
     - show me times square
 
   memory_save:
+    - remember that the cheapest place to buy diapers is Costco
     - remember that I took my medicine
     - remember that Alex took his allergy pill
     - remember I parked in section c
@@ -371,6 +397,8 @@ routes:
     - start a pasta timer
 
   reminder_set:
+    # research's "compare ... and" must leave a reminder alone
+    - remind me to compare insurance quotes and car prices tomorrow at 9
     - remind me in 30 seconds
     - remind me to move the laundry in 40 minutes
     - remind me to call the dentist at 3 tomorrow
@@ -401,7 +429,7 @@ routes:
     - when I get home remind me to call mom
     - remind Katherine to feed the dog when she gets home
     - tell Alex to check the mail when he gets home
-    - when Maria gets home remind her to take her pills
+    - when Jordan gets home remind her to take her pills
     - tell Alex dinner is in the fridge when he gets home
     - remind me to take my medicine when I get back
 
@@ -695,6 +723,16 @@ routes:
     - what is the thermostat set to
     - what does the thermostat say
     - how humid is it inside
+    - is the AC on
+    - is the heat on
+    - what's the AC doing
+    - I'm gonna open the windows
+    - we're opening the windows for a couple hours
+    - I just closed the windows
+    - I'm going to close the windows
+    - the windows are open
+    - turn off windows mode
+    - is windows mode on
 
   air:
     - what's the air quality

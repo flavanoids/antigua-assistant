@@ -14,6 +14,12 @@ during motion_hours (not overnight). Only a person speaks an announcement
 by default (announce_on): the doorbell reports wind and passing cars as
 motion, and "somebody's at the door" for those was the false alarm.
 
+A door that's in and out doesn't get the sentence every time: the first
+detection speaks, the next within repeat_window_minutes plays a chime
+instead, and more than repeat_limit in that window chime for
+repeat_cooldown_minutes after the last one (user decision 2026-10-25). A
+quiet door speaks again.
+
 Every lock change, doorbell ring and person/motion detection is written to a
 local SQLite log by a poller, so "when was the front door locked?" and "who
 triggered the garage cam?" are answered from here, not from HA's history,
@@ -135,6 +141,16 @@ class HomeAssistant:
         """Admin tokens only: HA refuses hassio services to other users."""
         self._req("POST", "/api/services/hassio/addon_restart", json={"addon": slug})
 
+    def camera_image(self, entity_id: str) -> bytes | None:
+        """Fetch the latest camera JPEG from HA without starting a P2P livestream."""
+        try:
+            r = self._s.request("GET", f"{self.url}/api/camera_proxy/{entity_id}", timeout=self.timeout)
+            if r.status_code == 200 and r.content[:2] == b"\xff\xd8":
+                return r.content
+        except requests.RequestException as e:
+            log.debug("Security: camera_image for %s failed: %s", entity_id, e)
+        return None
+
 
 @dataclass
 class Camera:
@@ -194,6 +210,9 @@ class Config:
     snapshot_hours: str = "05:00-23:00"   # the display's camera window; none overnight
     motion_hours: str = "07:00-23:00"     # speak motion announcements during these hours
     motion_cooldown_seconds: float = 60.0 # seconds before announcing motion again on a camera
+    repeat_window_minutes: float = 5      # a second visitor within this chimes instead of speaking
+    repeat_limit: int = 2                 # more than this many in the window: chimes only ...
+    repeat_cooldown_minutes: float = 20   # ... until the door has been quiet this long
     eufy_addon: str | None = None         # HA add-on slug of the eufy-security-ws bridge
     # With a non-admin HA user, press this input_button instead; an HA
     # automation does the hassio.addon_restart in HA's own context.
@@ -213,6 +232,11 @@ class Config:
                    motion_hours=d.get("motion_hours", cls.motion_hours),
                    motion_cooldown_seconds=float(d.get("motion_cooldown_seconds",
                                                        cls.motion_cooldown_seconds)),
+                   repeat_window_minutes=float(d.get("repeat_window_minutes",
+                                                     cls.repeat_window_minutes)),
+                   repeat_limit=int(d.get("repeat_limit", cls.repeat_limit)),
+                   repeat_cooldown_minutes=float(d.get("repeat_cooldown_minutes",
+                                                       cls.repeat_cooldown_minutes)),
                    eufy_addon=d.get("eufy_addon"),
                    eufy_restart_button=d.get("eufy_restart_button"))
 
@@ -303,7 +327,7 @@ def clean_names(people: Sequence[str] | None) -> tuple[list[str], bool]:
 
 
 def _single_person_phrase(name: str, loc: str) -> str:
-    """Natural contraction for a single visitor: 'Sam's at the front door',
+    """Natural contraction for a single visitor: 'Dana's at the front door',
     using 'is' for names ending in sibilants ('James is at the front door')."""
     if name.lower().endswith(("s", "z", "x", "sh", "ch")):
         return f"{name} is at {loc}."
@@ -320,11 +344,11 @@ def format_visitor_announcement(
 
     Examples:
       - None / [] -> "Somebody is at the front door."
-      - ["Sam"] -> "Sam's at the front door."
-      - ["Maria", "Vivicca"] -> "Maria is at the front door with Vivicca."
-      - ["Sam", "Jordan", "Maria"] -> "Sam, Jordan, and Maria are at the front door."
-      - ["Sam"], has_unknown=True -> "Sam is at the front door with a guest."
-      - ["Maria", "Vivicca"], has_unknown=True -> "Maria and Vivicca are at the front door with a guest."
+      - ["Dana"] -> "Dana's at the front door."
+      - ["Jordan", "Riley"] -> "Jordan is at the front door with Riley."
+      - ["Dana", "Sam", "Jordan"] -> "Dana, Sam, and Jordan are at the front door."
+      - ["Dana"], has_unknown=True -> "Dana is at the front door with a guest."
+      - ["Jordan", "Riley"], has_unknown=True -> "Jordan and Riley are at the front door with a guest."
     """
     clean_people, extra_unknown = clean_names(people)
     has_unknown = has_unknown or extra_unknown
@@ -395,17 +419,20 @@ def extract_people_from_state(s: dict | None) -> tuple[list[str], bool]:
 
 class Security:
     def __init__(self, ha: HomeAssistant, cfg: Config, events: EventLog, pineda=None,
-                 announce=None):
+                 announce=None, chime=None):
         self.ha = ha
         self.cfg = cfg
         self.events = events
         self.pineda = pineda
         self.announce = announce
+        self.chime = chime                      # plays the repeat-visitor chime
         self._seen: dict[str, str] = {}         # entity → last state the poller saw
         self._snap_due: dict[str, float] = {}
         self._charged: str | None = None        # a camera done charging, level not refreshed
         self._last_restart = 0.0
         self._last_motion_announce: dict[str, float] = {}
+        self._visits: dict[str, list[float]] = {}     # camera → recent announced detections
+        self._chime_until: dict[str, float] = {}      # camera → chimes only until then
         self._last_motion_show: dict[str, float] = {}
         self._stop = threading.Event()
         self._poll_lock = threading.Lock()      # the push and the poller take turns
@@ -456,9 +483,51 @@ class Security:
         target_pip = pip if pip is not None else cam.pip_camera
         self.pineda.show_camera(name, seconds or self.cfg.live_seconds, pip=target_pip)
 
+    def _fetch_event_snapshot(self, cam: Camera) -> bool:
+        """Save the fresh event snapshot from HA's memory cache (no P2P livestream wake)."""
+        if not self.cfg.snapshots_dir or not cam.entity:
+            return False
+        try:
+            if not hasattr(self.ha, "camera_image"):
+                return False
+            jpeg = self.ha.camera_image(cam.entity)
+            if not jpeg:
+                return False
+            out = self.cfg.snapshots_dir
+            out.mkdir(parents=True, exist_ok=True)
+            tmp = out / f".{cam.name}.jpg"
+            tmp.write_bytes(jpeg)
+            tmp.chmod(0o644)
+            tmp.replace(out / f"{cam.name}.jpg")
+            meta = {
+                "camera": cam.name,
+                "title": cam.title,
+                "battery": self.battery(cam.name),
+                "every": cam.snapshot_minutes,
+                "low_battery": self.cfg.low_battery,
+                "taken": time.time(),
+                "event": True,
+            }
+            tmp_json = out / f".{cam.name}.json"
+            tmp_json.write_text(json.dumps(meta))
+            tmp_json.chmod(0o644)
+            tmp_json.replace(out / f"{cam.name}.json")
+            log.info("Security: saved instant event snapshot for %s", cam.name)
+            return True
+        except Exception as e:
+            log.warning("Security: fetching event snapshot for %s: %s", cam.name, e)
+            return False
+
     def _show_unasked(self, name: str, seconds: float | None, why: str, pip: str | None = None) -> None:
         """A ring or motion: the camera goes up on its own."""
         try:
+            cam = self.cfg.cameras.get(name)
+            if cam:
+                self._fetch_event_snapshot(cam)
+            if pip:
+                pip_cam = self.cfg.cameras.get(pip)
+                if pip_cam:
+                    self._fetch_event_snapshot(pip_cam)
             self.show_camera(name, seconds, pip=pip)
             log.info("Security: showing %s%s for %s", name, f" (with pip {pip})" if pip else "", why)
         except Exception:
@@ -498,12 +567,19 @@ class Security:
         """The poller, and HA pushing changes as they happen: a ring or
         motion acts at once instead of up to poll_seconds later. Either
         sees a change once (poll_once remembers what it saw); the poller
-        covers a dropped connection."""
-        threading.Thread(target=self._run, daemon=True, name="security-poll").start()
+        covers a dropped connection. Can follow stop(): the fallback runs
+        this only while it stands in for the primary."""
+        stop = self._stop = threading.Event()   # each run its own, so an old thread can't revive
+        self._seen.clear()      # a first look again: what changed while stopped isn't news
+        threading.Thread(target=self._run, args=(stop,), daemon=True, name="security-poll").start()
         pushed = sorted(set(self._watched()) | set(self.listeners)
                         | {c.charging for c in self.cfg.cameras.values() if c.charging})
-        threading.Thread(target=self.ha.watch, args=(pushed, self.poll_once, self._stop),
+        threading.Thread(target=self.ha.watch, args=(pushed, self.poll_once, stop),
                          daemon=True, name="security-push").start()
+
+    def stop(self) -> None:
+        """End the poller and the push."""
+        self._stop.set()
 
     def _watched(self) -> dict[str, tuple[str, str]]:
         """entity → (subject, kind) the poller logs."""
@@ -605,8 +681,8 @@ class Security:
         except SecurityError as e:      # a slow restart can outlast the timeout; it still runs
             log.warning("Security: restarting the Eufy bridge (%s): %s", how, e)
 
-    def _run(self) -> None:
-        while not self._stop.is_set():
+    def _run(self, stop: threading.Event) -> None:
+        while not stop.is_set():
             try:
                 self.poll_once(self.ha.states())
                 self._snapshots()
@@ -614,7 +690,7 @@ class Security:
                 log.debug("Security poll: %s", e)
             except Exception:
                 log.exception("Security poll failed")
-            self._stop.wait(self.cfg.poll_seconds)
+            stop.wait(self.cfg.poll_seconds)
 
     def _in_snapshot_hours(self) -> bool:
         return in_hours(self.cfg.snapshot_hours)
@@ -662,9 +738,10 @@ class Security:
         has_unknown: bool = False,
         source: str = "",
     ) -> str | None:
-        """Speak a visitor announcement for a camera if enabled and within motion hours.
+        """Speak a visitor announcement for a camera if enabled and within
+        motion hours, or play the chime for a repeat visit (_repeat_visit).
 
-        Returns the spoken phrase, or None if skipped/debounced.
+        Returns the spoken phrase, or None if skipped, debounced or chimed.
         """
         if not self.announce:
             return None
@@ -685,9 +762,6 @@ class Security:
         self._last_motion_announce[cam.name] = now
         phrase = format_visitor_announcement(cam.title, people, has_unknown,
                                              fallback_announcement=cam.motion_announcement)
-        if cam.show_on_motion and self.pineda is not None:
-            # Its live video goes up too (_check_motion_show, same hours): say where.
-            phrase = phrase.rstrip(" .") + ", live on Pineda Display."
 
         clean, unk = clean_names(people)
         unk = unk or has_unknown
@@ -701,6 +775,11 @@ class Security:
             detail = ""
 
         self.events.add(cam.name, "person", detail=detail, source=source)
+        if self._repeat_visit(cam.name, now) and callable(self.chime):
+            log.info("Security: chimed for a repeat visitor at %s (detail: %r)", cam.name, detail)
+            threading.Thread(target=self._do_chime, daemon=True,
+                             name=f"security-chime-{cam.name}").start()
+            return None
         log.info("Security: announced visitor at %s: %r (detail: %r)", cam.name, phrase, detail)
         threading.Thread(target=self._do_announce, args=(phrase,), daemon=True,
                          name=f"security-announce-{cam.name}").start()
@@ -730,6 +809,27 @@ class Security:
                         if unk:
                             has_unknown = True
         return self.announce_visitor(subject, people=people, has_unknown=has_unknown)
+
+    def _repeat_visit(self, name: str, now: float) -> bool:
+        """Chime rather than speak? The first visit in repeat_window_minutes
+        speaks and the next ones chime; past repeat_limit in the window the
+        door chimes until it's been quiet repeat_cooldown_minutes."""
+        cfg = self.cfg
+        if now < self._chime_until.get(name, 0.0):
+            self._chime_until[name] = now + cfg.repeat_cooldown_minutes * 60
+            return True
+        visits = [t for t in self._visits.get(name, []) if now - t < cfg.repeat_window_minutes * 60]
+        visits.append(now)
+        self._visits[name] = visits
+        if len(visits) > cfg.repeat_limit:
+            self._chime_until[name] = now + cfg.repeat_cooldown_minutes * 60
+        return len(visits) > 1
+
+    def _do_chime(self) -> None:
+        try:
+            self.chime()
+        except Exception:
+            log.exception("Security: chime failed")
 
     def _do_announce(self, text: str) -> None:
         try:

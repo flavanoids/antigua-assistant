@@ -10,7 +10,7 @@ Run: python3 tests/test_utility.py   (also works under pytest)
 import random
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import _isolated  # noqa: E402,F401  — temp data dir; must precede antigua_core
@@ -127,6 +127,71 @@ def test_climate():
     data["latest"]["time"] = "2026-01-01T15:01"
     assert climate.answer("setpoint", data).endswith(", as of 3:01 PM.")
     assert climate.answer("temp", {}) == "I can't reach the thermostat right now."
+
+
+def test_climate_status_and_windows():
+    now = datetime.now()
+    stamp = now.strftime("%Y-%m-%dT%H:%M")
+    until = (now + timedelta(hours=1, minutes=30)).strftime("%Y-%m-%dT%H:%M")
+
+    def data(mode, op, win=None):
+        return {"latest": {"time": stamp, "indoor_temp": 73.0, "current_setpoint": 72.0},
+                "thermostat": {"time": stamp, "mode": mode, "operation_status": op,
+                               "cool_setpoint": "72", "heat_setpoint": "69"},
+                "windows": win or {"enabled": True, "open": False}}
+
+    assert climate.answer("running", data("Cool", "Cool")) == \
+        "Cooling. It's seventy-three inside. It's set to seventy-two."
+    assert climate.answer("running", data("Heat", "Heat")) == \
+        "Heating. It's seventy-three inside. The heat is set to sixty-nine."
+    assert climate.answer("running", data("Auto", "EquipmentOff")) == \
+        "Off right now. It's seventy-three inside. It's in auto, holding between sixty-nine and seventy-two."
+    opened = {"enabled": True, "open": True, "open_until": until, "engine_off": True}
+    r = climate.answer("running", data("Off", "EquipmentOff", opened))
+    assert r.startswith("Off. Windows open mode is engaged to let fresh air into the house "
+                        "without running cooling or heating, until "), r
+    r = climate.answer("running", data("Cool", "Cool", dict(opened, engine_off=False)))
+    assert "The AC is cooling right now, and it shuts off within half an hour" in r, r
+    assert climate.answer("running", data("Off", "EquipmentOff")) == \
+        "Off. The system is switched off. It's seventy-three inside."
+    assert climate.answer("windows_status", data("Off", "EquipmentOff", opened)).startswith(
+        "Yes, windows open mode is on until ")
+    # Stale telemetry: back to the runtime answer.
+    old = data("Cool", "Cool")
+    old["thermostat"]["time"] = "2026-01-01T15:00"
+    old["latest"]["runtime_pct_30m"] = 100.0
+    assert climate.answer("running", old).startswith("Yes, it's been running")
+
+    # The switch, through the pipeline, with windows.py stubbed.
+    calls, state = [], {"enabled": True, "open": False, "engine_off": False, "open_until": None}
+
+    def fake(*args):
+        calls.append(args)
+        if args[0] == "open":
+            state.update(open=True, open_until=until)
+        elif args[0] == "closed":
+            state.update(open=False)
+        return dict(state)
+
+    setup()
+    real, script = climate._windows_cmd, settings.CLIMATE_WINDOWS_SCRIPT
+    climate._windows_cmd, settings.CLIMATE_WINDOWS_SCRIPT = fake, "/x/windows.py"
+    try:
+        r = say("I'm gonna open the windows")
+        assert calls[-1] == ("open",) and r.startswith("Windows open mode is on. The AC shuts off "
+                                                       "within half an hour, and it comes back on"), r
+        say("we're opening the windows for 3 hours")
+        assert calls[-1] == ("open", "3"), calls
+        state["engine_off"] = True
+        assert say("I closed the windows") == \
+            "Windows open mode is off. The AC comes back on within half an hour."
+        state["engine_off"] = False
+        assert say("I'm going to close the windows") == \
+            "Windows open mode wasn't on, so the AC is already running normally."
+        state["enabled"] = False
+        assert "turned off in the AC controller's settings" in say("I'm gonna open the windows")
+    finally:
+        climate._windows_cmd, settings.CLIMATE_WINDOWS_SCRIPT = real, script
 
 
 def test_hours():

@@ -38,6 +38,14 @@ the servers. See [`server/mcp/README.md`](../../server/mcp/README.md).
 - **Volume / mute:** "tv volume up", "volume down on the tv", "mute the tv", "unmute the tv"
 - **Playback:** "pause the tv", "resume the tv", "play the apple tv". Bare
   "pause" stays with the satellite's media route.
+- **What's on:** "what's on the tv", "what's playing on the apple tv", "what
+  am I watching", "is the tv on", "how much is left in this episode".
+  "What's on TV tonight" (no "the") is left to the LLM. Checked before the
+  power pattern, which used to turn the TV on for "is the tv on".
+- **Skipping:** "skip ahead 2 minutes on the tv", "rewind the tv", "go back
+  30 seconds on the tv", "fast forward the tv", "restart the movie on the
+  tv". The TV must be named: bare "skip ahead 30 seconds" / "rewind" are the
+  music and podcast seek. With no amount: 30 s ahead, 15 s back.
 - **Navigation:** "tv home", "go back on the tv"
 - **Apps:** "open netflix", "put on youtube on the tv", "launch disney plus",
   "open plex". The list is in `_TV_APP_RE` (`classify.py`) and
@@ -56,6 +64,9 @@ the servers. See [`server/mcp/README.md`](../../server/mcp/README.md).
 | unmute | `set_volume(<remembered level, else 30>)` |
 | home / back | `navigate(direction="home" / "menu")` |
 | play / pause | `play` / `pause` |
+| skip ahead / back | `skip_forward` / `skip_backward(seconds)` |
+| start over | `set_position(0)` |
+| what's on | `power_state`, then `now_playing` unless it's off |
 | open app | `list_apps` (cached 1h), match by name, then `launch_app(<bundle id>)` |
 
 The MCP server has no mute tool, hence the volume save and restore. Whether
@@ -97,5 +108,8 @@ server/scripts/deploy_fallback.sh   # copies pyatv.conf to the backup
 - **Roku standby:** a standby Roku TV holds keypresses about 5s, and the Roku
   MCP gives up at 5s, so an input switch while the TV is off may report
   failure.
-- **No state query by voice** (`power_state` and `now_playing` exist, but
-  aren't wired to intents).
+- **No next/previous episode:** pyatv reports `Next`/`Previous` as
+  unavailable in the TV app (checked 2026-10-30), so they aren't wired.
+- **Series and episode numbers** are unavailable from the TV app; "what's
+  on" says the title only. Other apps may report them, and they're used
+  when present.

@@ -35,6 +35,8 @@ log = logging.getLogger("antigua_core")
 
 # Steps take minutes and the mic's answer window is only seconds, so the
 # prompt names the wake word: "next" alone works only right after a reply.
+_TIMER_CUE_TTL = 45 * 60
+
 _PROMPTS = (
     "When you're ready, say {wake}, next.",
     "Say {wake}, next, when you're ready for more.",
@@ -108,16 +110,44 @@ def _duration_minutes(m) -> int:
 
 
 def timer_minutes(step: str) -> int | None:
-    """The cooking time in a step worth a timer: the first duration that goes
-    with a cooking verb ("bake for 1 hour and 10 minutes"), 6 minutes or more:
-    a few minutes of stirring is watched, not timed."""
+    """The cooking time in a step worth a timer (step_timer's minutes)."""
+    timed = step_timer(step)
+    return timed[0] if timed else None
+
+
+# A timed step's timer is started on a cue, not when the step is read
+# (user decision 2026-10-25): the time runs once it's in the oven, or once
+# the oven's hot when the step preheats it first. Named for what it times.
+# "Preheat the oven", not "bake in the preheated oven" (already hot).
+_PREHEAT_RE = re.compile(r"\bpre-?heat\b(?!ed)", re.IGNORECASE)
+# verb -> (timer noun after the dish, or "" for just the dish; where it is when the timer starts)
+_TIMED = {
+    "bake": ("", "in the oven"), "roast": ("", "in the oven"), "broil": ("", "in the oven"),
+    "chill": ("chill", "in the fridge"), "refrigerate": ("chill", "in the fridge"),
+    "freeze": ("freeze", "in the freezer"), "rest": ("rest", ""), "rise": ("rise", ""),
+    "marinate": ("marinade", "in the marinade"), "simmer": ("simmer", "simmering"),
+    "boil": ("boil", "boiling"), "steam": ("steam", "steaming"), "braise": ("braise", "in"),
+    "soak": ("soak", "soaking"), "cool": ("cooling", ""), "sit": ("rest", ""), "stand": ("rest", ""),
+}
+
+
+def step_timer(step: str) -> tuple | None:
+    """(minutes, verb, preheat) for a step worth a timer: its first
+    duration that goes with a cooking verb, 6 minutes to 12 hours; preheat
+    when the same step heats the oven first ("preheat to 350 and bake 20
+    minutes")."""
     for sent in _sentences(step):
-        if not _COOK_VERB_RE.search(sent):
+        v = _COOK_VERB_RE.search(sent)
+        if not v:
             continue
         m = _DURATION_RE.search(sent)
         if m:
             mins = _duration_minutes(m)
-            return mins if 6 <= mins <= 12 * 60 else None
+            if not 6 <= mins <= 12 * 60:
+                return None
+            word = re.sub(r"^let\s+(?:it\s+)?", "", v.group(0).lower())
+            verb = next((k for k in _TIMED if word.startswith(k)), "cook")
+            return mins, verb, bool(_PREHEAT_RE.search(step))
     return None
 
 
@@ -149,7 +179,8 @@ class CookSession:
         self.pending_dish = ""
         self.check_i = -1                 # one-at-a-time ingredient checklist
         self.asked = []                   # lines this turn's answer was about (the kiosk lights them)
-        self.timer = 0
+        self.timers = []                  # timed steps waiting for their cue, latest last:
+                                          # {"mins", "name" ("apple pie", "chia pudding chill"), "verb"}
         self.prompt_n = 0
         self.scale = 1.0                  # ingredient amounts x this (§2, scaling)
         self.target_servings = 0          # the "for 4" a scale came from, if any
@@ -188,9 +219,40 @@ class CookSession:
         self.awaiting, self.asked_at = question, time.time()
 
     def _waiting(self) -> str:
-        if self.awaiting and time.time() - self.asked_at < settings.RECIPE_ANSWER_TTL:
+        # An oven takes 10-20 minutes to preheat: a timer waits for its cue longer.
+        ttl = _TIMER_CUE_TTL if self.awaiting == "timer" else settings.RECIPE_ANSWER_TTL
+        if self.awaiting and time.time() - self.asked_at < ttl:
             return self.awaiting
         return ""
+
+    def _timer_name(self, verb: str) -> str:
+        noun = _TIMED.get(verb, ("", ""))[0]
+        return f"{self.dish} {noun}".strip()
+
+    def _queue_timer(self, mins: int, verb: str) -> dict:
+        t = {"mins": mins, "name": self._timer_name(verb), "verb": verb}
+        self.timers = [x for x in self.timers if x["name"] != t["name"]][-2:] + [t]
+        return t
+
+    def _start_timer(self, said: str = "") -> Reply:
+        """Start a waiting step timer: the one where the cue says it is
+        ("it's in the oven" is the bake, not the chill), else the latest."""
+        place = re.search(r"\b(oven|fridge|refrigerator|freezer)\b", said, re.I)
+        pick = self.timers[-1]
+        if place:
+            where = {"refrigerator": "fridge"}.get(place.group(1).lower(), place.group(1).lower())
+            pick = next((x for x in reversed(self.timers)
+                         if where in _TIMED.get(x["verb"], ("", ""))[1]), pick)
+        self.timers.remove(pick)
+        if self.awaiting == "timer":
+            self.awaiting = ""
+        mins, name = pick["mins"], pick["name"]
+        text = f"Okay, {say_minutes(mins)} on the {name} timer."
+        if self.stage == "finished" or (self.stage == "steps" and self._at_end()):
+            self.stage = "finished"
+            return Reply(f"{text} That was the last step. Enjoy your {self.name}!",
+                         timer_minutes=mins, timer_label=name)
+        return Reply(_say_next(text + " "), timer_minutes=mins, timer_label=name)
 
     def _baked(self) -> bool:
         return bool(re.search(r"\b(?:bake|oven)\b", " ".join(self.recipe.steps), re.I))
@@ -454,12 +516,21 @@ class CookSession:
             head = "Then:"
         text = parts[part]
         body = f"{head} {text}{self._notes(text)}"
-        mins = timer_minutes(text)
+        timed = step_timer(text)
         self.awaiting = ""
-        if mins:
-            self.timer = mins
+        if timed:
+            mins, verb, preheat = timed
+            name = self._queue_timer(mins, verb)["name"]
             self._ask("timer")
-            tail = f" Want me to set a timer for {say_minutes(mins)}?"
+            where = _TIMED.get(verb, ("", ""))[1]
+            if preheat:
+                tail = (f" Tell me when the oven's preheated, and I'll time "
+                        f"{say_minutes(mins)} for the {name}.")
+            else:
+                tail = (f" When it's {where}, say {_wake()}, start the timer, and I'll time "
+                        f"{say_minutes(mins)} for the {name}." if where else
+                        f" Say {_wake()}, start the timer, when it's time, and I'll set "
+                        f"{say_minutes(mins)} for the {name}.")
             if last and last_part:
                 tail = " That's the last step." + tail
         elif not last_part:
@@ -889,18 +960,22 @@ class CookSession:
             if c in ("no", "cancel"):
                 self.awaiting = ""
                 return Reply(f"Okay. Just say {_wake()}, I'm ready, when you are.")
+        # "The oven's preheated", "it's in", "start the timer": the step's
+        # timer starts now, even after "next" moved on (frosting while it bakes).
+        if c == "timer_go" and self.timers:
+            return self._start_timer(transcript)
+        if c == "timer_go" and cooking and self.step >= 0:
+            timed = step_timer(self.recipe.steps[self.step])
+            if timed:
+                self._queue_timer(timed[0], timed[1])
+                return self._start_timer(transcript)
         if waiting == "timer":
-            if c == "yes":
-                mins, self.timer = self.timer, 0
-                self.awaiting = ""
-                if self.stage == "finished" or self._at_end():
-                    self.stage = "finished"
-                    return Reply(f"Timer set. That was the last step. Enjoy your {self.name}!",
-                                 timer_minutes=mins, timer_label=self.dish)
-                return Reply(_say_next("Timer set. "),
-                             timer_minutes=mins, timer_label=self.dish)
+            if c == "yes" and self.timers:
+                return self._start_timer()
             if c == "no":
                 self.awaiting = ""
+                if self.timers:
+                    self.timers.pop()           # "no timer, thanks"
                 if self._at_end():
                     self.stage = "finished"
                     return Reply(f"Okay. Enjoy your {self.name}!")
@@ -925,8 +1000,7 @@ class CookSession:
                 return self._say_step(self.step - 1)
             if c == "repeat":
                 return self._say_step(self.step, self.part)
-            # The mic takes plain speech after each step now, so "okay" or
-            # "not yet" to "say next when you're ready" lands here. Neither
+            # "Okay" or "not yet" to "say next when you're ready". Neither
             # moves on; "I'm ready" and "next" do.
             if c == "yes" and not waiting:
                 return Reply("Okay.")

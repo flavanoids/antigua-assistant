@@ -507,6 +507,27 @@ def main():
     finally:
         music_router.requests.post = orig_post
 
+    # A podcast that started under the kitchen duck rewinds when the duck lifts
+    # (2026-10-22: Apple News "cut in" mid-sentence); one started before it doesn't.
+    mc = make()
+    ep = "https://news-assets.apple.com/podcast/audio/x/ANT-1.mp3"
+    pid = PLAYERS[mc.default_player]
+
+    def podcast_playing():
+        mc.ma.queues[pid]["current_item"]["media_item"]["uri"] = f"builtin://sound_effect/{ep}"
+    ducked = time.time() - 3
+    mc.play_url(ep, title="Apple News Today")
+    podcast_playing()
+    mc.on_unducked(ducked)
+    assert mc.ma.last("player_queues/seek") == {"queue_id": pid, "position": 0}
+    n = len(mc.ma.calls)
+    mc.on_unducked(time.time())         # once per start
+    assert len(mc.ma.calls) == n
+    mc.play_url(ep)
+    podcast_playing()
+    mc.on_unducked(time.time() + 5)     # the duck began after the episode did
+    assert not any(c == "player_queues/seek" for c, _ in mc.ma.calls[n:])
+
     print("PASS — music suite")
 
 

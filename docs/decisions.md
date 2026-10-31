@@ -183,8 +183,8 @@ no model and starts no MCP servers until `/activate`, which keeps a
 small-memory box responsive. Timers aren't synced to it, because both servers
 would fire them.
 
-**The backup keeps the 2B model** (2026-10-03, during a primary-server PSU
-outage). The backup's GPU, a 4 GB Radeon Vega M, holds `qwen3.5:2b` entirely.
+**The backup keeps the 2B model** (2026-10-03, during a PSU outage on the
+primary). The backup's GPU, a 4 GB card (GTX 1650 class), holds `qwen3.5:2b` entirely.
 The test used the stock `qwen3.5:4b` with the same quant and size as the
 primary's uncensored 4B; it spilled 31% to CPU. The test used the fallback's
 own settings: no thinking, an 8k context, 120 tokens and the real system
