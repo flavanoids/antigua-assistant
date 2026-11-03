@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/assets/antigua-logo.jpg" alt="Antigua" width="500">
+
 # Antigua
 
 **A self-hosted voice assistant for the whole house.**<br>
